@@ -1,0 +1,60 @@
+# 默认配置
+
+# LLM 配置
+llm:
+  qgenerator_model: "gpt-4o"
+  persona_model: "gemma-3-27b-it"
+  mutator_model: "gpt-4o"
+  api_base: null  # 使用默认
+  api_key: null   # 从环境变量读取
+
+# 问卷生成配置
+qgenerator:
+  num_questionnaires: 50
+  train_split: 30
+  val_split: 10
+  test_split: 10
+  few_shot_examples:
+    - "BFI"
+    - "DASS"
+    - "SVO"
+    - "NFCS"
+  k_dimensions: [2, 3]
+  likert_scale: 5
+
+# 人格生成器配置
+persona_generator:
+  default_n: 25
+  seeds:
+    - seed1
+    - seed2
+    - seed3
+
+# 模拟器配置
+simulator:
+  reset_memory_per_question: true
+  logic: "appropriateness"
+
+# 评估器配置
+evaluator:
+  num_random_points: 10000
+  coverage_calibration_trials: 1000
+  coverage_target: 0.99
+  metrics:
+    - coverage
+    - convex_hull
+    - avg_dist
+    - min_dist
+    - dispersion
+    - kl_divergence
+
+# Open-Evolve 配置
+open_evolve:
+  num_islands: 10
+  elites_per_island: 6
+  extinction_interval: 100  # 轮数
+  extinction_interval_hours: 8
+  initial_seed_distribution:
+    seed1: 4
+    seed2: 3
+    seed3: 3
