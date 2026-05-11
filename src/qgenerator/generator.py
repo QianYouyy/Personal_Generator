@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.qgenerator import prompts
+from src.utils.config import get_config
 
 
 @dataclass
@@ -52,10 +53,8 @@ class Questionnaire:
 
 def _extract_json(text: str) -> dict:
     """从 LLM 输出中提取 JSON."""
-    # 尝试直接解析
     text = text.strip()
     if text.startswith("```"):
-        # 去除 markdown 代码块
         lines = text.splitlines()
         if lines[0].startswith("```"):
             lines = lines[1:]
@@ -67,11 +66,25 @@ def _extract_json(text: str) -> dict:
 
 
 class QGenerator:
-    """自动生成带多样性轴的心理学问卷."""
+    """自动生成带多样性轴的心理学问卷.
 
-    def __init__(self, llm_client, items_per_dimension: int = 5):
+    model 和 temperature 从 configs/default.yaml 读取，无需硬编码。
+    """
+
+    def __init__(
+        self,
+        llm_client,
+        items_per_dimension: int = None,
+        stage1_temp: float = None,
+        stage2_temp: float = None,
+    ):
         self.llm = llm_client
-        self.items_per_dimension = items_per_dimension
+
+        # 从配置文件读取默认值
+        cfg = get_config()
+        self.items_per_dimension = items_per_dimension or cfg.get("qgenerator.items_per_dimension", 5)
+        self.stage1_temp = stage1_temp or cfg.get("qgenerator.stage1_temperature", 0.8)
+        self.stage2_temp = stage2_temp or cfg.get("qgenerator.stage2_temperature", 0.7)
 
     def generate(
         self,
@@ -88,7 +101,7 @@ class QGenerator:
         stage1_resp = self.llm.generate(
             stage1_prompt,
             system_prompt=prompts.STAGE1_SYSTEM_PROMPT,
-            temperature=0.8,
+            temperature=self.stage1_temp,
             max_tokens=2048,
         )
         stage1_data = _extract_json(stage1_resp)
@@ -96,7 +109,6 @@ class QGenerator:
         context = stage1_data["context"]
         dimensions = stage1_data["dimensions"]
 
-        # 确保维度数量正确
         if len(dimensions) != k_dimensions:
             raise ValueError(
                 f"期望 {k_dimensions} 个维度，实际得到 {len(dimensions)}"
@@ -112,7 +124,7 @@ class QGenerator:
             stage2_resp = self.llm.generate(
                 stage2_prompt,
                 system_prompt=prompts.STAGE2_SYSTEM_PROMPT,
-                temperature=0.7,
+                temperature=self.stage2_temp,
                 max_tokens=2048,
             )
             stage2_data = _extract_json(stage2_resp)
@@ -130,15 +142,7 @@ class QGenerator:
         brief_contexts: List[str],
         k_dimensions_list: List[int] = None,
     ) -> List[Questionnaire]:
-        """批量生成问卷.
-
-        Args:
-            brief_contexts: 简短情境描述列表
-            k_dimensions_list: 每个问卷的维度数列表，None 则随机 2 或 3
-
-        Returns:
-            List[Questionnaire]: 生成的问卷列表
-        """
+        """批量生成问卷."""
         if k_dimensions_list is None:
             k_dimensions_list = [random.choice([2, 3]) for _ in brief_contexts]
 
@@ -160,11 +164,16 @@ class QGenerator:
     @staticmethod
     def split(
         questionnaires: List[Questionnaire],
-        train: int = 30,
-        val: int = 10,
-        test: int = 10,
+        train: int = None,
+        val: int = None,
+        test: int = None,
     ) -> Tuple[List[Questionnaire], List[Questionnaire], List[Questionnaire]]:
         """划分训练/验证/测试集."""
+        cfg = get_config()
+        train = train or cfg.get("qgenerator.train_split", 30)
+        val = val or cfg.get("qgenerator.val_split", 10)
+        test = test or cfg.get("qgenerator.test_split", 10)
+
         total = train + val + test
         if len(questionnaires) < total:
             raise ValueError(

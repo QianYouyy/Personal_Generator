@@ -78,9 +78,9 @@ def main():
     print("问卷生成器 - 批量生成 50 份心理学问卷")
     print("=" * 60)
 
-    # 初始化 LLM 客户端
-    llm = LLMClient(model="gpt-4o")
-    generator = QGenerator(llm, items_per_dimension=5)
+    # 初始化 LLM 客户端（model 从 configs/default.yaml 读取）
+    llm = LLMClient.from_config("llm.qgenerator_model")
+    generator = QGenerator(llm)
 
     # 批量生成
     print(f"\n开始生成 {len(BRIEF_CONTEXTS)} 份问卷...\n")

@@ -1,14 +1,27 @@
-# 默认配置
+# ============================================
+# 全局配置文件
+# 所有阶段使用的 model 在此统一管理
+# ============================================
 
-# LLM 配置
+# --------------------------------------------
+# LLM 全局配置
+# --------------------------------------------
 llm:
-  qgenerator_model: "gpt-4o"
-  persona_model: "gemma-3-27b-it"
-  mutator_model: "gpt-4o"
-  api_base: null  # 使用默认
-  api_key: null   # 从环境变量读取
+  # API 配置
+  api_base: null          # 自定义 API base URL（如使用中转）
+  api_key: null           # 从环境变量 OPENAI_API_KEY 读取
 
-# 问卷生成配置
+  # 各阶段专用模型（修改此处即可切换模型）
+  qgenerator_model: "gpt-4o"           # Phase 1: 问卷生成器
+  persona_model: "gemma-3-27b-it"      # Phase 2: 人格生成器（所有 seed 共用）
+  simulator_model: "gpt-4o-mini"       # Phase 2: Concordia 模拟器（Agent 内部推理）
+  evaluator_model: "gpt-4o"            # Phase 2: 评估器（一致性校验等）
+  mutator_model: "gpt-4o"              # Phase 3: Open-Evolve 变异算子（代码改写）
+  feedback_model: "gpt-4o"             # Phase 3: 反馈机制（empirical data 分析）
+
+# --------------------------------------------
+# Phase 1: 问卷生成器配置
+# --------------------------------------------
 qgenerator:
   num_questionnaires: 50
   train_split: 30
@@ -21,21 +34,33 @@ qgenerator:
     - "NFCS"
   k_dimensions: [2, 3]
   likert_scale: 5
+  items_per_dimension: 5
+  stage1_temperature: 0.8
+  stage2_temperature: 0.7
 
-# 人格生成器配置
+# --------------------------------------------
+# Phase 2: 人格生成器配置
+# --------------------------------------------
 persona_generator:
   default_n: 25
   seeds:
     - seed1
     - seed2
     - seed3
+  stage1_temperature: 0.9
+  stage2_temperature: 0.8
 
-# 模拟器配置
+# --------------------------------------------
+# Phase 2: Concordia 模拟器配置
+# --------------------------------------------
 simulator:
   reset_memory_per_question: true
   logic: "appropriateness"
+  max_attempts_per_question: 3
 
-# 评估器配置
+# --------------------------------------------
+# Phase 2: 多样性评估器配置
+# --------------------------------------------
 evaluator:
   num_random_points: 10000
   coverage_calibration_trials: 1000
@@ -48,13 +73,17 @@ evaluator:
     - dispersion
     - kl_divergence
 
-# Open-Evolve 配置
+# --------------------------------------------
+# Phase 3: Open-Evolve 进化引擎配置
+# --------------------------------------------
 open_evolve:
   num_islands: 10
   elites_per_island: 6
-  extinction_interval: 100  # 轮数
+  extinction_interval: 100        # 轮数
   extinction_interval_hours: 8
   initial_seed_distribution:
     seed1: 4
     seed2: 3
     seed3: 3
+  max_evaluations_per_candidate: 40    # 评估时使用的问卷数量
+  personas_per_evaluation: 25          # 每份问卷生成的人格数量

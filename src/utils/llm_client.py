@@ -4,23 +4,29 @@ import os
 from typing import Optional
 import openai
 
+from src.utils.config import get_config
+
 
 def load_env():
     """尝试加载 .env 文件."""
     try:
         from dotenv import load_dotenv
-
         load_dotenv()
     except ImportError:
         pass
 
 
 class LLMClient:
-    """通用 LLM 客户端，支持同步和异步调用."""
+    """通用 LLM 客户端，支持同步和异步调用.
+
+    使用方式：
+      1. 从配置文件创建: LLMClient.from_config("llm.qgenerator_model")
+      2. 直接指定 model: LLMClient(model="gpt-4o")
+    """
 
     def __init__(
         self,
-        model: str = "gpt-4o",
+        model: str,
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
     ):
@@ -35,6 +41,29 @@ class LLMClient:
             )
         self.client = openai.OpenAI(api_key=api_key, base_url=api_base)
         self.async_client = openai.AsyncOpenAI(api_key=api_key, base_url=api_base)
+
+    @classmethod
+    def from_config(
+        cls,
+        model_key: str,
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+    ) -> "LLMClient":
+        """从配置文件创建 LLMClient.
+
+        Args:
+            model_key: 配置中的 model 键名，如 "llm.qgenerator_model"
+            api_key: 可选，覆盖配置
+            api_base: 可选，覆盖配置
+        """
+        cfg = get_config()
+        model = cfg.get(model_key)
+        if not model:
+            raise ValueError(
+                f"配置中未找到 '{model_key}'，请检查 configs/default.yaml"
+            )
+        api_base = api_base or cfg.get("llm.api_base")
+        return cls(model=model, api_key=api_key, api_base=api_base)
 
     def generate(
         self,
