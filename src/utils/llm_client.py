@@ -8,10 +8,23 @@ from src.utils.config import get_config
 
 
 def load_env():
-    """尝试加载 .env 文件."""
+    """加载环境变量文件.
+    
+    优先级: .env.development > .env
+    .env.development 已加入 .gitignore，用于存放真实 API Key。
+    """
     try:
         from dotenv import load_dotenv
-        load_dotenv()
+        from pathlib import Path
+        
+        project_root = Path(__file__).parent.parent.parent
+        env_dev = project_root / ".env.development"
+        env_default = project_root / ".env"
+        
+        if env_dev.exists():
+            load_dotenv(env_dev, override=True)
+        elif env_default.exists():
+            load_dotenv(env_default, override=True)
     except ImportError:
         pass
 
@@ -36,8 +49,10 @@ class LLMClient:
         api_base = api_base or os.getenv("OPENAI_API_BASE")
         if not api_key:
             raise ValueError(
-                "API key 未设置。请设置 OPENAI_API_KEY 环境变量，"
-                "或在 .env 文件中配置，或传入 api_key 参数。"
+                "API key 未设置。请将 API Key 写入 .env.development 文件\n"
+                "（已加入 .gitignore，不会上传到仓库），"
+                "或设置 OPENAI_API_KEY 环境变量，"
+                "或传入 api_key 参数。"
             )
         self.client = openai.OpenAI(api_key=api_key, base_url=api_base)
         self.async_client = openai.AsyncOpenAI(api_key=api_key, base_url=api_base)

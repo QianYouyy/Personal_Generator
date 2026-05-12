@@ -82,38 +82,28 @@ def main():
     llm = LLMClient.from_config("llm.qgenerator_model")
     generator = QGenerator(llm)
 
-    # 批量生成
-    print(f"\n开始生成 {len(BRIEF_CONTEXTS)} 份问卷...\n")
-    questionnaires = generator.batch_generate(BRIEF_CONTEXTS)
+    # 测试阶段：只生成前 5 份
+    test_contexts = BRIEF_CONTEXTS[:5]
+    print(f"\n【测试阶段】开始生成 {len(test_contexts)} 份问卷...\n")
+    questionnaires = generator.batch_generate(test_contexts)
 
     print(f"\n✅ 成功生成 {len(questionnaires)} 份问卷")
 
-    # 划分数据集
-    train, val, test = QGenerator.split(questionnaires, train=30, val=10, test=10)
-
     # 保存
     data_dir = Path(__file__).parent.parent / "data" / "questionnaires"
-    QGenerator.save(train, data_dir / "train.json")
-    QGenerator.save(val, data_dir / "val.json")
-    QGenerator.save(test, data_dir / "test.json")
-    QGenerator.save(questionnaires, data_dir / "all.json")
+    QGenerator.save(questionnaires, data_dir / "test_5.json")
 
     print("\n" + "=" * 60)
-    print("生成完成!")
-    print(f"  训练集: {len(train)} 份")
-    print(f"  验证集: {len(val)} 份")
-    print(f"  测试集: {len(test)} 份")
+    print("测试生成完成!")
     print("=" * 60)
 
-    # 打印第一份问卷作为示例
-    if questionnaires:
-        q = questionnaires[0]
-        print(f"\n📋 示例问卷（第1份）:")
-        print(f"  主题: {q.brief}")
-        print(f"  维度数: {len(q.dimensions)}")
-        for dim in q.dimensions:
-            items = q.items.get(dim['name_cn'], [])
-            print(f"    - {dim['name_cn']} ({dim['name_en']}): {len(items)} 题")
+    # 打印每份问卷的摘要
+    for i, q in enumerate(questionnaires):
+        print(f"\n📋 问卷 {i+1}: {q.brief}")
+        print(f"  维度: {q.dimensions}")
+        grouped = q.items_by_dimension()
+        for dim, items in grouped.items():
+            print(f"    - {dim}: {len(items)} 题")
 
 
 if __name__ == "__main__":

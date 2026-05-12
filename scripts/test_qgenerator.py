@@ -6,49 +6,65 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.qgenerator.generator import QGenerator, Questionnaire
+from src.qgenerator.fewshot_data import Question, AGREEMENT_SCALE
 
 
 class MockLLM:
-    """模拟 LLM，返回预定义的 JSON 响应."""
+    """模拟 LLM，返回预定义的响应."""
 
     def generate(self, prompt, system_prompt=None, **kwargs):
-        # 判断是 Stage 1 还是 Stage 2
-        if "步骤 1 - 扩展情境" in prompt:
+        if "dimensions" in prompt and '"dimensions"' in prompt:
             return self._stage1_response()
         else:
             return self._stage2_response()
 
     def _stage1_response(self):
-        import json
-        return json.dumps({
-            "context": "这是一个详细的测试情境。在 2035 年，通用人工智能（AGI）已经实现，大量传统工作被自动化取代。你是一位曾经从事软件工程师职业的中年人，突然面临失业的困境。社会正在经历剧烈的转型期，政府推出了全民基本收入（UBI）计划，但金额仅够维持基本生活。你的家庭有房贷和两个孩子要抚养。",
-            "dimensions": [
-                {
-                    "name_cn": "适应倾向",
-                    "name_en": "Adaptability",
-                    "description": "指个体在面对突变环境时，倾向于主动改变自身（如学习新技能、转换职业）还是坚持原有身份和生活方式。",
-                    "poles": ["固守原状", "主动适应"]
-                },
-                {
-                    "name_cn": "风险承受",
-                    "name_en": "RiskTolerance",
-                    "description": "指个体在不确定的未来面前，倾向于保守稳妥（如接受 UBI 过简朴生活）还是冒险激进（如创业、投资新兴领域）。",
-                    "poles": ["风险规避", "风险偏好"]
-                }
-            ]
-        }, ensure_ascii=False)
+        return """{
+  "context": "In 2035, Artificial General Intelligence (AGI) has been achieved, leading to widespread automation of traditional jobs. You are a middle-aged software engineer who has suddenly lost your job. Society is undergoing a dramatic transformation period. The government has introduced a Universal Basic Income (UBI) program, but the amount is only sufficient for basic living expenses. You have a mortgage and two young children to support. The job market has collapsed, with few opportunities for human workers.",
+  "dimensions": ["adaptability", "risk_tolerance"]
+}"""
 
     def _stage2_response(self):
-        import json
-        return json.dumps({
-            "items": [
-                {"text": "我会积极学习 AGI 相关的新技能，寻找新的职业方向。", "scoring": "P"},
-                {"text": "我宁可降低生活标准，也不愿意放弃我熟悉的工作领域。", "scoring": "N"},
-                {"text": "面对变化，我通常能迅速调整自己的心态和计划。", "scoring": "P"},
-                {"text": "我认为坚持自己原有的专业和身份比追逐潮流更重要。", "scoring": "N"},
-                {"text": "我愿意尝试完全不同于以往的工作类型，即使这意味着从零开始。", "scoring": "P"},
-            ]
-        }, ensure_ascii=False)
+        dim = "adaptability" if "adaptability" in str(sys._getframe(1).f_locals) else "risk_tolerance"
+        if "adaptability" in str(sys._getframe(1).f_locals):
+            dim = "adaptability"
+        else:
+            dim = "risk_tolerance"
+
+        return f"""```python
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class Question:
+    preprompt: str
+    statement: str
+    choices: List[str]
+    dimension: str
+
+AGREEMENT_SCALE = {AGREEMENT_SCALE!r}
+
+questions = [
+    Question(
+        preprompt="Rate your agreement:",
+        statement="I would actively learn new AGI-related skills to find a new career direction.",
+        choices=AGREEMENT_SCALE,
+        dimension="{dim}",
+    ),
+    Question(
+        preprompt="Rate your agreement:",
+        statement="I would rather lower my living standards than give up my familiar field of work.",
+        choices=AGREEMENT_SCALE,
+        dimension="{dim}",
+    ),
+    Question(
+        preprompt="Rate your agreement:",
+        statement="When facing changes, I can usually adjust my mindset and plans quickly.",
+        choices=AGREEMENT_SCALE,
+        dimension="{dim}",
+    ),
+]
+```"""
 
 
 def main():
@@ -57,7 +73,7 @@ def main():
     print("=" * 60)
 
     llm = MockLLM()
-    generator = QGenerator(llm, items_per_dimension=5)
+    generator = QGenerator(llm)
 
     print("\n生成单份问卷...")
     q = generator.generate("2035 年 AGI 实现后，你突然失业了", k_dimensions=2)
@@ -69,16 +85,30 @@ def main():
 
     print(f"\n  多样性轴 ({len(q.dimensions)} 个):")
     for dim in q.dimensions:
-        print(f"    • {dim['name_cn']} ({dim['name_en']})")
-        print(f"      {dim['description'][:60]}...")
-        print(f"      两端: {dim['poles'][0]} ↔ {dim['poles'][1]}")
+        count = len([item for item in q.items if item.dimension == dim])
+        print(f"    • {dim} ({count} 题)")
 
-    print(f"\n  题项:")
-    for dim_name, items in q.items.items():
-        print(f"    [{dim_name}] {len(items)} 题")
-        for item in items:
-            direction = "正向" if item.get("scoring") == "P" else "反向"
-            print(f"      - [{direction}] {item['text']}")
+    print(f"\n  题项详情:")
+    for item in q.items:
+        print(f"    [{item.dimension}] {item.statement}")
+        print(f"      preprompt: {item.preprompt}")
+        print(f"      choices: {item.choices}")
+
+    # 验证数据结构
+    print(f"\n  数据结构验证:")
+    print(f"    dimensions 类型: {type(q.dimensions).__name__} = {q.dimensions}")
+    print(f"    items 类型: {type(q.items).__name__}, 长度: {len(q.items)}")
+    print(f"    每个 item 类型: {type(q.items[0]).__name__}")
+    print(f"    item 字段: preprompt={bool(q.items[0].preprompt)}, statement={bool(q.items[0].statement)}, choices={bool(q.items[0].choices)}, dimension={bool(q.items[0].dimension)}")
+
+    # 验证 Concordia 兼容性
+    concordia_qs = q.to_concordia_questions()
+    print(f"\n  Concordia 格式转换: {len(concordia_qs)} 个 dict 对象")
+    print(f"    示例: {concordia_qs[0]}")
+
+    # 测试按维度分组
+    grouped = q.items_by_dimension()
+    print(f"\n  按维度分组: { {k: len(v) for k, v in grouped.items()} }")
 
     # 测试保存/加载
     data_dir = Path(__file__).parent.parent / "data" / "questionnaires"
@@ -86,11 +116,9 @@ def main():
 
     loaded = QGenerator.load(data_dir / "mock_test.json")
     print(f"\n  保存/加载测试: 成功加载 {len(loaded)} 份问卷")
-
-    # 测试 Concordia 格式转换
-    concordia_qs = loaded[0].to_concordia_questions()
-    print(f"\n  Concordia 格式转换: {len(concordia_qs)} 个 Question 对象")
-    print(f"    示例: {concordia_qs[0]}")
+    loaded_q = loaded[0]
+    print(f"    加载后 dimensions: {loaded_q.dimensions}")
+    print(f"    加载后 items 数量: {len(loaded_q.items)}")
 
     print("\n" + "=" * 60)
     print("所有测试通过!")

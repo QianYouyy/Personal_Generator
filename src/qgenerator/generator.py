@@ -1,30 +1,40 @@
 """问卷生成器 (QGenerator)."""
 
+import ast
 import json
 import random
+import re
 from typing import List, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 from src.qgenerator import prompts
+from src.qgenerator.fewshot_data import Question
 from src.utils.config import get_config
 
 
 @dataclass
 class Questionnaire:
-    """问卷数据结构."""
+    """问卷数据结构（与论文技术路线一致）.
 
-    context: str            # c: 详细上下文
-    dimensions: List[dict]  # D: 多样性轴（含 name_cn, name_en, description, poles）
-    items: dict             # I: 按轴名分组的题项列表
-    brief: str = ""         # 原始简短描述（用于追溯）
+    Fields:
+      - context: str      # c: 详细上下文
+      - dimensions: List[str]  # D: 多样性轴，K ∈ {2, 3}
+      - items: List[Question]  # I: 题项列表（扁平列表，每个 Question 含 dimension 字段）
+      - brief: str        # 原始简短描述
+    """
+
+    context: str
+    dimensions: List[str]
+    items: List[Question]
+    brief: str = ""
 
     def to_dict(self) -> dict:
         return {
             "brief": self.brief,
             "context": self.context,
             "dimensions": self.dimensions,
-            "items": self.items,
+            "items": [q.to_dict() for q in self.items],
         }
 
     @classmethod
@@ -33,22 +43,19 @@ class Questionnaire:
             brief=data.get("brief", ""),
             context=data["context"],
             dimensions=data["dimensions"],
-            items=data["items"],
+            items=[Question.from_dict(q) for q in data["items"]],
         )
 
     def to_concordia_questions(self) -> List[dict]:
         """转换为 Concordia 兼容的 Question 对象列表."""
-        questions = []
+        return [q.to_dict() for q in self.items]
+
+    def items_by_dimension(self) -> dict:
+        """按维度名分组返回题项（便于查看）."""
+        result = {}
         for dim in self.dimensions:
-            dim_name = dim["name_cn"]
-            for item in self.items.get(dim_name, []):
-                questions.append({
-                    "text": item["text"],
-                    "dimension": dim_name,
-                    "scoring": item.get("scoring", "P"),
-                    "scale": 5,
-                })
-        return questions
+            result[dim] = [q for q in self.items if q.dimension == dim]
+        return result
 
 
 def _extract_json(text: str) -> dict:
@@ -65,10 +72,54 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
+def _extract_python_code(text: str) -> str:
+    """从 LLM 输出中提取 Python 代码块."""
+    text = text.strip()
+    # 尝试提取 ```python ... ``` 代码块
+    match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    # 如果没有标记，尝试直接返回
+    return text
+
+
+def _exec_questions_code(code: str) -> List[Question]:
+    """执行 Python 代码，提取 questions 列表.
+
+    安全说明：此函数使用 exec() 执行 LLM 生成的代码。
+    在生产环境中应考虑使用受限执行环境（如 sandbox）。
+    """
+    # 在受限命名空间中执行
+    namespace = {}
+    exec(code, namespace)
+
+    if "questions" not in namespace:
+        raise ValueError("Python 代码未定义 'questions' 变量")
+
+    raw_questions = namespace["questions"]
+
+    # 转换为 Question 对象列表
+    questions = []
+    for q in raw_questions:
+        if isinstance(q, dict):
+            questions.append(Question(**q))
+        elif hasattr(q, "preprompt"):
+            questions.append(Question(
+                preprompt=q.preprompt,
+                statement=q.statement,
+                choices=list(q.choices),
+                dimension=q.dimension,
+            ))
+        else:
+            raise ValueError(f"未知的 question 类型: {type(q)}")
+
+    return questions
+
+
 class QGenerator:
     """自动生成带多样性轴的心理学问卷.
 
-    model 和 temperature 从 configs/default.yaml 读取，无需硬编码。
+    model 和 temperature 从 configs/default.yaml 读取。
     """
 
     def __init__(
@@ -93,8 +144,8 @@ class QGenerator:
     ) -> Questionnaire:
         """两阶段生成问卷.
 
-        Stage 1: 扩展 brief_context → 详细上下文 c + 多样性轴 D
-        Stage 2: 按每个轴生成 Likert 题项 I
+        Stage 1: 扩展 brief_context → 详细上下文 c + 多样性轴 D (JSON)
+        Stage 2: 按每个轴生成 Likert 题项 I (Python 代码，exec 执行)
         """
         # ---- Stage 1 ----
         stage1_prompt = prompts.stage1_prompt(brief_context, k_dimensions)
@@ -115,9 +166,8 @@ class QGenerator:
             )
 
         # ---- Stage 2 ----
-        items_by_dimension = {}
+        all_questions = []
         for dim in dimensions:
-            dim_name = dim["name_cn"]
             stage2_prompt = prompts.stage2_prompt(
                 context, dim, self.items_per_dimension
             )
@@ -127,14 +177,23 @@ class QGenerator:
                 temperature=self.stage2_temp,
                 max_tokens=2048,
             )
-            stage2_data = _extract_json(stage2_resp)
-            items_by_dimension[dim_name] = stage2_data.get("items", [])
+            code = _extract_python_code(stage2_resp)
+            questions = _exec_questions_code(code)
+
+            # 验证所有题项的 dimension 是否正确
+            for q in questions:
+                if q.dimension != dim:
+                    raise ValueError(
+                        f"题项维度不匹配: 期望 '{dim}', 实际 '{q.dimension}'"
+                    )
+
+            all_questions.extend(questions)
 
         return Questionnaire(
             brief=brief_context,
             context=context,
             dimensions=dimensions,
-            items=items_by_dimension,
+            items=all_questions,
         )
 
     def batch_generate(

@@ -1,115 +1,110 @@
 """问卷生成器的 Prompt 模板."""
 
-# 少样本示例，展示高质量问卷的多样性轴和题项风格
-FEW_SHOT_EXAMPLES = """
-【示例 1: BFI (大五人格量表)】
-维度: 开放性(Openness), 尽责性(Conscientiousness), 外向性(Extraversion), 宜人性(Agreeableness), 神经质(Neuroticism)
-题项风格: "我喜欢抽象思考" / "我做事有条理" / "我在人群中感到 energized" / "我关心他人的感受" / "我容易感到焦虑"
-每个维度 8-10 题，Likert 5 点量表
+from src.qgenerator.fewshot_data import render_all_fewshots, AGREEMENT_SCALE
 
-【示例 2: DASS (抑郁焦虑压力量表)】
-维度: 抑郁(Depression), 焦虑(Anxiety), 压力(Stress)
-题项风格: "我觉得做任何事都很费劲" / "我感到口干舌燥" / "我很难放松下来"
-每个维度 7 题，Likert 4 点量表（本系统使用 5 点）
+# ============================================
+# Stage 1 少样本示例
+# 从 4 份成熟问卷中提取真实数据，渲染为可直接 exec() 的 Python 代码
+# ============================================
 
-【示例 3: SVO (社会价值取向量表)】
-维度: 亲社会(Prosocial), 个体主义(Individualistic), 竞争(Competitive)
-题项风格: 通过在资源分配情境中的选择来测量，如"你得到 X，对方得到 Y"
+FEW_SHOT_EXAMPLES = render_all_fewshots()
 
-【示例 4: NFCS (认知闭合需求量表)】
-维度: 决断性(Decisiveness), 结构需求(Need for Structure), 对模糊的不适(Discomfort with Ambiguity)
-题项风格: "我不喜欢问题没有明确答案的情况" / "我更喜欢有秩序的、按部就班的生活"
-"""
+STAGE1_SYSTEM_PROMPT = """You are an expert psychometrician specializing in personality psychology, social psychology, and psychological measurement.
+Your task is to design a new psychological questionnaire based on a brief scenario description, following the exact structure and style of the 4 example questionnaires provided.
 
-STAGE1_SYSTEM_PROMPT = """你是一位资深心理学量表设计专家，精通人格心理学、社会心理学和心理测量学。
-你的任务是根据用户提供的简短情境描述，设计一个能够捕捉该情境下人格差异多样性轴的心理学问卷。
-
-设计原则：
-1. 多样性轴必须是**在该情境下能够导致行为差异**的深层心理维度
-2. 轴与轴之间应尽量**正交**（低相关）
-3. 每个轴应该是**连续谱**（而非分类），两端代表截然不同的倾向
-4. 避免过于宽泛的人格维度，要贴合具体情境
+Design principles:
+1. Diversity dimensions must be deep psychological dimensions that lead to behavioral differences IN THE GIVEN SCENARIO
+2. Dimensions should be orthogonal (low correlation) to each other
+3. Each dimension should be a continuous spectrum, not a category
+4. Dimensions must emerge from the specific scenario, not generic personality traits
+5. Target dimension count is strictly 2 or 3
+6. Output format must be JSON, with dimension names as English snake_case identifiers (e.g., "agi_threat_appraisal")
 """
 
 
 def stage1_prompt(brief_context: str, k_dimensions: int) -> str:
-    """Stage 1: 扩展上下文 + 提议多样性轴."""
-    return f"""{FEW_SHOT_EXAMPLES}
+    """Stage 1: 扩展上下文 + 提议多样性轴（输出 JSON）."""
+    return f"""Here are 4 established psychological questionnaires rendered as Concordia-compatible Python code:
 
+{FEW_SHOT_EXAMPLES}
 ---
 
-【任务】
-基于以下简短情境描述，完成两个步骤：
+【Task】
+Based on the brief scenario description below, generate a new questionnaire following the EXACT structure and style of the 4 examples above.
 
-步骤 1 - 扩展情境:
-将简短描述扩展为 2-3 段的详细情境说明（c）。增加具体的背景信息、时间地点、涉及的社会角色、潜在冲突等，使情境更加丰满和具体。
+Requirements:
+1. Expand the scenario: Write a detailed context (200-500 words) describing the situation, roles, stakes, and conflicts
+2. Propose diversity dimensions: Design **exactly {k_dimensions}** dimensions
+   - Use English snake_case identifiers (e.g., "risk_tolerance", "social_compliance")
+   - Dimensions must emerge from the scenario, not generic traits like "openness" or "neuroticism"
+3. Output must be valid JSON
 
-步骤 2 - 设计多样性轴:
-为该情境设计 **{k_dimensions} 个**多样性轴（D）。
-要求：
-- 每个轴用 1-2 个中文字命名，并附英文翻译
-- 为每个轴写一段说明（50-100 字），解释它在此情境下如何导致不同行为
-- 明确标注轴的两端（如 "乐观 ↔ 悲观"）
-- 轴的数量严格为 {k_dimensions} 个
-
-【简短描述】
+【Brief Description】
 {brief_context}
 
-【输出格式】
-请用以下 JSON 格式输出（不要包含 markdown 代码块标记）：
+【Output Format (JSON)】
 {{
-  "context": "扩展后的详细情境...",
-  "dimensions": [
-    {{
-      "name_cn": "轴中文名",
-      "name_en": "AxisName",
-      "description": "轴的说明...",
-      "poles": ["左端标签", "右端标签"]
-    }}
-  ]
+  "context": "Detailed scenario description...",
+  "dimensions": ["dim_1", "dim_2"]
 }}
 """
 
 
-STAGE2_SYSTEM_PROMPT = """你是一位资深心理学量表设计专家。你的任务是根据给定的情境和多样性轴，设计 Likert 5 点量表题项。
+STAGE2_SYSTEM_PROMPT = f"""You are an expert psychometrician. Your task is to generate Likert-scale questionnaire items based on a given scenario and diversity dimensions.
 
-设计原则：
-1. 每个题项必须**只测量一个轴**，不能交叉
-2. 题项要**具体、可观察、避免双重否定**
-3. 题项要贴合情境，不能是通用人格题
-4. 每个轴的题项要覆盖轴的两端（正向和反向计分）
-5. 使用第一人称"我"或"对我来说"
+Design principles:
+1. Each item must measure ONLY ONE dimension
+2. Items must be SPECIFIC to the scenario, containing situational details
+3. Items should be observable behaviors or concrete thoughts, not abstract traits
+4. Use first-person "I" or "For me"
+5. All items must use the SAME 5-point Likert scale:
+   {AGREEMENT_SCALE}
+6. Output must be valid Python code that can be executed directly
 """
 
 
-def stage2_prompt(context: str, dimension: dict, num_items: int = 5) -> str:
-    """Stage 2: 为单个轴生成题项."""
-    dim_name = dimension["name_cn"]
-    poles = dimension.get("poles", ["低", "高"])
-    return f"""【情境】
+def stage2_prompt(context: str, dimension: str, num_items: int = 5) -> str:
+    """Stage 2: 为单个轴生成题项（输出可直接 exec 的 Python 代码）."""
+    return f"""【Scenario Context】
 {context}
 
-【多样性轴】
-轴名: {dim_name}
-说明: {dimension.get('description', '')}
-两端: {poles[0]} ↔ {poles[1]}
+【Dimension to Measure】
+{dimension}
 
-【任务】
-为该轴设计 {num_items} 个 Likert 5 点量表题项。
-要求：
-- 其中约一半为正向计分（高分对应 {poles[1]}）
-- 约一半为反向计分（高分对应 {poles[0]}）
-- 每题标注是正向(P)还是反向(N)
-- 题项要具体、贴合情境
+【Task】
+Generate {num_items} Likert-scale questionnaire items for the dimension "{dimension}".
 
-【输出格式】
-请用以下 JSON 格式输出（不要包含 markdown 代码块标记）：
-{{
-  "items": [
-    {{
-      "text": "题项内容",
-      "scoring": "P"
-    }}
-  ]
-}}
+Requirements:
+- Each item must be specific to the scenario above (contain situational details)
+- All items use the same 5-point Likert scale: {AGREEMENT_SCALE}
+- Use first-person statements ("I..." or "For me...")
+- Output must be valid Python code that can be executed directly with exec()
+- The code must define a variable named `questions` as a list of Question objects
+
+【Output Format (Python Code)】
+```python
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class Question:
+    preprompt: str
+    statement: str
+    choices: List[str]
+    dimension: str
+
+AGREEMENT_SCALE = {AGREEMENT_SCALE!r}
+
+questions = [
+    Question(
+        preprompt="Rate your agreement:",
+        statement="Specific item text related to the scenario...",
+        choices=AGREEMENT_SCALE,
+        dimension="{dimension}",
+    ),
+    # ... more items
+]
+```
+
+Please output ONLY the Python code block, nothing else.
 """
