@@ -1,27 +1,73 @@
-"""多样性评估器 - 6 个指标."""
+"""多样性评估器 — 6 个多样性指标."""
 
 import numpy as np
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.distance import cdist
-from scipy.stats import entropy
-from scipy.spatial import cKDTree
+from scipy.stats import gaussian_kde, entropy
+from scipy.stats import qmc
+from typing import Dict, List, Tuple
 
 
-class DiversityEvaluator:
-    """计算人格分布的 6 个多样性指标."""
+class DiversityMetrics:
+    """计算人格分布的 6 个多样性指标.
+
+    指标列表:
+      1. Coverage       — 球覆盖比例（越大越好）
+      2. ConvexHull     — 凸包体积（越大越好）
+      3. AvgDist        — 平均两两距离（越大越好）
+      4. MinDist        — 最小两两距离（越大越好）
+      5. Dispersion     — 最大空白区半径（越小越好 → 符号反转）
+      6. KL Divergence  — 与 Sobol 分布的 KL 散度（越小越好 → 符号反转）
+    """
 
     NUM_RANDOM_POINTS = 10000
+    COVERAGE_TARGET = 0.99
+    COVERAGE_CALIBRATION_TRIALS = 1000
 
-    def __init__(self, coverage_radius: float):
-        self.k = coverage_radius  # 校准后的 Coverage 半径
+    def __init__(self, coverage_radius: float = None):
+        """
+        Args:
+            coverage_radius: Coverage 球的半径 k。
+                若为 None，则自动根据 N=25, dim=2/3 校准。
+        """
+        self.k = coverage_radius
+
+    # ------------------------------------------------------------------
+    # 6 个核心指标
+    # ------------------------------------------------------------------
 
     def coverage(self, Z: np.ndarray) -> float:
-        """覆盖率: 随机点被球覆盖的比例."""
-        # TODO: 在 K 维空间撒点，计算覆盖比例
-        raise NotImplementedError("Phase 2 实现中")
+        """覆盖率: 随机参考点被球覆盖的比例.
+
+        算法:
+          1. 在 Z 的包围盒内撒 NUM_RANDOM_POINTS 个随机点
+          2. 对每个随机点，检查是否落在任一 z_i 为中心、半径 k 的球内
+          3. 返回被覆盖的比例
+        """
+        if len(Z) == 0:
+            return 0.0
+
+        n, dim = Z.shape
+        k = self._get_coverage_radius(n, dim)
+
+        # 在 Z 的包围盒内撒点
+        mins = Z.min(axis=0)
+        maxs = Z.max(axis=0)
+        random_points = np.random.rand(self.NUM_RANDOM_POINTS, dim)
+        random_points = random_points * (maxs - mins) + mins
+
+        # 用 cKDTree 加速近邻查询
+        tree = cKDTree(Z)
+        distances, _ = tree.query(random_points, k=1)
+        covered = (distances <= k).sum()
+
+        return covered / self.NUM_RANDOM_POINTS
 
     def convex_hull_volume(self, Z: np.ndarray) -> float:
-        """凸包体积."""
+        """凸包体积.
+
+        注意: 低维数据（点数 ≤ 维数）时返回 0。
+        """
         if len(Z) <= Z.shape[1]:
             return 0.0
         try:
@@ -31,30 +77,97 @@ class DiversityEvaluator:
             return 0.0
 
     def avg_pairwise_dist(self, Z: np.ndarray) -> float:
-        """平均两两距离."""
+        """平均两两欧氏距离."""
+        if len(Z) <= 1:
+            return 0.0
         dists = cdist(Z, Z)
         # 取上三角（排除对角线）
-        return dists[np.triu_indices_from(dists, k=1)].mean()
+        triu_idx = np.triu_indices_from(dists, k=1)
+        return float(dists[triu_idx].mean())
 
     def min_pairwise_dist(self, Z: np.ndarray) -> float:
-        """最小两两距离."""
+        """最小两两欧氏距离."""
+        if len(Z) <= 1:
+            return 0.0
         dists = cdist(Z, Z)
-        # 排除对角线（距离为0）
         np.fill_diagonal(dists, np.inf)
-        return dists.min()
+        return float(dists.min())
 
     def dispersion(self, Z: np.ndarray) -> float:
-        """最大空白区半径（随机参考点到最近 z_i 的最大距离）."""
-        # TODO: 撒随机参考点，找最大距离
-        raise NotImplementedError("Phase 2 实现中")
+        """最大空白区半径: 随机参考点到最近 z_i 的最大距离.
 
-    def kl_divergence(self, Z: np.ndarray) -> float:
-        """KL 散度: Z 的经验分布 vs Sobol 准随机参考分布."""
-        # TODO: 用核密度估计 + Sobol 采样计算 KL
-        raise NotImplementedError("Phase 2 实现中")
+        越小表示覆盖越均匀。在适应度计算中会符号反转。
+        """
+        if len(Z) == 0:
+            return 0.0
 
-    def evaluate(self, Z: np.ndarray) -> dict:
-        """计算全部 6 个指标."""
+        n, dim = Z.shape
+        mins = Z.min(axis=0)
+        maxs = Z.max(axis=0)
+
+        random_points = np.random.rand(self.NUM_RANDOM_POINTS, dim)
+        random_points = random_points * (maxs - mins) + mins
+
+        tree = cKDTree(Z)
+        distances, _ = tree.query(random_points, k=1)
+        return float(distances.max())
+
+    def kl_divergence(self, Z: np.ndarray, num_ref_points: int = 10000) -> float:
+        """KL 散度: Z 的经验分布 vs Sobol 准随机参考分布.
+
+        使用核密度估计(KDE)估计两个分布，然后计算 KL 散度。
+        越小表示 Z 的分布越接近均匀。在适应度计算中会符号反转。
+        """
+        if len(Z) == 0:
+            return 0.0
+
+        n, dim = Z.shape
+
+        # Sobol 参考分布采样
+        try:
+            sampler = qmc.Sobol(d=dim, scramble=True)
+            ref_points = sampler.random(num_ref_points)
+        except Exception:
+            ref_points = np.random.rand(num_ref_points, dim)
+
+        # 将 Z 和参考点归一化到 [0, 1] 区间
+        mins = Z.min(axis=0)
+        maxs = Z.max(axis=0)
+        range_vals = maxs - mins
+        range_vals[range_vals == 0] = 1.0  # 避免除零
+
+        Z_norm = (Z - mins) / range_vals
+        ref_norm = (ref_points - mins) / range_vals
+        ref_norm = np.clip(ref_norm, 0, 1)
+
+        # 使用直方图估计分布（比 KDE 更稳定，尤其在高维）
+        bins_per_dim = max(5, int(50 ** (1.0 / dim)))  # 自适应 bin 数
+        bins = [bins_per_dim] * dim
+
+        # Z 的经验分布
+        hist_z, edges = np.histogramdd(Z_norm, bins=bins, range=[(0, 1)] * dim)
+        hist_z = hist_z.flatten() + 1e-10  # 加平滑避免零概率
+        hist_z = hist_z / hist_z.sum()
+
+        # 参考分布
+        hist_ref, _ = np.histogramdd(ref_norm, bins=bins, range=[(0, 1)] * dim)
+        hist_ref = hist_ref.flatten() + 1e-10
+        hist_ref = hist_ref / hist_ref.sum()
+
+        # KL(Z || Ref)
+        kl = entropy(hist_z, hist_ref)
+        return float(kl)
+
+    # ------------------------------------------------------------------
+    # 聚合评估
+    # ------------------------------------------------------------------
+
+    def evaluate(self, Z: np.ndarray) -> Dict[str, float]:
+        """计算全部 6 个指标.
+
+        Returns:
+            dict: {metric_name: value}
+        """
         return {
             "coverage": self.coverage(Z),
             "convex_hull": self.convex_hull_volume(Z),
@@ -64,12 +177,132 @@ class DiversityEvaluator:
             "kl_divergence": self.kl_divergence(Z),
         }
 
-    @staticmethod
-    def calibrate_coverage_radius(n: int = 25, dim: int = 2, trials: int = 1000) -> float:
+    def fitness(self, Z: np.ndarray) -> Dict[str, float]:
+        """计算适应度分数（统一为"越大越好"）.
+
+        Dispersion 和 KL Divergence 取负值（或倒数），使其方向一致。
+        """
+        metrics = self.evaluate(Z)
+        fitness = {
+            "coverage": metrics["coverage"],
+            "convex_hull": metrics["convex_hull"],
+            "avg_dist": metrics["avg_dist"],
+            "min_dist": metrics["min_dist"],
+            # 符号反转: 越小越好 → 越大越好
+            "dispersion": -metrics["dispersion"],
+            "kl_divergence": -metrics["kl_divergence"],
+        }
+        return fitness
+
+    # ------------------------------------------------------------------
+    # Coverage 半径校准
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def calibrate_coverage_radius(
+        cls,
+        n: int = 25,
+        dim: int = 2,
+        trials: int = None,
+        target: float = None,
+    ) -> float:
         """校准 Coverage 半径 k.
 
-        从 Sobol 分布采样 N 个点，找覆盖 99% 空间的最小半径，
-        重复 trials 次取平均.
+        从 Sobol 分布采样 N 个点，找覆盖 target 比例空间的最小半径，
+        重复 trials 次取平均。
+
+        Args:
+            n: 每次采样的点数（默认 25，匹配评估时的 personas_per_evaluation）
+            dim: 维度数
+            trials: 重复次数（默认 1000）
+            target: 目标覆盖比例（默认 0.99）
+
+        Returns:
+            float: 校准后的半径 k
         """
-        # TODO: Phase 2 实现
-        raise NotImplementedError("Phase 2 实现中")
+        trials = trials or cls.COVERAGE_CALIBRATION_TRIALS
+        target = target or cls.COVERAGE_TARGET
+
+        radii = []
+        for _ in range(trials):
+            try:
+                sampler = qmc.Sobol(d=dim, scramble=True)
+                points = sampler.random(n=n)
+            except Exception:
+                points = np.random.rand(n, dim)
+
+            # 二分查找最小半径
+            r_low, r_high = 0.0, 2.0  # 在归一化空间，最大距离约 sqrt(dim)
+            for _ in range(30):  # 二分 30 次足够精确
+                r_mid = (r_low + r_high) / 2.0
+
+                # 检查覆盖比例
+                random_pts = np.random.rand(cls.NUM_RANDOM_POINTS, dim)
+                tree = cKDTree(points)
+                dists, _ = tree.query(random_pts, k=1)
+                coverage = (dists <= r_mid).mean()
+
+                if coverage >= target:
+                    r_high = r_mid
+                else:
+                    r_low = r_mid
+
+            radii.append((r_low + r_high) / 2.0)
+
+        return float(np.mean(radii))
+
+    # ------------------------------------------------------------------
+    # 内部辅助
+    # ------------------------------------------------------------------
+
+    def _get_coverage_radius(self, n: int, dim: int) -> float:
+        """获取 Coverage 半径（优先使用预校准值，否则动态计算）."""
+        if self.k is not None:
+            return self.k
+        # 动态校准（缓存结果）
+        if not hasattr(self, "_cached_radius"):
+            print(f"  [Evaluator] 校准 Coverage 半径 (N={n}, dim={dim})...")
+            self._cached_radius = self.calibrate_coverage_radius(n=n, dim=dim)
+            print(f"  [Evaluator] 校准完成: k = {self._cached_radius:.4f}")
+        return self._cached_radius
+
+
+class MultiQuestionnaireEvaluator:
+    """跨多份问卷的聚合评估器.
+
+    对 40 份问卷分别计算 M(Z)，取平均作为最终适应度。
+    """
+
+    def __init__(self, coverage_radius: float = None):
+        self.metrics = DiversityMetrics(coverage_radius)
+
+    def evaluate_batch(
+        self,
+        questionnaire_results: List[np.ndarray],
+    ) -> Dict[str, float]:
+        """评估多份问卷的结果并取平均.
+
+        Args:
+            questionnaire_results: 每份问卷的 Z 矩阵列表
+                每个 Z 形状为 (N, K)
+
+        Returns:
+            dict: 6 个指标的平均值
+        """
+        all_metrics = []
+        for i, Z in enumerate(questionnaire_results):
+            if Z is None or len(Z) == 0:
+                continue
+            m = self.metrics.fitness(Z)
+            all_metrics.append(m)
+
+        if not all_metrics:
+            return {name: 0.0 for name in DiversityMetrics().evaluate(np.zeros((1, 2))).keys()}
+
+        # 取平均
+        avg_metrics = {}
+        for key in all_metrics[0].keys():
+            values = [m[key] for m in all_metrics]
+            avg_metrics[key] = float(np.mean(values))
+
+        return avg_metrics
