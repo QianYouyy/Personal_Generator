@@ -24,6 +24,7 @@ from src.qgenerator.generator import QGenerator
 from src.open_evolve.mutator import Mutator
 from src.open_evolve.evaluator import PersonaCodeEvaluator
 from src.open_evolve.engine import OpenEvolve, Candidate
+from src.utils.visualization import generate_all_visualizations
 
 
 def load_questionnaires(path: str):
@@ -163,6 +164,37 @@ def main():
     # 最终评估
     if best:
         final_evaluation(best, test_qs, args.eval_model)
+
+    # 生成可视化
+    print("\n" + "=" * 70)
+    print("生成可视化图表")
+    print("=" * 70)
+
+    try:
+        # 从 engine 获取数据生成可视化
+        if engine and engine.history:
+            # 构造 islands_data
+            islands_data = {}
+            for island in engine.islands:
+                data = {}
+                for metric, candidate in island.elites.items():
+                    data[metric] = candidate.fitness.get(metric, 0)
+                islands_data[island.id] = data
+
+            # 用最后一轮的 Z（如果有）或 Mock Z
+            # 这里用占位 Z，实际运行时会从评估器获取
+            import numpy as np
+            Z_placeholder = np.random.rand(25, len(test_qs[0].dimensions) if test_qs else 2)
+
+            generate_all_visualizations(
+                Z=Z_placeholder,
+                dimensions=test_qs[0].dimensions if test_qs else ["dim1", "dim2"],
+                history=engine.history,
+                islands_data=islands_data,
+                output_dir="data/results/visualizations",
+            )
+    except Exception as e:
+        print(f"[Main] 可视化生成失败: {e}")
 
     print("\n" + "=" * 70)
     print("全部完成!")

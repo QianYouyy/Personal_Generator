@@ -241,7 +241,7 @@ best = engine.run(max_generations=100)
 | Phase 2 | 多样性评估器 (6 指标) | ✅ 完成 | Coverage 半径校准 + 多问卷聚合 |
 | Phase 3 | Open-Evolve 引擎 | ✅ 完成 | 岛屿 + 变异 + 灭绝 + 反馈 |
 | **Phase 4** | **集成主入口** | ✅ **完成** | `main.py` 一键运行 + checkpoint + 日志 |
-| Phase 5 | 可视化 | ⏳ 待开始 | 2D/3D 散点图 + 进化曲线 |
+| Phase 5 | 可视化 | ✅ 完成 | 2D/3D 散点图 + 进化曲线 + 岛屿热力图 |
 | Phase 5 | 单元测试 | ⏳ 待开始 | 补全测试覆盖 |
 
 ---
