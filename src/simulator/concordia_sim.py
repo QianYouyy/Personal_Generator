@@ -1,21 +1,13 @@
 """Concordia 模拟器 — 将文本人格转化为数值化回答嵌入.
 
-本实现基于 Concordia 框架的核心概念：
-  - AssociativeMemoryBank: Agent 的记忆系统
-  - EntityAgentWithLogging: 带日志的 Agent
-  - QuestionOfRecentMemories: 让 Agent 回答问题
-
-但简化了配置流程，直接通过 LLM 调用实现"适当性逻辑"：
-  1. "这是什么样的情境？"
-  2. "我是什么样的人？"
-  3. "像我这样的人会怎么做？"
-
-每道题后重置 Agent 记忆，防止顺序效应。
+基于 Concordia 框架核心概念，但简化了配置流程，直接通过 LLM 调用实现"适当性逻辑"。
+支持多线程并行加速。
 """
 
 import re
 from typing import List, Dict
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from src.qgenerator.fewshot_data import AGREEMENT_SCALE
@@ -23,21 +15,16 @@ from src.qgenerator.fewshot_data import AGREEMENT_SCALE
 
 @dataclass
 class ConcordiaAgent:
-    """简化版 Concordia Agent.
-
-    封装了人格描述和记忆状态，核心行为是让 LLM 根据人格回答问卷题项。
-    """
+    """简化版 Concordia Agent."""
 
     name: str
-    persona_description: str  # p_i: 完整人格描述
-    memory: List[str]         # 模拟 Concordia 的 AssociativeMemory
+    persona_description: str
+    memory: List[str]
 
     def reset(self):
-        """重置记忆（防止顺序效应）."""
         self.memory = []
 
     def observe(self, observation: str):
-        """观察/记忆一条信息."""
         self.memory.append(observation)
 
     def answer_question(
@@ -47,25 +34,9 @@ class ConcordiaAgent:
         llm_client,
         context: str = "",
     ) -> int:
-        """让 Agent 回答一道问卷题项.
-
-        使用"适当性逻辑"(Logic of Appropriateness)：
-          1. 识别情境
-          2. 回忆自己是谁
-          3. 做出符合人格的选择
-
-        Args:
-            question_statement: 题项陈述
-            choices: 选项列表（如 Likert 5 点量表）
-            llm_client: LLM 客户端
-            context: 问卷情境描述
-
-        Returns:
-            int: 选择的选项索引（0-based）
-        """
-        # 构建适当性逻辑的 prompt
+        """让 Agent 回答一道问卷题项."""
         memory_context = "\n".join(
-            f"- {m}" for m in self.memory[-5:]  # 最近 5 条记忆
+            f"- {m}" for m in self.memory[-5:]
         ) if self.memory else "（暂无相关记忆）"
 
         choices_str = "\n".join(
@@ -94,95 +65,105 @@ class ConcordiaAgent:
 
         resp = llm_client.generate(
             prompt,
-            temperature=0.3,  # 低温度确保一致性
+            temperature=0.3,
             max_tokens=10,
         )
 
-        # 解析选项编号
         match = re.search(r'\b(\d+)\b', resp.strip())
         if match:
             choice_idx = int(match.group(1))
             choice_idx = max(0, min(choice_idx, len(choices) - 1))
         else:
-            # 回退：默认选中间值
             choice_idx = len(choices) // 2
 
-        # 记录这次回答到记忆
         self.observe(f"回答了问题：'{question_statement[:50]}...' → 选择 '{choices[choice_idx]}'")
-
         return choice_idx
 
 
 class ConcordiaSimulator:
-    """Concordia 模拟器 — 将人格群体转化为数值化回答嵌入.
+    """Concordia 模拟器 — 支持多线程并行加速."""
 
-    输入：P（人格群体），I（问卷题项）
-    输出：Z = {z₁...z_N} ⊂ ℝ^K
-    """
-
-    def __init__(self, llm_client):
+    def __init__(self, llm_client, max_workers: int = 5):
         self.llm = llm_client
+        self.max_workers = max_workers
+
+    def _answer_single(
+        self,
+        agent_idx: int,
+        agent: ConcordiaAgent,
+        item_idx: int,
+        statement: str,
+        choices: List[str],
+        context: str,
+    ) -> tuple:
+        """回答单道题（用于多线程）."""
+        agent.reset()
+        choice_idx = agent.answer_question(
+            question_statement=statement,
+            choices=choices,
+            llm_client=self.llm,
+            context=context,
+        )
+        return (agent_idx, item_idx, choice_idx)
 
     def simulate(
         self,
-        personas: List[Dict],  # 人格描述列表，每个含 "description" 字段
-        questionnaire: Dict,   # 问卷数据，含 "context", "dimensions", "items"
+        personas: List[Dict],
+        questionnaire: Dict,
     ) -> np.ndarray:
-        """模拟人格群体回答问卷.
-
-        Args:
-            personas: 人格描述列表，每项为 {"description": str}
-            questionnaire: 问卷数据结构
-                - context: str
-                - dimensions: List[str]
-                - items: List[Question]（含 statement, choices, dimension）
-
-        Returns:
-            np.ndarray: Z = {z₁...z_N} ⊂ ℝ^K，每行是一个人格在各维度上的平均得分
-        """
+        """模拟人格群体回答问卷（多线程加速）."""
         context = questionnaire.get("context", "")
         dimensions = questionnaire.get("dimensions", [])
         items = questionnaire.get("items", [])
         k = len(dimensions)
         n = len(personas)
 
-        print(f"  [Simulator] 模拟 {n} 个人格回答 {len(items)} 道题...")
+        logger_msg = f"[Simulator] 模拟 {n} 个人格回答 {len(items)} 道题 (并行 {self.max_workers} 线程)..."
+        print(f"  {logger_msg}")
 
-        # 为每个人格创建 Agent
+        # 创建 Agent
         agents = []
         for i, p in enumerate(personas):
             desc = p.get("description", p) if isinstance(p, dict) else str(p)
-            agent = ConcordiaAgent(
+            agents.append(ConcordiaAgent(
                 name=f"Persona_{i+1}",
                 persona_description=desc,
                 memory=[],
-            )
-            agents.append(agent)
+            ))
 
-        # 收集回答
-        # answers[persona_idx][item_idx] = choice_idx
         answers = np.zeros((n, len(items)), dtype=int)
 
-        for item_idx, item in enumerate(items):
-            statement = item.get("statement", item.get("text", ""))
-            choices = item.get("choices", AGREEMENT_SCALE)
-            dim = item.get("dimension", "")
+        # 多线程并行：所有 (人格, 题项) 组合同时处理
+        total_tasks = n * len(items)
+        completed = 0
 
-            for agent_idx, agent in enumerate(agents):
-                # 每道题前重置记忆（防止顺序效应）
-                agent.reset()
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {}
+            for item_idx, item in enumerate(items):
+                statement = item.get("statement", item.get("text", ""))
+                choices = item.get("choices", AGREEMENT_SCALE)
+                for agent_idx, agent in enumerate(agents):
+                    future = executor.submit(
+                        self._answer_single,
+                        agent_idx, agent, item_idx,
+                        statement, choices, context
+                    )
+                    futures[future] = (agent_idx, item_idx)
 
-                # 让 Agent 回答
-                choice_idx = agent.answer_question(
-                    question_statement=statement,
-                    choices=choices,
-                    llm_client=self.llm,
-                    context=context,
-                )
-                answers[agent_idx, item_idx] = choice_idx
+            for future in as_completed(futures):
+                agent_idx, item_idx = futures[future]
+                try:
+                    _, _, choice_idx = future.result()
+                    answers[agent_idx, item_idx] = choice_idx
+                except Exception as e:
+                    print(f"    [Simulator] 回答失败 (agent={agent_idx}, item={item_idx}): {e}")
 
-        # 按维度取平均 → z_i
-        # 构建维度到题项索引的映射
+                completed += 1
+                # 进度打印已禁用（减少日志噪音）
+                # if completed % 10 == 0 or completed == total_tasks:
+                #     print(f"    [Simulator] 进度: {completed}/{total_tasks} ({completed/total_tasks*100:.0f}%)")
+
+        # 按维度取平均
         dim_to_items = {dim: [] for dim in dimensions}
         for item_idx, item in enumerate(items):
             dim = item.get("dimension", "")
@@ -193,8 +174,6 @@ class ConcordiaSimulator:
         for dim_idx, dim in enumerate(dimensions):
             item_indices = dim_to_items.get(dim, [])
             if item_indices:
-                # 将选项索引归一化到 [0, 1]
-                # 假设选项是等距的 Likert 量表
                 max_choice = len(items[0].get("choices", AGREEMENT_SCALE)) - 1
                 dim_scores = answers[:, item_indices] / max_choice
                 Z[:, dim_idx] = dim_scores.mean(axis=1)

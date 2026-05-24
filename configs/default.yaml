@@ -12,12 +12,11 @@ llm:
   api_key: null           # 从环境变量 OPENAI_API_KEY 读取
 
   # 各阶段专用模型（修改此处即可切换模型）
-  qgenerator_model: "gpt-4o"           # Phase 1: 问卷生成器
-  persona_model: "gemma-3-27b-it"      # Phase 2: 人格生成器（所有 seed 共用）
-  simulator_model: "gpt-4o-mini"       # Phase 2: Concordia 模拟器（Agent 内部推理）
-  evaluator_model: "gpt-4o"            # Phase 2: 评估器（一致性校验等）
-  mutator_model: "gpt-4o"              # Phase 3: Open-Evolve 变异算子（代码改写）
-  feedback_model: "gpt-4o"             # Phase 3: 反馈机制（empirical data 分析）
+  # 注意：以下模型必须配置，程序会按名称自动调用
+  qgenerator_model: "gpt-5.4"           # Phase 1: 问卷生成器（生成新问卷）
+  mutator_model: "gpt-5.4-mini"              # Phase 3: 变异算子（代码改写，需要强模型）
+  persona_model: "gpt-4o-mini"         # Phase 2: 人格生成器（Stage1/Stage2）
+  simulator_model: "gpt-4o-mini"       # Phase 2: Concordia 模拟器（Agent 回答）
 
 # --------------------------------------------
 # Phase 1: 问卷生成器配置
@@ -57,6 +56,7 @@ simulator:
   reset_memory_per_question: true
   logic: "appropriateness"
   max_attempts_per_question: 3
+  max_workers: 10          # 并行线程数（模拟回答时的并发数）
 
 # --------------------------------------------
 # Phase 2: 多样性评估器配置
@@ -77,13 +77,13 @@ evaluator:
 # Phase 3: Open-Evolve 进化引擎配置
 # --------------------------------------------
 open_evolve:
-  num_islands: 10
+  num_islands: 6
   elites_per_island: 6
-  extinction_interval: 100        # 轮数
-  extinction_interval_hours: 8
+  extinction_interval: 5          # 轮数触发灭绝（每5轮触发一次）
+  extinction_interval_hours: 8    # 小时触发灭绝
   initial_seed_distribution:
-    seed1: 4
-    seed2: 3
-    seed3: 3
+    seed1: 2
+    seed2: 2
+    seed3: 2
   max_evaluations_per_candidate: 40    # 评估时使用的问卷数量
-  personas_per_evaluation: 25          # 每份问卷生成的人格数量
+  personas_per_evaluation: 10          # 每份问卷生成的人格数量（测试阶段建议5-15，正式25）

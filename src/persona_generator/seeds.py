@@ -2,6 +2,7 @@
 
 import random
 import numpy as np
+import asyncio
 from abc import ABC, abstractmethod
 from typing import List
 
@@ -20,57 +21,127 @@ class PersonaSeed(ABC):
 
     @abstractmethod
     def stage1(self, context: str, dimensions: List[str], n: int) -> List[str]:
-        """Stage 1: 生成高层定位标签 p̂_i.
-
-        Returns:
-            List[str]: 高层定位标签列表
-        """
+        """Stage 1: 生成高层定位标签 p̂_i."""
         pass
 
+    async def _stage2_single_async(self, context: str, dimensions: List[str], tag: str, idx: int) -> tuple:
+        """异步生成单个人格的 Stage 2."""
+        import time
+        start = time.time()
+        prompt = prompts.stage2_prompt(context, dimensions, tag)
+        resp = await self.llm.generate_async(
+            prompt,
+            system_prompt=prompts.STAGE2_SYSTEM_PROMPT,
+            temperature=self.stage2_temp,
+            max_tokens=512,
+        )
+        elapsed = time.time() - start
+        from src.utils.logger import logger
+        logger.info(f"[Stage2] Persona {idx+1} 生成完成: {elapsed:.2f}s")
+        return (idx, resp.strip())
+
     def stage2(self, context: str, dimensions: List[str], high_level_tags: List[str]) -> List[str]:
-        """Stage 2: 并行细节扩展.
+        """Stage 2: 异步并行细节扩展.
 
         所有 seed 共享相同的 Stage 2 策略：形成性记忆。
-
-        Returns:
-            List[str]: 完整人格描述列表
+        使用 asyncio 并发生成所有人格。
         """
+        import time
+        total_start = time.time()
+        print(f"    [Stage2] 开始生成 {len(high_level_tags)} 个人格...")
+        
+        async def _run_all():
+            tasks = [
+                self._stage2_single_async(context, dimensions, tag, idx)
+                for idx, tag in enumerate(high_level_tags)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            return results
+
+        # 直接使用 asyncio.run，避免嵌套事件循环问题
+        # 安全运行异步代码（兼容ThreadPoolExecutor环境）
+        try:
+            results = asyncio.run(_run_all())
+        except RuntimeError:
+            # 已在事件循环中，使用nest_asyncio
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(_run_all())
+
+        total_elapsed = time.time() - total_start
+        from src.utils.logger import logger
+        logger.info(f"[Stage2] 全部完成: {total_elapsed:.2f}s")
+
         personas = []
-        for tag in high_level_tags:
-            prompt = prompts.stage2_prompt(context, dimensions, tag)
-            resp = self.llm.generate(
-                prompt,
-                system_prompt=prompts.STAGE2_SYSTEM_PROMPT,
-                temperature=self.stage2_temp,
-                max_tokens=1024,
-            )
-            personas.append(resp.strip())
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"[Stage2] 生成失败 (idx={idx}): {result}")
+                personas.append(f"Error: {result}")
+            else:
+                _, persona = result
+                personas.append(persona)
+
         return personas
 
 
 class Seed1Default(PersonaSeed):
     """seed1: 默认 Concordia 提示 + 形成性记忆.
 
-    Stage 1 策略：串行逐个生成，每次把已生成的人格加入上下文，
-    让模型主动错开，确保多样性空间覆盖。
+    Stage 1 策略：并行生成所有标签。
     """
 
+    async def _stage1_single_async(self, context: str, dimensions: List[str], n: int, i: int) -> str:
+        """异步生成单个标签."""
+        import time
+        start = time.time()
+        prompt = prompts.stage1_seed1_prompt(
+            context, dimensions, n, generated_so_far=[]
+        )
+        resp = await self.llm.generate_async(
+            prompt,
+            system_prompt=prompts.STAGE1_SYSTEM_PROMPT,
+            temperature=self.stage1_temp,
+            max_tokens=256,
+        )
+        elapsed = time.time() - start
+        from src.utils.logger import logger
+        logger.info(f"[Stage1] Tag {i+1} 生成完成: {elapsed:.2f}s")
+        tag = resp.strip()
+        tag = tag.lstrip("1234567890. ").strip()
+        return tag
+
     def stage1(self, context: str, dimensions: List[str], n: int) -> List[str]:
+        import time
+        total_start = time.time()
+        print(f"    [Stage1] 开始生成 {n} 个标签...")
+        
+        async def _run_all():
+            tasks = [self._stage1_single_async(context, dimensions, n, i) for i in range(n)]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 安全运行异步代码（兼容ThreadPoolExecutor环境）
+        try:
+            results = asyncio.run(_run_all())
+        except RuntimeError:
+            # 已在事件循环中，使用nest_asyncio
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(_run_all())
+
+        total_elapsed = time.time() - total_start
+        from src.utils.logger import logger
+        logger.info(f"[Stage1] 全部完成: {total_elapsed:.2f}s")
+
         tags = []
-        for i in range(n):
-            prompt = prompts.stage1_seed1_prompt(
-                context, dimensions, n, generated_so_far=tags
-            )
-            resp = self.llm.generate(
-                prompt,
-                system_prompt=prompts.STAGE1_SYSTEM_PROMPT,
-                temperature=self.stage1_temp,
-                max_tokens=256,
-            )
-            tag = resp.strip()
-            # 去除可能的编号前缀
-            tag = tag.lstrip("1234567890. ").strip()
-            tags.append(tag)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"[Seed1 Stage1] 生成失败 (i={i}): {result}")
+                tags.append(f"Error: {result}")
+            else:
+                tags.append(result)
+
         return tags
 
 
@@ -98,7 +169,7 @@ class Seed2SmallBatch(PersonaSeed):
                 prompt,
                 system_prompt=prompts.STAGE1_SYSTEM_PROMPT,
                 temperature=self.stage1_temp,
-                max_tokens=1024,
+                max_tokens=512,
             )
 
             # 解析编号列表
@@ -129,7 +200,31 @@ class Seed3QuasiRandom(PersonaSeed):
     2. 对每个点，用 LLM 将坐标翻译为文字描述
     """
 
+    async def _stage1_single_async(self, context: str, dimensions: List[str], coords: List[float], i: int) -> str:
+        """异步生成单个标签."""
+        import time
+        start = time.time()
+        prompt = prompts.stage1_seed3_coordinate_to_text(
+            context, dimensions, coords
+        )
+        resp = await self.llm.generate_async(
+            prompt,
+            system_prompt=prompts.STAGE1_SYSTEM_PROMPT,
+            temperature=self.stage1_temp,
+            max_tokens=256,
+        )
+        elapsed = time.time() - start
+        from src.utils.logger import logger
+        logger.info(f"[Stage1] Tag {i+1} 生成完成: {elapsed:.2f}s")
+        tag = resp.strip()
+        tag = tag.lstrip("1234567890. ").strip()
+        return tag
+
     def stage1(self, context: str, dimensions: List[str], n: int) -> List[str]:
+        import time
+        total_start = time.time()
+        print(f"    [Stage1] 开始生成 {n} 个标签...")
+        
         k = len(dimensions)
 
         # 使用 Sobol 序列在 K 维空间均匀采样
@@ -141,19 +236,33 @@ class Seed3QuasiRandom(PersonaSeed):
             # 回退：均匀随机采样
             points = np.random.rand(n, k)
 
+        async def _run_all():
+            tasks = [
+                self._stage1_single_async(context, dimensions, coords.tolist(), i)
+                for i, coords in enumerate(points)
+            ]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 安全运行异步代码（兼容ThreadPoolExecutor环境）
+        try:
+            results = asyncio.run(_run_all())
+        except RuntimeError:
+            # 已在事件循环中，使用nest_asyncio
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(_run_all())
+
+        total_elapsed = time.time() - total_start
+        from src.utils.logger import logger
+        logger.info(f"[Stage1] 全部完成: {total_elapsed:.2f}s")
+
         tags = []
-        for i, coords in enumerate(points):
-            prompt = prompts.stage1_seed3_coordinate_to_text(
-                context, dimensions, coords.tolist()
-            )
-            resp = self.llm.generate(
-                prompt,
-                system_prompt=prompts.STAGE1_SYSTEM_PROMPT,
-                temperature=self.stage1_temp,
-                max_tokens=256,
-            )
-            tag = resp.strip()
-            tag = tag.lstrip("1234567890. ").strip()
-            tags.append(tag)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"[Seed3 Stage1] 生成失败 (i={i}): {result}")
+                tags.append(f"Error: {result}")
+            else:
+                tags.append(result)
 
         return tags

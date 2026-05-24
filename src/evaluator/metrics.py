@@ -20,9 +20,9 @@ class DiversityMetrics:
       6. KL Divergence  — 与 Sobol 分布的 KL 散度（越小越好 → 符号反转）
     """
 
-    NUM_RANDOM_POINTS = 10000
+    NUM_RANDOM_POINTS = 1000   # 从10000减少到1000
     COVERAGE_TARGET = 0.99
-    COVERAGE_CALIBRATION_TRIALS = 1000
+    COVERAGE_CALIBRATION_TRIALS = 100  # 从1000减少到100
 
     def __init__(self, coverage_radius: float = None):
         """
@@ -50,11 +50,8 @@ class DiversityMetrics:
         n, dim = Z.shape
         k = self._get_coverage_radius(n, dim)
 
-        # 在 Z 的包围盒内撒点
-        mins = Z.min(axis=0)
-        maxs = Z.max(axis=0)
+        # 在单位空间 [0,1]^d 内撒点（与校准时的采样空间一致）
         random_points = np.random.rand(self.NUM_RANDOM_POINTS, dim)
-        random_points = random_points * (maxs - mins) + mins
 
         # 用 cKDTree 加速近邻查询
         tree = cKDTree(Z)
@@ -97,16 +94,16 @@ class DiversityMetrics:
         """最大空白区半径: 随机参考点到最近 z_i 的最大距离.
 
         越小表示覆盖越均匀。在适应度计算中会符号反转。
+        
+        在单位空间 [0,1]^d 内撒点（与 coverage 一致）。
         """
         if len(Z) == 0:
             return 0.0
 
         n, dim = Z.shape
-        mins = Z.min(axis=0)
-        maxs = Z.max(axis=0)
 
+        # 在单位空间 [0,1]^d 内撒点
         random_points = np.random.rand(self.NUM_RANDOM_POINTS, dim)
-        random_points = random_points * (maxs - mins) + mins
 
         tree = cKDTree(Z)
         distances, _ = tree.query(random_points, k=1)
@@ -115,7 +112,7 @@ class DiversityMetrics:
     def kl_divergence(self, Z: np.ndarray, num_ref_points: int = 10000) -> float:
         """KL 散度: Z 的经验分布 vs Sobol 准随机参考分布.
 
-        使用核密度估计(KDE)估计两个分布，然后计算 KL 散度。
+        在 Z 的实际包围盒内比较分布均匀性。
         越小表示 Z 的分布越接近均匀。在适应度计算中会符号反转。
         """
         if len(Z) == 0:
@@ -123,34 +120,37 @@ class DiversityMetrics:
 
         n, dim = Z.shape
 
-        # Sobol 参考分布采样
-        try:
-            sampler = qmc.Sobol(d=dim, scramble=True)
-            ref_points = sampler.random(num_ref_points)
-        except Exception:
-            ref_points = np.random.rand(num_ref_points, dim)
-
-        # 将 Z 和参考点归一化到 [0, 1] 区间
+        # Z 的包围盒
         mins = Z.min(axis=0)
         maxs = Z.max(axis=0)
         range_vals = maxs - mins
         range_vals[range_vals == 0] = 1.0  # 避免除零
 
-        Z_norm = (Z - mins) / range_vals
-        ref_norm = (ref_points - mins) / range_vals
-        ref_norm = np.clip(ref_norm, 0, 1)
+        # Sobol 参考分布采样，并映射到 Z 的包围盒
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sampler = qmc.Sobol(d=dim, scramble=True)
+                ref_points = sampler.random(num_ref_points)
+        except Exception:
+            ref_points = np.random.rand(num_ref_points, dim)
+        
+        ref_points = ref_points * range_vals + mins
+        ref_points = np.clip(ref_points, mins, maxs)
 
-        # 使用直方图估计分布（比 KDE 更稳定，尤其在高维）
-        bins_per_dim = max(5, int(50 ** (1.0 / dim)))  # 自适应 bin 数
+        # 使用直方图估计分布
+        # bin 数根据样本量自适应：每维约 N^(1/d) 个 bin，确保平均每 bin 有若干点
+        bins_per_dim = max(3, int(n ** (1.0 / dim)))
         bins = [bins_per_dim] * dim
+        ranges = [(mins[i], maxs[i]) for i in range(dim)]
 
         # Z 的经验分布
-        hist_z, edges = np.histogramdd(Z_norm, bins=bins, range=[(0, 1)] * dim)
-        hist_z = hist_z.flatten() + 1e-10  # 加平滑避免零概率
+        hist_z, _ = np.histogramdd(Z, bins=bins, range=ranges)
+        hist_z = hist_z.flatten() + 1e-10
         hist_z = hist_z / hist_z.sum()
 
         # 参考分布
-        hist_ref, _ = np.histogramdd(ref_norm, bins=bins, range=[(0, 1)] * dim)
+        hist_ref, _ = np.histogramdd(ref_points, bins=bins, range=ranges)
         hist_ref = hist_ref.flatten() + 1e-10
         hist_ref = hist_ref / hist_ref.sum()
 
@@ -226,8 +226,10 @@ class DiversityMetrics:
         radii = []
         for _ in range(trials):
             try:
-                sampler = qmc.Sobol(d=dim, scramble=True)
-                points = sampler.random(n=n)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    sampler = qmc.Sobol(d=dim, scramble=True)
+                    points = sampler.random(n=n)
             except Exception:
                 points = np.random.rand(n, dim)
 
@@ -259,12 +261,15 @@ class DiversityMetrics:
         """获取 Coverage 半径（优先使用预校准值，否则动态计算）."""
         if self.k is not None:
             return self.k
-        # 动态校准（缓存结果）
+        # 动态校准（按 (n, dim) 缓存）
+        cache_key = (n, dim)
         if not hasattr(self, "_cached_radius"):
+            self._cached_radius = {}
+        if cache_key not in self._cached_radius:
             print(f"  [Evaluator] 校准 Coverage 半径 (N={n}, dim={dim})...")
-            self._cached_radius = self.calibrate_coverage_radius(n=n, dim=dim)
-            print(f"  [Evaluator] 校准完成: k = {self._cached_radius:.4f}")
-        return self._cached_radius
+            self._cached_radius[cache_key] = self.calibrate_coverage_radius(n=n, dim=dim)
+            print(f"  [Evaluator] 校准完成: k = {self._cached_radius[cache_key]:.4f}")
+        return self._cached_radius[cache_key]
 
 
 class MultiQuestionnaireEvaluator:

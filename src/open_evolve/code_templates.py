@@ -6,16 +6,153 @@
 
 
 SEED1_CODE = '''
+import asyncio
+
 class SeedPersonaGenerator:
     """seed1: 默认 Concordia 提示 + 形成性记忆."""
 
     def __init__(self, llm_client):
         self.llm = llm_client
 
+    async def _stage1_single(self, context: str, dimensions: list, n: int, i: int) -> str:
+        """异步生成单个标签."""
+        import time
+        start = time.time()
+        existing_tags = "\\n".join(f"  {j+1}. {t}" for j, t in enumerate([]))
+        prompt = f"""【情境】
+{context}
+
+【多样性轴】
+{"\\n".join(f"  - {d}" for d in dimensions)}
+
+【已生成的人格定位】
+（暂无）
+
+【任务】
+请生成 1 个新的人格高层定位标签。
+要求：
+1. 明确指定在各维度上的位置（如"高适应力、中等风险承受"）
+2. 与其他人格错开，确保多样性
+3. 2-3 句话
+
+直接输出标签文本，不要前缀。"""
+        resp = await self.llm.generate_async(prompt, temperature=0.9, max_tokens=256)
+        tag = resp.strip().lstrip("0123456789. ").strip()
+        elapsed = time.time() - start
+        # 单标签耗时打印已禁用
+        pass
+        return tag
+
     def stage1(self, context: str, dimensions: list, n: int) -> list:
-        """串行逐个生成高层定位标签，主动错开."""
+        """并行生成所有标签."""
+        import time
+        print(f"    [Stage1] 开始生成 {n} 个标签...")
+        total_start = time.time()
+        
+        async def _run_all():
+            tasks = [self._stage1_single(context, dimensions, n, i) for i in range(n)]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+        
+        try:
+            results = asyncio.run(_run_all())
+        except RuntimeError:
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(_run_all())
+        
+        total_elapsed = time.time() - total_start
+        print(f"    [Stage1] 全部完成: {total_elapsed:.2f}s")
+        
         tags = []
-        for i in range(n):
+        for result in results:
+            if isinstance(result, Exception):
+                tags.append("Error")
+            else:
+                tags.append(result)
+        return tags
+
+    async def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
+        """异步生成单个人格."""
+        import time
+        start = time.time()
+        prompt = f"""【情境】
+{context}
+
+【高层定位标签】
+{tag}
+
+【任务】
+将上述标签扩展为完整的人格描述（200-400 词）。
+从童年形成性记忆写起，包含：
+1. 童年经历如何塑造核心特质
+2. 核心信念和价值观
+3. 行为逻辑和决策方式
+4. 说话风格和社交模式
+
+用第三人称"他/她"。"""
+        resp = await self.llm.generate_async(prompt, temperature=0.8, max_tokens=512)
+        elapsed = time.time() - start
+        # 单人格耗时打印已禁用
+        pass
+        return resp.strip()
+
+    def stage2(self, context: str, dimensions: list, high_level_tags: list) -> list:
+        """并行细节扩展 — 形成性记忆."""
+        import time
+        print(f"    [Stage2] 开始生成 {len(high_level_tags)} 个人格...")
+        total_start = time.time()
+        
+        async def _run_all():
+            tasks = [self._stage2_single(context, dimensions, tag, i) for i, tag in enumerate(high_level_tags)]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+        
+        try:
+            results = asyncio.run(_run_all())
+        except RuntimeError:
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(_run_all())
+        
+        total_elapsed = time.time() - total_start
+        print(f"    [Stage2] 全部完成: {total_elapsed:.2f}s")
+        
+        personas = []
+        for result in results:
+            if isinstance(result, Exception):
+                personas.append("Error")
+            else:
+                personas.append(result)
+        return personas
+'''
+
+
+SEED2_CODE = '''
+import asyncio
+
+class SeedPersonaGenerator:
+    """seed2: 小批次自回归 + 形成性记忆."""
+
+    BATCH_SIZE = 5
+
+    def __init__(self, llm_client):
+        self.llm = llm_client
+
+    def stage1(self, context: str, dimensions: list, n: int) -> list:
+        """小批次串行生成标签（保持自回归错开逻辑）."""
+        import time
+        print(f"    [Stage1] 开始生成 {n} 个标签（小批次串行）...")
+        total_start = time.time()
+        
+        tags = []
+        total_batches = (n + self.BATCH_SIZE - 1) // self.BATCH_SIZE
+        
+        for batch_idx in range(total_batches):
+            remaining = n - len(tags)
+            batch_size = min(self.BATCH_SIZE, remaining)
+            
+            batch_start = time.time()
             existing_tags = "\\n".join(f"  {j+1}. {t}" for j, t in enumerate(tags))
             prompt = f"""【情境】
 {context}
@@ -27,23 +164,36 @@ class SeedPersonaGenerator:
 {existing_tags if tags else "（暂无）"}
 
 【任务】
-请生成 1 个新的人格高层定位标签。
+请生成 {batch_size} 个新的人格高层定位标签。
 要求：
-1. 明确指定在各维度上的位置（如"高适应力、中等风险承受"）
-2. 与已生成的人格错开，确保多样性
-3. 2-3 句话
+1. 明确指定在各维度上的位置
+2. 与已生成的标签错开，确保多样性
+3. 每个标签 2-3 句话
 
-直接输出标签文本，不要前缀。"""
-            resp = self.llm.generate(prompt, temperature=0.9, max_tokens=256)
-            tag = resp.strip().lstrip("0123456789. ").strip()
-            tags.append(tag)
-        return tags
+直接输出编号列表："""
+            resp = self.llm.generate(prompt, temperature=0.9, max_tokens=1024)
+            
+            # 解析编号列表
+            lines = resp.strip().split("\\n")
+            batch_tags = []
+            for line in lines:
+                line = line.strip().lstrip("01234567890.-) ").strip()
+                if line and len(line) > 10:
+                    batch_tags.append(line)
+            
+            tags.extend(batch_tags[:batch_size])
+            batch_elapsed = time.time() - batch_start
+            print(f"    [Stage1] Batch {batch_idx+1}/{total_batches} 完成: {batch_elapsed:.2f}s ({len(batch_tags)}个标签)")
+        
+        total_elapsed = time.time() - total_start
+        print(f"    [Stage1] 全部完成: {total_elapsed:.2f}s")
+        return tags[:n]
 
-    def stage2(self, context: str, dimensions: list, high_level_tags: list) -> list:
-        """并行细节扩展 — 形成性记忆（从童年写起）."""
-        personas = []
-        for tag in high_level_tags:
-            prompt = f"""【情境】
+    async def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
+        """异步生成单个人格."""
+        import time
+        start = time.time()
+        prompt = f"""【情境】
 {context}
 
 【高层定位标签】
@@ -58,79 +208,45 @@ class SeedPersonaGenerator:
 4. 说话风格和社交模式
 
 用第三人称"他/她"。"""
-            resp = self.llm.generate(prompt, temperature=0.8, max_tokens=1024)
-            personas.append(resp.strip())
-        return personas
-'''
-
-
-SEED2_CODE = '''
-class SeedPersonaGenerator:
-    """seed2: 小批次自回归 + 形成性记忆."""
-
-    BATCH_SIZE = 5
-
-    def __init__(self, llm_client):
-        self.llm = llm_client
-
-    def stage1(self, context: str, dimensions: list, n: int) -> list:
-        """小批次生成，减少上下文依赖."""
-        tags = []
-        total_batches = (n + self.BATCH_SIZE - 1) // self.BATCH_SIZE
-        for batch_idx in range(total_batches):
-            remaining = n - len(tags)
-            batch_size = min(self.BATCH_SIZE, remaining)
-            prompt = f"""【情境】
-{context}
-
-【多样性轴】
-{"\\n".join(f"  - {d}" for d in dimensions)}
-
-【任务】
-这是第 {batch_idx+1}/{total_batches} 批。
-请生成 {batch_size} 个不同的人格高层定位标签。
-要求：
-1. 每个标签明确在各维度上的位置
-2. {batch_size} 个标签之间必须相互错开
-3. 每标签 2-3 句话
-
-用编号列表输出。"""
-            resp = self.llm.generate(prompt, temperature=0.9, max_tokens=1024)
-            # 解析编号列表
-            for line in resp.strip().split("\\n"):
-                line = line.strip().lstrip("01234567890.-) ").strip()
-                if line and len(line) > 10:
-                    tags.append(line)
-            if len(tags) >= n:
-                break
-        return tags[:n]
+        resp = await self.llm.generate_async(prompt, temperature=0.8, max_tokens=512)
+        elapsed = time.time() - start
+        # 单人格耗时打印已禁用
+        pass
+        return resp.strip()
 
     def stage2(self, context: str, dimensions: list, high_level_tags: list) -> list:
         """并行细节扩展 — 形成性记忆."""
+        import time
+        print(f"    [Stage2] 开始生成 {len(high_level_tags)} 个人格...")
+        total_start = time.time()
+        
+        async def _run_all():
+            tasks = [self._stage2_single(context, dimensions, tag, i) for i, tag in enumerate(high_level_tags)]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+        
+        try:
+            results = asyncio.run(_run_all())
+        except RuntimeError:
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(_run_all())
+        
+        total_elapsed = time.time() - total_start
+        print(f"    [Stage2] 全部完成: {total_elapsed:.2f}s")
+        
         personas = []
-        for tag in high_level_tags:
-            prompt = f"""【情境】
-{context}
-
-【高层定位标签】
-{tag}
-
-【任务】
-将上述标签扩展为完整的人格描述（200-400 词）。
-从童年形成性记忆写起，包含：
-1. 童年经历如何塑造核心特质
-2. 核心信念和价值观
-3. 行为逻辑和决策方式
-4. 说话风格和社交模式
-
-用第三人称"他/她"。"""
-            resp = self.llm.generate(prompt, temperature=0.8, max_tokens=1024)
-            personas.append(resp.strip())
+        for result in results:
+            if isinstance(result, Exception):
+                personas.append("Error")
+            else:
+                personas.append(result)
         return personas
 '''
 
 
 SEED3_CODE = '''
+import asyncio
 import numpy as np
 
 class SeedPersonaGenerator:
@@ -139,43 +255,69 @@ class SeedPersonaGenerator:
     def __init__(self, llm_client):
         self.llm = llm_client
 
+    async def _stage1_single(self, context: str, dimensions: list, coords: list, i: int) -> str:
+        """异步生成单个标签."""
+        import time
+        start = time.time()
+        coords_str = ", ".join(f"{d}={c:.2f}" for d, c in zip(dimensions, coords))
+        prompt = f"""【情境】
+{context}
+
+【人格坐标】
+{coords_str}
+
+【任务】
+将上述坐标翻译为一段人格高层定位标签（2-3 句话）。
+描述这个人在各维度上的位置和行为特征。"""
+        resp = await self.llm.generate_async(prompt, temperature=0.9, max_tokens=256)
+        tag = resp.strip().lstrip("0123456789. ").strip()
+        elapsed = time.time() - start
+        # 单标签耗时打印已禁用
+        pass
+        return tag
+
     def stage1(self, context: str, dimensions: list, n: int) -> list:
-        """在 K 维空间均匀撒点，再翻译为文字."""
+        """并行生成所有标签."""
+        import time
+        print(f"    [Stage1] 开始生成 {n} 个标签（蒙特卡洛采样）...")
+        total_start = time.time()
+        
         k = len(dimensions)
-        # Sobol 采样
         try:
             from scipy.stats import qmc
             sampler = qmc.Sobol(d=k, scramble=True)
             points = sampler.random(n=n)
         except Exception:
             points = np.random.rand(n, k)
-
+        
+        async def _run_all():
+            tasks = [self._stage1_single(context, dimensions, coords.tolist(), i) for i, coords in enumerate(points)]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+        
+        try:
+            results = asyncio.run(_run_all())
+        except RuntimeError:
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(_run_all())
+        
+        total_elapsed = time.time() - total_start
+        print(f"    [Stage1] 全部完成: {total_elapsed:.2f}s")
+        
         tags = []
-        for coords in points:
-            coord_str = "\\n".join(
-                f"  - {dim}: {c:.2f} (0=极低, 1=极高)"
-                for dim, c in zip(dimensions, coords)
-            )
-            prompt = f"""【情境】
-{context}
-
-【坐标定位】
-{coord_str}
-
-【任务】
-将上述坐标翻译成一段人格高层定位标签。
-描述一个具有这些维度坐标的完整人格轮廓。
-2-3 句话，生动有辨识度。"""
-            resp = self.llm.generate(prompt, temperature=0.9, max_tokens=256)
-            tag = resp.strip().lstrip("01234567890. ").strip()
-            tags.append(tag)
+        for result in results:
+            if isinstance(result, Exception):
+                tags.append("Error")
+            else:
+                tags.append(result)
         return tags
 
-    def stage2(self, context: str, dimensions: list, high_level_tags: list) -> list:
-        """并行细节扩展 — 形成性记忆."""
-        personas = []
-        for tag in high_level_tags:
-            prompt = f"""【情境】
+    async def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
+        """异步生成单个人格."""
+        import time
+        start = time.time()
+        prompt = f"""【情境】
 {context}
 
 【高层定位标签】
@@ -190,8 +332,39 @@ class SeedPersonaGenerator:
 4. 说话风格和社交模式
 
 用第三人称"他/她"。"""
-            resp = self.llm.generate(prompt, temperature=0.8, max_tokens=1024)
-            personas.append(resp.strip())
+        resp = await self.llm.generate_async(prompt, temperature=0.8, max_tokens=512)
+        elapsed = time.time() - start
+        # 单人格耗时打印已禁用
+        pass
+        return resp.strip()
+
+    def stage2(self, context: str, dimensions: list, high_level_tags: list) -> list:
+        """并行细节扩展 — 形成性记忆."""
+        import time
+        print(f"    [Stage2] 开始生成 {len(high_level_tags)} 个人格...")
+        total_start = time.time()
+        
+        async def _run_all():
+            tasks = [self._stage2_single(context, dimensions, tag, i) for i, tag in enumerate(high_level_tags)]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+        
+        try:
+            results = asyncio.run(_run_all())
+        except RuntimeError:
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(_run_all())
+        
+        total_elapsed = time.time() - total_start
+        print(f"    [Stage2] 全部完成: {total_elapsed:.2f}s")
+        
+        personas = []
+        for result in results:
+            if isinstance(result, Exception):
+                personas.append("Error")
+            else:
+                personas.append(result)
         return personas
 '''
 
