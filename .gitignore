@@ -64,7 +64,8 @@ venv.bak/
 # 生成的问卷、人格、结果等可以通过脚本重新生成
 data/questionnaires/*.json
 data/generated_personas/*.json
-data/results/*.json
+# 忽略整个 results 目录（包含日志、API记录、checkpoints、可视化等）
+data/results/
 # 但保留目录结构和示例数据
 data/**/*.log
 
