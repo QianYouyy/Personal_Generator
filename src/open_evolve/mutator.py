@@ -34,11 +34,34 @@ The provided codebase uses a two-stage process. Stage 1 is crucial for diversity
 
 When modifying the code:
 1. You MUST preserve the class name "SeedPersonaGenerator"
-2. You MUST preserve the method signatures: __init__, stage1, stage2
+2. You MUST preserve the method signatures: __init__(self, llm_client), stage1(self, context, dimensions, n) -> list, stage2(self, context, dimensions, high_level_tags) -> list
 3. You MUST preserve the two-stage structure (stage1 → stage2)
 4. You should ONLY modify the internal logic, prompts, and strategies inside stage1 and stage2
 5. Output ONLY the complete modified Python code, no explanations, no markdown
 6. The code must be valid Python that can be exec()'ed directly
+
+## HARD CONSTRAINTS - Violations will cause immediate rejection
+
+Your modified code will be executed automatically by an evaluation pipeline. If it crashes or produces invalid output, the candidate is discarded. The following constraints are NON-NEGOTIABLE:
+
+### Return Type Contracts
+- **stage1 MUST return a Python `list` of strings.** Never return `None`, never return an empty list `[]`, never return a single string. The list length must be exactly `n` (the input parameter). Each element must be a non-empty, non-None string.
+- **stage2 MUST return a Python `list` of strings.** Never return `None`, never return an empty list `[]`. The list length must be exactly `len(high_level_tags)`. Each element must be a non-empty, non-None string.
+
+### Async Safety
+- If you use `asyncio.gather(return_exceptions=True)`, you MUST filter the results: remove all `Exception` objects and all `None` values. Replace failed tasks with valid fallback strings (e.g., "Error" or a copy of a successful result). Never let exceptions or None leak into the returned list.
+- If you use `asyncio.run()`, you MUST wrap it in try/except. If it fails, fall back to synchronous execution or return a list of placeholder strings of the correct length.
+- NEVER call `asyncio.run()` inside an already running event loop without using `nest_asyncio`. If `RuntimeError` occurs, apply `nest_asyncio.apply()` and use `loop.run_until_complete()`.
+
+### Error Handling
+- Every LLM API call MUST have a fallback. If the API call fails or returns unexpected output, the function must still return a valid list of the correct length.
+- NEVER let an unhandled exception propagate out of stage1 or stage2. Use try/except at the top level of both methods if necessary.
+
+### Code Structure
+- Do NOT add top-level code (code outside the class) that executes on import.
+- Do NOT add external dependencies that require pip install.
+- Do NOT modify the __init__ signature or remove the self.llm attribute.
+- The code must be completely self-contained within the SeedPersonaGenerator class.
 """
 
 
@@ -180,7 +203,7 @@ class Mutator:
             mutation_prompt,
             system_prompt=ALPHAEVOLVE_SYSTEM_PROMPT,
             temperature=0.8,
-            max_tokens=2048,
+            max_tokens=4096,
         )
 
         # 清理输出
@@ -198,6 +221,12 @@ class Mutator:
             raise ValueError("变异后的代码缺少 SeedPersonaGenerator 类")
         if "def stage1" not in code or "def stage2" not in code:
             raise ValueError("变异后的代码缺少 stage1 或 stage2 方法")
+        
+        # 语法验证：尝试编译代码
+        try:
+            compile(code, "<mutated>", "exec")
+        except SyntaxError as e:
+            raise ValueError(f"变异后的代码存在语法错误: {e}")
 
         return code
 

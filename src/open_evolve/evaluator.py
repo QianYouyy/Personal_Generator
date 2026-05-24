@@ -41,6 +41,7 @@ class PersonaCodeEvaluator:
         self.metrics = DiversityMetrics()
         self.total_evals = 0
         self.total_time = 0.0
+        self._last_Z = None  # 保存最后一次评估的 Z 矩阵用于可视化
 
     def evaluate(self, code_str: str) -> Dict[str, float]:
         """评估代码字符串."""
@@ -76,12 +77,34 @@ class PersonaCodeEvaluator:
                     logger.debug(f"[Eval #{eval_id}] 问卷 {q_idx+1}/{len(self.questionnaires)}: {q.brief[:40]}...")
 
                     tags = generator.stage1(q.context, q.dimensions, self.num_personas)
+                    if tags is None:
+                        logger.warn(f"[Eval #{eval_id}]   Stage1 返回 None，跳过")
+                        continue
+                    if not isinstance(tags, list):
+                        logger.warn(f"[Eval #{eval_id}]   Stage1 返回类型错误: {type(tags).__name__}，跳过")
+                        continue
+                    # 过滤 None 元素
+                    tags = [t for t in tags if t is not None]
+                    if len(tags) == 0:
+                        logger.warn(f"[Eval #{eval_id}]   Stage1 返回空列表，跳过")
+                        continue
                     if len(tags) < self.num_personas:
                         tags = tags + [tags[-1]] * (self.num_personas - len(tags))
                     tags = tags[:self.num_personas]
                     logger.debug(f"[Eval #{eval_id}]   Stage1 完成: {len(tags)} 个标签")
 
                     descriptions = generator.stage2(q.context, q.dimensions, tags)
+                    if descriptions is None:
+                        logger.warn(f"[Eval #{eval_id}]   Stage2 返回 None，跳过")
+                        continue
+                    if not isinstance(descriptions, list):
+                        logger.warn(f"[Eval #{eval_id}]   Stage2 返回类型错误: {type(descriptions).__name__}，跳过")
+                        continue
+                    # 过滤 None 元素
+                    descriptions = [d for d in descriptions if d is not None]
+                    if len(descriptions) == 0:
+                        logger.warn(f"[Eval #{eval_id}]   Stage2 返回空列表，跳过")
+                        continue
                     if len(descriptions) < self.num_personas:
                         descriptions = descriptions + [descriptions[-1]] * (self.num_personas - len(descriptions))
                     descriptions = descriptions[:self.num_personas]
@@ -119,6 +142,9 @@ class PersonaCodeEvaluator:
             for key in all_fitness[0].keys():
                 values = [f[key] for f in all_fitness]
                 avg_fitness[key] = float(np.mean(values))
+
+            # 保存最后一个 Z 矩阵用于可视化（取第一份问卷的 Z）
+            self._last_Z = Z
 
             elapsed = time.time() - start_time
             self.total_time += elapsed

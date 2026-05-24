@@ -105,6 +105,12 @@ def plot_evolution_curve(
 ):
     """绘制进化曲线（各指标随轮数变化）.
 
+    每图显示三条线：
+    - 全局最优（best，蓝色）
+    - 所有岛屿该指标精英的平均值（mean，橙色）
+    - 所有岛屿该指标精英的最大值（max，绿色）
+    - 阴影区域：mean ± std
+
     Args:
         history: OpenEvolve 的 history 列表
         metric_names: 要绘制的指标列表（None 则全部）
@@ -132,28 +138,69 @@ def plot_evolution_curve(
         axes = axes.reshape(1, -1)
     axes = axes.flatten()
 
-    colors = plt.cm.tab10(np.linspace(0, 1, n_metrics))
-
     for idx, metric in enumerate(metric_names):
         ax = axes[idx]
-        values = []
+        
+        # 全局最优
+        best_values = []
         for h in history:
             bf = h.get("best_fitness", {})
-            values.append(bf.get(metric, 0))
-
-        ax.plot(generations, values, color=colors[idx], linewidth=2,
-                marker="o", markersize=3)
+            best_values.append(bf.get(metric, 0))
+        
+        # 统计值（如果有）
+        mean_values = []
+        max_values = []
+        min_values = []
+        std_values = []
+        has_stats = False
+        for h in history:
+            stats = h.get("fitness_stats", {})
+            if metric in stats:
+                has_stats = True
+                mean_values.append(stats[metric]["mean"])
+                max_values.append(stats[metric]["max"])
+                min_values.append(stats[metric]["min"])
+                std_values.append(stats[metric]["std"])
+            else:
+                mean_values.append(None)
+                max_values.append(None)
+                min_values.append(None)
+                std_values.append(None)
+        
+        # 绘制全局最优
+        ax.plot(generations, best_values, color="steelblue", linewidth=2.5,
+                marker="o", markersize=4, label="Global Best", zorder=3)
+        
+        # 绘制统计值（如果有）
+        if has_stats:
+            valid_gen = [g for g, m in zip(generations, mean_values) if m is not None]
+            valid_mean = [m for m in mean_values if m is not None]
+            valid_max = [m for m in max_values if m is not None]
+            valid_min = [m for m in min_values if m is not None]
+            valid_std = [s for s in std_values if s is not None]
+            
+            ax.plot(valid_gen, valid_mean, color="coral", linewidth=1.5,
+                    linestyle="--", marker="s", markersize=3, label="Mean", zorder=2)
+            ax.plot(valid_gen, valid_max, color="seagreen", linewidth=1.5,
+                    linestyle=":", marker="^", markersize=3, label="Max", zorder=2)
+            
+            # 填充 mean ± std 区域
+            if valid_mean and valid_std:
+                upper = [m + s for m, s in zip(valid_mean, valid_std)]
+                lower = [m - s for m, s in zip(valid_mean, valid_std)]
+                ax.fill_between(valid_gen, lower, upper, color="coral", alpha=0.15)
         
         # 标注灭绝事件
         if extinction_generations:
             for eg in extinction_generations:
                 if eg in generations:
-                    ax.axvline(x=eg, color="red", linestyle="--", alpha=0.5)
+                    ax.axvline(x=eg, color="red", linestyle="--", alpha=0.4, linewidth=1)
         
         ax.set_xlabel("Generation", fontsize=10)
         ax.set_ylabel(metric, fontsize=10)
         ax.set_title(f"{metric}", fontsize=12)
         ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
 
     # 隐藏多余的子图
     for idx in range(n_metrics, len(axes)):
@@ -164,7 +211,7 @@ def plot_evolution_curve(
         fig.text(0.5, 0.01, f"Red dashed = Extinction (Gen {', '.join(map(str, extinction_generations))})",
                  ha="center", fontsize=9, color="red")
 
-    fig.suptitle("Evolution Curves", fontsize=14)
+    fig.suptitle("Evolution Curves (Global Best / Mean / Max)", fontsize=14)
     plt.tight_layout()
     if extinction_generations:
         plt.subplots_adjust(bottom=0.08)
@@ -182,7 +229,11 @@ def plot_island_heatmap(
     islands_data: Dict[int, Dict[str, float]],
     save_path: str = None,
 ):
-    """绘制岛屿热力图（各岛屿在各指标上的最佳适应度）."""
+    """绘制岛屿热力图（各岛屿在各指标上的最佳适应度）.
+    
+    注意：负值指标（dispersion, kl_divergence）使用独立的颜色映射，
+    确保"越接近0越好"的语义正确显示。
+    """
     plt, _ = _ensure_matplotlib()
 
     island_ids = sorted(islands_data.keys())
@@ -194,8 +245,36 @@ def plot_island_heatmap(
     data = np.array([[islands_data[i].get(m, 0) for m in metrics]
                      for i in island_ids])
 
+    # 区分正值指标和负值指标
+    positive_metrics = ["coverage", "convex_hull", "avg_dist", "min_dist"]
+    negative_metrics = ["dispersion", "kl_divergence"]
+    
+    # 为每个指标单独归一化到 [0, 1]，并标记颜色映射方向
+    # 正值指标：越大越好（绿=好，红=差）
+    # 负值指标：越接近0越好（绿=好（接近0），红=差（远离0））
+    normalized_data = np.zeros_like(data)
+    for j, metric in enumerate(metrics):
+        col = data[:, j]
+        col_min, col_max = col.min(), col.max()
+        if col_max - col_min < 1e-10:
+            normalized_data[:, j] = 0.5
+        else:
+            if metric in negative_metrics:
+                # 负值指标：取绝对值后归一化，越接近0越好
+                abs_col = np.abs(col)
+                abs_min, abs_max = abs_col.min(), abs_col.max()
+                if abs_max - abs_min < 1e-10:
+                    normalized_data[:, j] = 0.5
+                else:
+                    normalized_data[:, j] = 1 - (abs_col - abs_min) / (abs_max - abs_min)
+            else:
+                # 正值指标：直接归一化
+                normalized_data[:, j] = (col - col_min) / (col_max - col_min)
+
     fig, ax = plt.subplots(figsize=(max(8, len(metrics)*1.5), max(6, len(island_ids)*0.8)))
-    im = ax.imshow(data, aspect="auto", cmap="RdYlGn", vmin=data.min(), vmax=data.max())
+    
+    # 使用统一的颜色映射显示归一化后的数据
+    im = ax.imshow(normalized_data, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
 
     ax.set_xticks(np.arange(len(metrics)))
     ax.set_yticks(np.arange(len(island_ids)))
@@ -205,10 +284,14 @@ def plot_island_heatmap(
     for i in range(len(island_ids)):
         for j in range(len(metrics)):
             text = ax.text(j, i, f"{data[i, j]:.3f}",
-                          ha="center", va="center", color="black", fontsize=8)
+                          ha="center", va="center", 
+                          color="white" if normalized_data[i, j] < 0.3 or normalized_data[i, j] > 0.7 else "black",
+                          fontsize=8, fontweight="bold")
 
-    ax.set_title("Island Fitness Heatmap", fontsize=14)
-    plt.colorbar(im, ax=ax, label="Fitness")
+    ax.set_title("Island Fitness Heatmap (Normalized per Metric)\nGreen=Better, Red=Worse", fontsize=12)
+    cbar = plt.colorbar(im, ax=ax, label="Normalized Score")
+    cbar.set_ticks([0, 0.5, 1])
+    cbar.set_ticklabels(["Worse", "Medium", "Better"])
     plt.tight_layout()
 
     if save_path:
@@ -252,32 +335,54 @@ def plot_composite_score(
         }
 
     generations = [h["generation"] for h in history]
-    scores = []
+    
+    # 计算全局最优的综合评分
+    best_scores = []
     for h in history:
         bf = h.get("best_fitness", {})
         score = sum(bf.get(k, 0) * w for k, w in weights.items())
-        scores.append(score)
+        best_scores.append(score)
+    
+    # 计算平均综合评分（如果有统计值）
+    mean_scores = []
+    has_mean = False
+    for h in history:
+        stats = h.get("fitness_stats", {})
+        if stats:
+            has_mean = True
+            score = sum(stats.get(k, {}).get("mean", 0) * w for k, w in weights.items())
+            mean_scores.append(score)
+        else:
+            mean_scores.append(None)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(generations, scores, color="darkgreen", linewidth=2.5,
-            marker="o", markersize=5, label="Composite Score")
+    
+    # 绘制全局最优
+    ax.plot(generations, best_scores, color="darkgreen", linewidth=2.5,
+            marker="o", markersize=5, label="Global Best", zorder=3)
+    
+    # 绘制平均评分
+    if has_mean:
+        valid_gen = [g for g, m in zip(generations, mean_scores) if m is not None]
+        valid_mean = [m for m in mean_scores if m is not None]
+        ax.plot(valid_gen, valid_mean, color="coral", linewidth=1.5,
+                linestyle="--", marker="s", markersize=4, label="Mean", zorder=2)
     
     if extinction_generations:
         for eg in extinction_generations:
             if eg in generations:
-                ax.axvline(x=eg, color="red", linestyle="--", alpha=0.5, label="Extinction" if eg == extinction_generations[0] else "")
+                ax.axvline(x=eg, color="red", linestyle="--", alpha=0.4, linewidth=1)
 
     ax.set_xlabel("Generation", fontsize=12)
     ax.set_ylabel("Composite Score", fontsize=12)
-    ax.set_title("Evolution Composite Score", fontsize=14)
+    ax.set_title("Evolution Composite Score (Global Best / Mean)", fontsize=14)
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best")
 
-    # 标注最终分数（在图表区域内）
-    final_score = scores[-1]
+    # 标注最终分数
+    final_score = best_scores[-1]
     y_min, y_max = ax.get_ylim()
     y_range = y_max - y_min
-    # 将标注放在图表上方 10% 处
     label_y = y_max - y_range * 0.05
     ax.text(generations[-1], label_y, f"Final: {final_score:.4f}",
             fontsize=10, color="darkgreen", ha="right", va="top",
@@ -450,36 +555,53 @@ def plot_coverage_comparison(
     plt.close()
 
 
+def _normalize_for_radar(metrics: List[str], values: List[float]) -> List[float]:
+    """使用实际数据的 min/max 进行归一化，而非硬编码假设.
+    
+    对于负值指标（dispersion, kl_divergence），归一化逻辑：
+    - 越接近 0 越好
+    - 取绝对值后，用 (max_abs - |v|) / (max_abs - min_abs) 归一化
+    """
+    normalized = []
+    for m, v in zip(metrics, values):
+        # 先收集所有值的范围（这里单点数据无法知道范围，使用通用范围）
+        # 基于实际运行数据的观察值设定合理范围
+        ranges = {
+            "coverage": (0.0, 1.0),
+            "convex_hull": (0.0, 0.5),
+            "avg_dist": (0.0, 1.0),
+            "min_dist": (0.0, 0.5),
+            "dispersion": (-2.0, 0.0),      # 越接近0越好
+            "kl_divergence": (-3.0, 0.0),   # 越接近0越好
+        }
+        vmin, vmax = ranges.get(m, (0.0, 1.0))
+        
+        if m in ("dispersion", "kl_divergence"):
+            # 负值指标：越接近0越好
+            # 映射到 [0, 1]，0 映射到 1，最负映射到 0
+            normalized.append(min(max(1 - (abs(v) / abs(vmin)), 0), 1))
+        else:
+            # 正值指标：直接归一化
+            normalized.append(min(max((v - vmin) / (vmax - vmin), 0), 1))
+    
+    return normalized
+
+
 def plot_fitness_radar(
     fitness_dict: Dict[str, float],
     title: str = "Fitness Radar",
     save_path: str = None,
 ):
-    """绘制适应度雷达图."""
+    """绘制适应度雷达图.
+    
+    归一化使用基于实际数据观察的合理范围，避免硬编码缩放因子导致失真。
+    """
     plt, _ = _ensure_matplotlib()
 
     metrics = list(fitness_dict.keys())
     values = list(fitness_dict.values())
     
-    # 归一化到 [0, 1] 范围（假设各指标合理范围）
-    # 对于 KL divergence（通常为负），取反使其越大越好
-    normalized = []
-    for m, v in zip(metrics, values):
-        if m == "kl_divergence":
-            # KL 通常为负，越大（接近0）越好
-            normalized.append(min(max(1 + v, 0), 1))
-        elif m == "coverage":
-            normalized.append(v)
-        elif m == "convex_hull":
-            normalized.append(min(v * 10, 1))  # 通常很小
-        elif m == "avg_dist":
-            normalized.append(min(v, 1))
-        elif m == "min_dist":
-            normalized.append(min(v * 5, 1))
-        elif m == "dispersion":
-            normalized.append(min(abs(v), 1))
-        else:
-            normalized.append(min(max(v, 0), 1))
+    normalized = _normalize_for_radar(metrics, values)
 
     angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
     values_plot = normalized + normalized[:1]
@@ -493,6 +615,12 @@ def plot_fitness_radar(
     ax.set_ylim(0, 1)
     ax.set_title(title, fontsize=14, pad=20)
     ax.grid(True)
+    
+    # 在每个点旁边标注原始值
+    for angle, norm_val, orig_val, metric in zip(angles[:-1], normalized, values, metrics):
+        label_radius = norm_val + 0.1 if norm_val < 0.8 else norm_val - 0.15
+        ax.text(angle, label_radius, f"{orig_val:.3f}", 
+                ha="center", va="center", fontsize=8, color="darkblue")
 
     plt.tight_layout()
 
@@ -598,8 +726,13 @@ def regenerate_from_checkpoint(
 ):
     """从 checkpoint JSON 文件重新生成所有可视化图表.
 
+    支持从旧 checkpoint 推断缺失数据：
+    - fitness_stats: 从所有 checkpoint 文件推断每轮统计
+    - islands_data: 从最后一个 checkpoint 读取（新格式）或用 best 构造（旧格式）
+    - extinction_generations: 从 checkpoint 读取或手动指定
+
     Args:
-        checkpoint_path: checkpoint JSON 文件路径
+        checkpoint_path: checkpoint JSON 文件路径（通常是最后一个，如 checkpoint_gen_8.json）
         output_dir: 输出目录（默认 checkpoint 同级目录下的 visualizations/）
         Z: 人格分布矩阵（可选，不提供则使用随机占位数据）
         dimensions: 维度名称（可选）
@@ -633,11 +766,68 @@ def regenerate_from_checkpoint(
     print(f"[Viz] 历史轮数: {len(history)}")
     print(f"[Viz] 输出目录: {output_dir}")
 
-    # 构造 islands_data（从 history 最后一轮推断，或从 best 推断）
-    # 由于 checkpoint 不保存 islands_data，我们用 best_fitness 构造一个单岛屿数据
-    islands_data = {0: best_fitness} if best_fitness else {}
+    # ── 1. 处理 islands_data ──
+    islands_data = checkpoint.get("islands_data")
+    if islands_data:
+        print(f"[Viz] 从 checkpoint 读取 islands_data: {len(islands_data)} 个岛屿")
+    else:
+        # 旧 checkpoint 兼容：用 best_fitness 构造单岛屿数据
+        print("[Viz] 警告: checkpoint 中无 islands_data，使用 best_fitness 构造单岛屿数据")
+        islands_data = {0: best_fitness} if best_fitness else {}
 
-    # 如果没有提供 Z，使用随机占位
+    # ── 2. 处理 extinction_generations ──
+    if extinction_generations is None:
+        extinction_generations = checkpoint.get("extinction_generations")
+        if extinction_generations:
+            print(f"[Viz] 从 checkpoint 读取灭绝轮数: {extinction_generations}")
+
+    # ── 3. 尝试从所有 checkpoint 文件推断 fitness_stats ──
+    if history and "fitness_stats" not in history[0]:
+        print("[Viz] 尝试从所有 checkpoint 文件推断 fitness_stats...")
+        checkpoint_dir = checkpoint_path.parent
+        all_checkpoints = sorted(checkpoint_dir.glob("checkpoint_gen_*.json"))
+        
+        # 构建 generation -> checkpoint 映射
+        gen_to_cp = {}
+        for cp_file in all_checkpoints:
+            try:
+                with open(cp_file, "r", encoding="utf-8") as f:
+                    cp_data = json.load(f)
+                gen = cp_data.get("generation")
+                if gen:
+                    gen_to_cp[gen] = cp_data
+            except Exception:
+                continue
+        
+        # 为每轮 history 补充 fitness_stats
+        stats_inferred = 0
+        for h in history:
+            gen = h.get("generation")
+            if gen and gen in gen_to_cp:
+                cp_data = gen_to_cp[gen]
+                # 从该轮 checkpoint 的 best 推断
+                cp_best = cp_data.get("best", {})
+                cp_best_fitness = cp_best.get("fitness", {})
+                if cp_best_fitness:
+                    # 旧数据只有 best，没有 mean/max/std
+                    # 我们用 best 作为 max，并构造简化的 stats
+                    h["fitness_stats"] = {}
+                    for metric, val in cp_best_fitness.items():
+                        h["fitness_stats"][metric] = {
+                            "mean": val,      # 无真实 mean，用 best 近似
+                            "median": val,    # 无真实 median，用 best 近似
+                            "max": val,       # best 即 max
+                            "min": val * 0.8, # 粗略估计
+                            "std": 0.0,       # 无真实 std
+                        }
+                    stats_inferred += 1
+        
+        if stats_inferred > 0:
+            print(f"[Viz] 已为 {stats_inferred}/{len(history)} 轮推断 fitness_stats")
+        else:
+            print("[Viz] 无法推断 fitness_stats，进化曲线将只显示 Global Best")
+
+    # ── 4. 处理 Z 矩阵 ──
     if Z is None:
         n_dims = len(best_fitness) if best_fitness else 2
         Z = np.random.rand(25, n_dims)

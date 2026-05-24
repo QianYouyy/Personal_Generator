@@ -102,17 +102,26 @@ def run_evolution(
     return engine, best
 
 
-def final_evaluation(best: Candidate, test_questionnaires):
-    """用 test 问卷做最终评估.
+def final_evaluation(best: Candidate, test_questionnaires, seed_baselines_train: dict = None, seed_codes: dict = None):
+    """用 test 问卷做最终评估，并与seed baseline对比.
     
-    使用独立的 persona_model + simulator_model 进行评估。
+    评估内容：
+    1. 最优进化代码在test集上的表现
+    2. 3个初始seed代码在test集上的baseline表现（公平对比）
+    3. 可选：train集上的seed baseline（历史记录）
+    
+    Args:
+        best: 最优候选
+        test_questionnaires: 测试问卷
+        seed_baselines_train: 从checkpoint读取的seed baseline (train集上的初始评分)
+        seed_codes: 3个seed的代码模板 {seed_name: code_str}
     """
     if not test_questionnaires:
         logger.warn("无测试问卷，跳过最终评估")
         return
 
     logger.step("最终评估（Test 问卷集）", 3, 4)
-    logger.info(f"使用 {len(test_questionnaires)} 份测试问卷评估最优代码...")
+    logger.info(f"使用 {len(test_questionnaires)} 份测试问卷评估...")
 
     # 最终评估使用 simulator_model（模拟器）
     simulator_llm = LLMClient.from_config("llm.simulator_model")
@@ -124,27 +133,98 @@ def final_evaluation(best: Candidate, test_questionnaires):
         num_personas=num_personas,
     )
 
-    logger.info("执行评估...")
-    fitness = evaluator.evaluate(best.code)
-
-    logger.success("Test 集评估结果:")
-    for k, v in fitness.items():
+    # 1. 评估最优进化结果
+    logger.info("评估最优进化结果...")
+    best_fitness = evaluator.evaluate(best.code)
+    
+    logger.success("Test 集评估结果 (evolved_best):")
+    for k, v in best_fitness.items():
         logger.metric(k, v)
 
-    # 保存最优代码到统一输出目录
+    # 2. 评估3个seed在test集上的baseline（公平对比）
+    seed_baselines_test = {}
+    if seed_codes:
+        logger.section("评估 Seed Baselines (Test 集)")
+        for seed_name, code in seed_codes.items():
+            logger.info(f"评估 {seed_name} ...")
+            fitness = evaluator.evaluate(code)
+            seed_baselines_test[seed_name] = fitness
+            logger.success(f"{seed_name} Test 集结果:")
+            for k, v in fitness.items():
+                logger.metric(k, v)
+
+    # 3. 打印对比表格
+    logger.section("Test 集对比汇总")
+    metrics = ["coverage", "convex_hull", "avg_dist", "min_dist", "dispersion", "kl_divergence"]
+    
+    all_names = list(seed_baselines_test.keys()) if seed_baselines_test else []
+    all_names.append("evolved_best")
+    
+    # 表头
+    header = f"{'Metric':<18}"
+    for name in all_names:
+        header += f"{name:<18}"
+    logger.info(header)
+    logger.info("-" * (18 + 18 * len(all_names)))
+    
+    # 每行数据
+    for metric in metrics:
+        line = f"{metric:<18}"
+        for name in all_names:
+            if name == "evolved_best":
+                val = best_fitness.get(metric, 0)
+            else:
+                val = seed_baselines_test.get(name, {}).get(metric, 0)
+            line += f"{val:<18.4f}"
+        logger.info(line)
+    
+    logger.info("")
+    logger.info("注: 所有数据均为 Test 集评分，seed1/2/3 为初始种子，evolved_best 为进化后最优")
+
+    # 4. 可选：打印train集baseline对比（如果提供）
+    if seed_baselines_train:
+        logger.section("Seed Baseline 对比 (Train集初始评分)")
+        header = f"{'Metric':<18}"
+        for name in list(seed_baselines_train.keys()) + ["evolved_best(test)"]:
+            header += f"{name:<18}"
+        logger.info(header)
+        logger.info("-" * (18 + 18 * (len(seed_baselines_train) + 1)))
+        
+        for metric in metrics:
+            line = f"{metric:<18}"
+            for name, fitness in seed_baselines_train.items():
+                val = fitness.get(metric, 0)
+                line += f"{val:<18.4f}"
+            val = best_fitness.get(metric, 0)
+            line += f"{val:<18.4f}"
+            logger.info(line)
+        
+        logger.info("")
+        logger.info("注: seed1/2/3 为 Train集初始评分，evolved_best 为 Test集评分")
+        logger.info("    两者数据集不同，仅供参考对比")
+
+    # 保存最优代码
     code_path = output_manager.get_output_path("best_persona_generator.py")
     with open(code_path, "w", encoding="utf-8") as f:
         f.write(best.code)
     logger.success(f"最优代码已保存: {code_path}")
 
+    # 保存结果
     result_path = output_manager.get_output_path("final_evaluation.json")
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "fitness": fitness,
+    result_data = {
+        "evolved_best": {
+            "fitness": best_fitness,
             "generation": best.generation,
             "island_id": best.island_id,
             "seed_name": best.seed_name,
-        }, f, ensure_ascii=False, indent=2)
+        },
+        "seed_baselines_test": seed_baselines_test,
+    }
+    if seed_baselines_train:
+        result_data["seed_baselines_train"] = seed_baselines_train
+    
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result_data, f, ensure_ascii=False, indent=2)
     logger.success(f"评估结果已保存: {result_path}")
 
 
@@ -168,10 +248,17 @@ def generate_viz(engine, test_questionnaires):
             islands_data[island.id] = data
             logger.debug(f"  Island {island.id}: { {k: f'{v:.3f}' for k, v in data.items()} }")
 
-        # 用占位 Z（实际运行时会从评估器获取真实 Z）
+        # 尝试获取真实的 Z 矩阵（从评估器最后一次评估）
         import numpy as np
-        n_dims = len(test_questionnaires[0].dimensions) if test_questionnaires else 2
-        Z_placeholder = np.random.rand(25, n_dims)
+        Z_real = None
+        if hasattr(engine, 'evaluator') and engine.evaluator and engine.evaluator._last_Z is not None:
+            Z_real = engine.evaluator._last_Z
+            logger.info(f"使用真实 Z 矩阵: shape={Z_real.shape}")
+        
+        if Z_real is None:
+            n_dims = len(test_questionnaires[0].dimensions) if test_questionnaires else 2
+            Z_real = np.random.rand(25, n_dims)
+            logger.warn("无真实 Z 矩阵，使用随机占位数据")
 
         viz_dir = output_manager.viz_dir
         
@@ -184,7 +271,7 @@ def generate_viz(engine, test_questionnaires):
         extinction_gens = getattr(engine, '_extinction_log', None)
         
         generate_all_visualizations(
-            Z=Z_placeholder,
+            Z=Z_real,
             dimensions=test_questionnaires[0].dimensions if test_questionnaires else ["dim1", "dim2"],
             history=engine.history,
             islands_data=islands_data,
@@ -270,7 +357,26 @@ def main():
 
     # 最终评估
     if best:
-        final_evaluation(best, test_qs)
+        # 从engine获取seed baselines和seed codes
+        seed_baselines_train = getattr(engine, 'seed_baselines', None)
+        if seed_baselines_train:
+            # 转换为平均fitness格式
+            from src.open_evolve.engine import OpenEvolve
+            seed_baselines_train_avg = {}
+            for seed_name, fitness_list in seed_baselines_train.items():
+                avg_fitness = {}
+                for key in fitness_list[0].keys():
+                    avg_fitness[key] = sum(f[key] for f in fitness_list) / len(fitness_list)
+                seed_baselines_train_avg[seed_name] = avg_fitness
+            seed_baselines_train = seed_baselines_train_avg
+        
+        from src.open_evolve.code_templates import SEED_CODES
+        final_evaluation(
+            best, 
+            test_qs, 
+            seed_baselines_train=seed_baselines_train,
+            seed_codes=SEED_CODES,
+        )
         generate_viz(engine, test_qs)
     else:
         logger.error("进化未产生最优解")

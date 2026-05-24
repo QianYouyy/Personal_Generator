@@ -101,13 +101,39 @@ class Island:
             "best_coverage": best.fitness.get("coverage", 0) if best else 0,
         }
 
-    def reset(self, new_seed: Candidate, current_gen: int = 0):
-        """重置岛屿（从其他岛屿复制精英）."""
-        self.elites = {}
+    def reset(self, best_elites: Dict[str, Candidate], current_gen: int = 0):
+        """重置岛屿：保留部分原有精英，部分替换为最优岛屿精英.
+
+        策略（对比择优）：
+        对于每个指标，保留被重置岛屿和最优岛屿中该指标更优的精英。
+        这样保证每个指标都不退化，同时保留被重置岛屿的局部优势。
+
+        Args:
+            best_elites: 最优岛屿的 elites 字典 {metric: Candidate}
+            current_gen: 当前轮数
+        """
+        # 按指标逐个对比，保留更优者
+        for metric in self.METRIC_NAMES:
+            old_elite = self.elites.get(metric)
+            new_elite = best_elites.get(metric)
+
+            if old_elite is None:
+                # 原岛屿没有该指标精英，直接复制
+                if new_elite is not None:
+                    self.elites[metric] = copy.deepcopy(new_elite)
+            elif new_elite is None:
+                # 最优岛屿没有该指标精英，保留原有
+                pass
+            else:
+                # 对比该指标上的适应度，保留更优者
+                old_val = old_elite.fitness.get(metric, float('-inf'))
+                new_val = new_elite.fitness.get(metric, float('-inf'))
+                if new_val > old_val:
+                    self.elites[metric] = copy.deepcopy(new_elite)
+                # 否则保留原有（不做任何操作）
+
         # 保留当前 generation 计数，不重置为0
         self.last_improvement_gen = current_gen
-        for metric in self.METRIC_NAMES:
-            self.elites[metric] = copy.deepcopy(new_seed)
 
 
 class OpenEvolve:
@@ -159,6 +185,10 @@ class OpenEvolve:
                 seed_list.append((seed_name, code))
 
         logger.info(f"初始化 {self.num_islands} 个岛屿...")
+        
+        # 记录每个seed的baseline（用于最终对比）
+        self.seed_baselines: Dict[str, List[Dict]] = {}
+        
         for i, island in enumerate(self.islands):
             seed_name, code = seed_list[i % len(seed_list)]
             logger.info(f"  [Island {i}] 评估初始种子 {seed_name}...")
@@ -171,7 +201,23 @@ class OpenEvolve:
                 seed_name=seed_name,
             )
             island.update_elite(candidate)
+            
+            # 记录baseline
+            if seed_name not in self.seed_baselines:
+                self.seed_baselines[seed_name] = []
+            self.seed_baselines[seed_name].append(fitness)
+            
             logger.success(f"  [Island {i}] 初始化完成 | Coverage: {fitness.get('coverage', 0):.3f} | AvgDist: {fitness.get('avg_dist', 0):.3f}")
+        
+        # 打印seed baseline汇总
+        logger.section("Seed Baseline 汇总")
+        for seed_name, fitness_list in self.seed_baselines.items():
+            avg_fitness = {}
+            for key in fitness_list[0].keys():
+                avg_fitness[key] = sum(f[key] for f in fitness_list) / len(fitness_list)
+            logger.success(f"{seed_name} (平均 {len(fitness_list)} 个岛屿):")
+            for k, v in avg_fitness.items():
+                logger.metric(k, v)
 
     def evolve_once(self) -> dict:
         """单轮进化."""
@@ -203,13 +249,23 @@ class OpenEvolve:
             parent = random.choice(elites)
             logger.debug(f"[Island {island.id}] 选择父代 (gen={parent.generation}, seed={parent.seed_name})")
 
-            # 2. 变异
-            try:
-                logger.debug(f"[Island {island.id}] 执行变异...")
-                child_code = self.mutator.mutate(parent.code)
-                logger.debug(f"[Island {island.id}] 变异完成，代码长度: {len(child_code)} chars")
-            except Exception as e:
-                logger.error(f"[Island {island.id}] 变异失败: {e}")
+            # 2. 变异（失败时重试，最多3次）
+            child_code = None
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    logger.debug(f"[Island {island.id}] 执行变异... (attempt {attempt + 1}/{max_retries})")
+                    child_code = self.mutator.mutate(parent.code)
+                    logger.debug(f"[Island {island.id}] 变异完成，代码长度: {len(child_code)} chars")
+                    break
+                except Exception as e:
+                    logger.warn(f"[Island {island.id}] 变异失败 (attempt {attempt + 1}): {e}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"[Island {island.id}] 重试变异...")
+                    else:
+                        logger.error(f"[Island {island.id}] 变异失败 {max_retries} 次，跳过")
+            
+            if child_code is None:
                 continue
 
             # 3. 评估
@@ -248,6 +304,25 @@ class OpenEvolve:
             logger.success(f"本轮最优 (Island {best.island_id}):")
             for k, v in best.fitness.items():
                 logger.metric(k, v)
+        
+        # 记录每轮统计：平均、中位数、最优、最差（用于可视化）
+        all_fitness_values = {}
+        for metric in Island.METRIC_NAMES:
+            values = []
+            for island in self.islands:
+                elite = island.elites.get(metric)
+                if elite:
+                    values.append(elite.fitness.get(metric, 0))
+            if values:
+                import numpy as np
+                all_fitness_values[metric] = {
+                    "mean": float(np.mean(values)),
+                    "median": float(np.median(values)),
+                    "max": float(np.max(values)),
+                    "min": float(np.min(values)),
+                    "std": float(np.std(values)),
+                }
+        round_stats["fitness_stats"] = all_fitness_values
 
         # 岛屿统计
         logger.info("岛屿状态:")
@@ -360,6 +435,9 @@ class OpenEvolve:
         logger.info("最优适应度:")
         for k, v in best_seed.fitness.items():
             logger.metric(k, v)
+        
+        # 获取最优岛屿的完整 elites（用于混合替换）
+        best_elites = best_island.elites
 
         reset_count = 0
         
@@ -373,7 +451,7 @@ class OpenEvolve:
                     continue
                 gens_since = next(gs for sid, gs in only_stagnated if sid == island.id)
                 logger.warn(f"[Island {island.id}] 已 {gens_since} 轮无改进，重置...")
-                island.reset(best_seed, current_gen=self.generation)
+                island.reset(best_elites, current_gen=self.generation)
                 reset_count += 1
         else:
             # 固定间隔：重置后50%的岛屿（保留最优+随机保留一半）
@@ -396,7 +474,7 @@ class OpenEvolve:
             
             for island in islands_to_reset:
                 logger.warn(f"[Island {island.id}] 固定间隔重置...")
-                island.reset(best_seed, current_gen=self.generation)
+                island.reset(best_elites, current_gen=self.generation)
                 reset_count += 1
 
         logger.success(f"重置了 {reset_count} 个岛屿，保留了 {self.num_islands - reset_count} 个岛屿")
@@ -529,6 +607,29 @@ class OpenEvolve:
             "history": self.history,
             "best": self.get_global_best().to_dict() if self.get_global_best() else None,
         }
+        
+        # 保存seed baseline（初始化完成后才有）
+        if hasattr(self, "seed_baselines"):
+            checkpoint["seed_baselines"] = {}
+            for seed_name, fitness_list in self.seed_baselines.items():
+                avg_fitness = {}
+                for key in fitness_list[0].keys():
+                    avg_fitness[key] = sum(f[key] for f in fitness_list) / len(fitness_list)
+                checkpoint["seed_baselines"][seed_name] = avg_fitness
+        
+        # 保存所有岛屿的当前 elites 数据（用于热力图重绘）
+        islands_data = {}
+        for island in self.islands:
+            data = {}
+            for metric, candidate in island.elites.items():
+                data[metric] = candidate.fitness.get(metric, 0)
+            islands_data[island.id] = data
+        checkpoint["islands_data"] = islands_data
+        
+        # 保存灭绝日志
+        if hasattr(self, '_extinction_log') and self._extinction_log:
+            checkpoint["extinction_generations"] = self._extinction_log
+        
         path = self.checkpoint_path / f"checkpoint_gen_{self.generation}.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(checkpoint, f, ensure_ascii=False, indent=2)
