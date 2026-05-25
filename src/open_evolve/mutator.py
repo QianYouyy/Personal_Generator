@@ -6,6 +6,8 @@
 import random
 from typing import List
 
+from src.utils.logger import logger
+
 
 # =============================================================================
 # AlphaEvolve System Prompt (Prompt 4) - 全局系统提示
@@ -180,23 +182,105 @@ class Mutator:
     使用方式：
       1. System Prompt: ALPHAEVOLVE_SYSTEM_PROMPT (全局注入)
       2. User Prompt: 随机从 25 条提示中抽取 1 条 + 父代代码
+    
+    支持状态持久化：get_state() / set_state() 用于 checkpoint 保存/恢复。
     """
 
-    def __init__(self, llm_client):
+    def __init__(
+        self,
+        llm_client,
+        temperature: float = 0.8,
+        max_tokens: int = 4096,
+        adaptive_temperature: bool = True,
+        temp_range: tuple = (0.7, 1.2),
+    ):
         self.llm = llm_client
+        self.base_temperature = temperature
+        self.max_tokens = max_tokens
+        self.adaptive_temperature = adaptive_temperature
+        self.temp_range = temp_range
+        # 实例级别的提示词库（支持持久化）
+        self._prompts = ALL_MUTATION_PROMPTS.copy()
+
+    def _get_temperature(self, generation: int = 0, stagnation: int = 0) -> float:
+        """动态计算变异温度.
+        
+        策略：
+        - 前期（gen 1-3）：高温探索（1.0-1.2）
+        - 中期（gen 4-7）：中温平衡（0.8-1.0）
+        - 后期（gen 8+）：低温精细（0.7-0.8）
+        - 停滞触发时：临时升温突破（+0.2）
+        
+        Args:
+            generation: 当前轮数
+            stagnation: 停滞轮数（该岛屿无改进的轮数）
+            
+        Returns:
+            float: 实际使用的 temperature
+        """
+        if not self.adaptive_temperature:
+            return self.base_temperature
+        
+        # 基础温度按阶段递减
+        if generation <= 3:
+            base = 1.1
+        elif generation <= 7:
+            base = 0.9
+        else:
+            base = 0.75
+        
+        # 停滞时升温突破
+        if stagnation >= 3:
+            base += 0.2
+            logger.info(f"[变异] 检测到停滞 {stagnation} 轮，升温至 {base:.2f} 尝试突破")
+        
+        # 限制在范围内
+        return max(self.temp_range[0], min(self.temp_range[1], base))
 
     def mutate(self, parent_code: str, prompt: str = None) -> str:
         """对父代代码进行变异.
 
         Args:
             parent_code: 父代人格生成器代码 φ
-            prompt: 变异指令（None 则随机从 25 条中抽取）
+            prompt: 变异指令（None 则随机从实例提示词库中抽取）
 
         Returns:
             str: 子代代码 φ'
         """
         if prompt is None:
-            prompt = random.choice(ALL_MUTATION_PROMPTS)
+            prompt = random.choice(self._prompts)
+
+        mutation_prompt = f"""【变异指令】
+{prompt}
+
+【父代代码】
+```python
+{parent_code}
+```
+
+【任务】
+请根据变异指令修改上述代码。
+只输出完整的修改后 Python 代码，不要任何解释或 markdown 标记。
+确保代码可以直接被 exec() 执行。
+"""
+
+    def mutate(self, parent_code: str, prompt: str = None, generation: int = 0, stagnation: int = 0) -> str:
+        """对父代代码进行变异.
+
+        Args:
+            parent_code: 父代人格生成器代码 φ
+            prompt: 变异指令（None 则随机从实例提示词库中抽取）
+            generation: 当前轮数（用于动态温度）
+            stagnation: 停滞轮数（用于动态温度）
+
+        Returns:
+            str: 子代代码 φ'
+        """
+        if prompt is None:
+            prompt = random.choice(self._prompts)
+
+        # 计算动态温度
+        temperature = self._get_temperature(generation, stagnation)
 
         mutation_prompt = f"""【变异指令】
 {prompt}
@@ -215,8 +299,8 @@ class Mutator:
         resp = self.llm.generate(
             mutation_prompt,
             system_prompt=ALPHAEVOLVE_SYSTEM_PROMPT,
-            temperature=0.8,
-            max_tokens=4096,
+            temperature=temperature,
+            max_tokens=self.max_tokens,
         )
 
         # 清理输出
@@ -245,18 +329,45 @@ class Mutator:
 
     def add_prompt(self, prompt: str):
         """向提示词库添加新变异指令."""
-        ALL_MUTATION_PROMPTS.append(prompt)
+        self._prompts.append(prompt)
 
-    @staticmethod
-    def get_prompts() -> List[str]:
+    def get_prompts(self) -> List[str]:
         """获取所有变异指令."""
-        return ALL_MUTATION_PROMPTS.copy()
+        return self._prompts.copy()
     
-    @staticmethod
-    def get_prompts_by_category() -> dict:
-        """按类别获取变异指令."""
+    def get_prompts_by_category(self) -> dict:
+        """按类别获取变异指令（基于当前实例的提示词库）."""
+        # 返回当前实例的所有提示，不保证分类准确（动态添加的提示无法分类）
+        n_stage1 = len(STAGE1_MUTATION_PROMPTS)
+        n_stage2 = len(STAGE2_MUTATION_PROMPTS)
+        n_meta = len(META_MUTATION_PROMPTS)
+        all_base = n_stage1 + n_stage2 + n_meta
+        
+        current = self._prompts
         return {
-            "stage1": STAGE1_MUTATION_PROMPTS.copy(),
-            "stage2": STAGE2_MUTATION_PROMPTS.copy(),
-            "meta": META_MUTATION_PROMPTS.copy(),
+            "stage1": current[:n_stage1],
+            "stage2": current[n_stage1:n_stage1 + n_stage2],
+            "meta": current[n_stage1 + n_stage2:all_base],
+            "dynamic": current[all_base:] if len(current) > all_base else [],
         }
+    
+    def get_state(self) -> dict:
+        """获取变异算子状态（用于 checkpoint 保存）."""
+        return {
+            "base_temperature": self.base_temperature,
+            "max_tokens": self.max_tokens,
+            "adaptive_temperature": self.adaptive_temperature,
+            "temp_range": self.temp_range,
+            "prompts": self._prompts.copy(),
+            "num_prompts": len(self._prompts),
+        }
+    
+    def set_state(self, state: dict):
+        """恢复变异算子状态（用于 checkpoint 恢复）."""
+        self.base_temperature = state.get("base_temperature", 0.8)
+        self.max_tokens = state.get("max_tokens", 4096)
+        self.adaptive_temperature = state.get("adaptive_temperature", True)
+        self.temp_range = tuple(state.get("temp_range", (0.7, 1.2)))
+        if "prompts" in state:
+            self._prompts = state["prompts"].copy()
+        logger.info(f"变异算子状态已恢复: base_temp={self.base_temperature}, adaptive={self.adaptive_temperature}, prompts={len(self._prompts)}")

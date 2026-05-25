@@ -174,6 +174,13 @@ class OpenEvolve:
         instance.evaluator = evaluator
         instance.questionnaires = questionnaires
         
+        # 恢复变异算子状态（如果 checkpoint 中有）
+        if "mutator_state" in checkpoint and hasattr(instance.mutator, 'set_state'):
+            instance.mutator.set_state(checkpoint["mutator_state"])
+            logger.info("变异算子状态已从 checkpoint 恢复")
+        elif "mutator_state" in checkpoint:
+            logger.warn("Mutator 不支持 set_state()，跳过变异状态恢复")
+        
         # 恢复灭绝机制状态（优先从 checkpoint 恢复，确保行为一致）
         if "extinction_state" in checkpoint:
             extinction_state = checkpoint["extinction_state"]
@@ -360,10 +367,21 @@ class OpenEvolve:
     def _mutate_single(self, parent_code: str, island_id: int, child_idx: int, children_per_island: int) -> Optional[str]:
         """变异单个候选解（用于线程池并行）."""
         max_retries = 3
+        
+        # 计算动态温度参数
+        island = self.islands[island_id] if island_id < len(self.islands) else None
+        stagnation = 0
+        if island:
+            stagnation = self.generation - island.last_improvement_gen
+        
         for attempt in range(max_retries):
             try:
                 logger.debug(f"[Island {island_id}] 候选 {child_idx+1}/{children_per_island} 变异... (attempt {attempt + 1}/{max_retries})")
-                child_code = self.mutator.mutate(parent_code)
+                child_code = self.mutator.mutate(
+                    parent_code,
+                    generation=self.generation,
+                    stagnation=stagnation,
+                )
                 return child_code
             except Exception as e:
                 logger.warn(f"[Island {island_id}] 候选 {child_idx+1} 变异失败 (attempt {attempt + 1}): {e}")
@@ -856,6 +874,10 @@ class OpenEvolve:
             "max_generations": getattr(self, 'max_generations', None),
             "children_per_island": getattr(self, 'children_per_island', 3),
         }
+        
+        # 保存变异算子状态
+        if hasattr(self, 'mutator') and self.mutator is not None:
+            checkpoint["mutator_state"] = self.mutator.get_state()
         
         # 保存岛屿详细状态（elites 元数据，代码存到单独文件）
         checkpoint["islands"] = self._serialize_islands()
