@@ -80,12 +80,14 @@ def run_evolution(
     questionnaires,
     max_generations: int = 20,
     max_hours: float = None,
+    children_per_island: int = 3,
 ):
     """运行进化."""
     logger.step("启动 Open-Evolve 进化", 2, 4)
 
     logger.info(f"配置: {len(questionnaires)} 份问卷, 最大 {max_generations} 轮")
     logger.info(f"岛屿数: 10 | 每岛精英位: 6 | 灭绝间隔: 100 轮/8h")
+    logger.info(f"大群体进化: 每岛 {children_per_island} 候选")
 
     engine = OpenEvolve(
         mutator=mutator,
@@ -97,6 +99,7 @@ def run_evolution(
     best = engine.run(
         max_generations=max_generations,
         max_hours=max_hours,
+        children_per_island=children_per_island,
     )
 
     return engine, best
@@ -301,6 +304,8 @@ def main():
                         help="评估时使用的模型配置键")
     parser.add_argument("--name", default="default",
                         help="运行名称，用于命名输出目录")
+    parser.add_argument("--children-per-island", type=int, default=3,
+                        help="每轮每岛产生的候选解数量（大群体进化，默认3）")
 
     args = parser.parse_args()
     
@@ -353,6 +358,7 @@ def main():
         questionnaires=train_qs,
         max_generations=args.generations,
         max_hours=args.hours,
+        children_per_island=args.children_per_island,
     )
 
     # 最终评估

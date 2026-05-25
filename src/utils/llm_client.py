@@ -101,7 +101,7 @@ api_recorder = APIRecorder()
 
 
 class LLMClient:
-    """统一 LLM 调用封装."""
+    """统一 LLM 调用封装（纯同步）."""
     
     def __init__(self, model: str, api_key: str = None, base_url: str = None):
         self.model = model
@@ -115,7 +115,6 @@ class LLMClient:
                 "或传入 api_key 参数。"
             )
         self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
-        self.async_client = openai.AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
         self.recorder = APIRecorder()
     
     @classmethod
@@ -143,54 +142,12 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
         return self.chat(messages, temperature=temperature, max_tokens=max_tokens, **kwargs)
     
-    async def generate_async(self, prompt: str, system_prompt: str = None, temperature: float = 0.7, max_tokens: int = 2048, **kwargs) -> str:
-        """异步调用 LLM 生成文本."""
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-        return await self.chat_async(messages, temperature=temperature, max_tokens=max_tokens, **kwargs)
-    
     def chat(self, messages: list, temperature: float = 0.7, max_tokens: int = 4000, **kwargs) -> str:
         """发送聊天请求."""
         start = time.time()
         try:
             # 统一使用 max_completion_tokens（兼容 o1/o3/gpt-5 系列）
             response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_completion_tokens=max_tokens,
-                **kwargs
-            )
-            elapsed = time.time() - start
-            content = response.choices[0].message.content
-            tokens = response.usage.completion_tokens if response.usage else 0
-            
-            self.recorder.record(
-                model=self.model,
-                messages=messages,
-                response=content,
-                elapsed=elapsed,
-                tokens=tokens
-            )
-            return content
-        except Exception as e:
-            elapsed = time.time() - start
-            self.recorder.record(
-                model=self.model,
-                messages=messages,
-                response="",
-                elapsed=elapsed,
-                error=str(e)
-            )
-            raise
-    
-    async def chat_async(self, messages: list, temperature: float = 0.7, max_tokens: int = 4000, **kwargs) -> str:
-        """异步发送聊天请求."""
-        start = time.time()
-        try:
-            response = await self.async_client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 temperature=temperature,

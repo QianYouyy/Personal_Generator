@@ -48,10 +48,23 @@ Your modified code will be executed automatically by an evaluation pipeline. If 
 - **stage1 MUST return a Python `list` of strings.** Never return `None`, never return an empty list `[]`, never return a single string. The list length must be exactly `n` (the input parameter). Each element must be a non-empty, non-None string.
 - **stage2 MUST return a Python `list` of strings.** Never return `None`, never return an empty list `[]`. The list length must be exactly `len(high_level_tags)`. Each element must be a non-empty, non-None string.
 
-### Async Safety
-- If you use `asyncio.gather(return_exceptions=True)`, you MUST filter the results: remove all `Exception` objects and all `None` values. Replace failed tasks with valid fallback strings (e.g., "Error" or a copy of a successful result). Never let exceptions or None leak into the returned list.
-- If you use `asyncio.run()`, you MUST wrap it in try/except. If it fails, fall back to synchronous execution or return a list of placeholder strings of the correct length.
-- NEVER call `asyncio.run()` inside an already running event loop without using `nest_asyncio`. If `RuntimeError` occurs, apply `nest_asyncio.apply()` and use `loop.run_until_complete()`.
+### Concurrency
+- 使用 `concurrent.futures.ThreadPoolExecutor` 进行并行 LLM 调用，不要使用 asyncio。
+- ThreadPoolExecutor 示例：
+  ```python
+  from concurrent.futures import ThreadPoolExecutor, as_completed
+  
+  results = [None] * n
+  with ThreadPoolExecutor(max_workers=5) as executor:
+      futures = {executor.submit(func, arg, i): i for i, arg in enumerate(args)}
+      for future in as_completed(futures):
+          i = futures[future]
+          try:
+              results[i] = future.result()
+          except Exception:
+              results[i] = "Error"
+  ```
+- 如果使用 `return_exceptions=True` 风格的 gather，必须过滤掉所有 Exception 对象和 None 值，用有效字符串替换。
 
 ### Error Handling
 - Every LLM API call MUST have a fallback. If the API call fails or returns unexpected output, the function must still return a valid list of the correct length.

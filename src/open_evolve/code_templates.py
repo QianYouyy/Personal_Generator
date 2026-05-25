@@ -6,7 +6,7 @@
 
 
 SEED1_CODE = '''
-import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class SeedPersonaGenerator:
     """seed1: 默认 Concordia 提示 + 形成性记忆."""
@@ -14,10 +14,8 @@ class SeedPersonaGenerator:
     def __init__(self, llm_client):
         self.llm = llm_client
 
-    async def _stage1_single(self, context: str, dimensions: list, n: int, i: int) -> str:
-        """异步生成单个标签."""
-        import time
-        start = time.time()
+    def _stage1_single(self, context: str, dimensions: list, n: int, i: int) -> str:
+        """同步生成单个标签."""
         existing_tags = "\\n".join(f"  {j+1}. {t}" for j, t in enumerate([]))
         prompt = f"""【情境】
 {context}
@@ -36,11 +34,8 @@ class SeedPersonaGenerator:
 3. 2-3 句话
 
 直接输出标签文本，不要前缀。"""
-        resp = await self.llm.generate_async(prompt, temperature=0.9, max_tokens=256)
+        resp = self.llm.generate(prompt, temperature=0.9, max_tokens=256)
         tag = resp.strip().lstrip("0123456789. ").strip()
-        elapsed = time.time() - start
-        # 单标签耗时打印已禁用
-        pass
         return tag
 
     def stage1(self, context: str, dimensions: list, n: int) -> list:
@@ -48,34 +43,27 @@ class SeedPersonaGenerator:
         import time
         print(f"    [Stage1] 开始生成 {n} 个标签...")
         total_start = time.time()
-        
-        async def _run_all():
-            tasks = [self._stage1_single(context, dimensions, n, i) for i in range(n)]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-        
-        try:
-            results = asyncio.run(_run_all())
-        except RuntimeError:
-            import nest_asyncio
-            nest_asyncio.apply()
-            loop = asyncio.get_event_loop()
-            results = loop.run_until_complete(_run_all())
-        
+
+        results = [None] * n
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(self._stage1_single, context, dimensions, n, i): i
+                for i in range(n)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    tag = future.result()
+                    results[i] = tag
+                except Exception:
+                    results[i] = "Error"
+
         total_elapsed = time.time() - total_start
         print(f"    [Stage1] 全部完成: {total_elapsed:.2f}s")
-        
-        tags = []
-        for result in results:
-            if isinstance(result, Exception):
-                tags.append("Error")
-            else:
-                tags.append(result)
-        return tags
+        return results
 
-    async def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
-        """异步生成单个人格."""
-        import time
-        start = time.time()
+    def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
+        """同步生成单个人格."""
         prompt = f"""【情境】
 {context}
 
@@ -91,10 +79,7 @@ class SeedPersonaGenerator:
 4. 说话风格和社交模式
 
 用第三人称"他/她"。"""
-        resp = await self.llm.generate_async(prompt, temperature=0.8, max_tokens=512)
-        elapsed = time.time() - start
-        # 单人格耗时打印已禁用
-        pass
+        resp = self.llm.generate(prompt, temperature=0.8, max_tokens=512)
         return resp.strip()
 
     def stage2(self, context: str, dimensions: list, high_level_tags: list) -> list:
@@ -102,34 +87,29 @@ class SeedPersonaGenerator:
         import time
         print(f"    [Stage2] 开始生成 {len(high_level_tags)} 个人格...")
         total_start = time.time()
-        
-        async def _run_all():
-            tasks = [self._stage2_single(context, dimensions, tag, i) for i, tag in enumerate(high_level_tags)]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-        
-        try:
-            results = asyncio.run(_run_all())
-        except RuntimeError:
-            import nest_asyncio
-            nest_asyncio.apply()
-            loop = asyncio.get_event_loop()
-            results = loop.run_until_complete(_run_all())
-        
+
+        results = [None] * len(high_level_tags)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(self._stage2_single, context, dimensions, tag, i): i
+                for i, tag in enumerate(high_level_tags)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    persona = future.result()
+                    results[i] = persona
+                except Exception:
+                    results[i] = "Error"
+
         total_elapsed = time.time() - total_start
         print(f"    [Stage2] 全部完成: {total_elapsed:.2f}s")
-        
-        personas = []
-        for result in results:
-            if isinstance(result, Exception):
-                personas.append("Error")
-            else:
-                personas.append(result)
-        return personas
+        return results
 '''
 
 
 SEED2_CODE = '''
-import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class SeedPersonaGenerator:
     """seed2: 小批次自回归 + 形成性记忆."""
@@ -144,14 +124,14 @@ class SeedPersonaGenerator:
         import time
         print(f"    [Stage1] 开始生成 {n} 个标签（小批次串行）...")
         total_start = time.time()
-        
+
         tags = []
         total_batches = (n + self.BATCH_SIZE - 1) // self.BATCH_SIZE
-        
+
         for batch_idx in range(total_batches):
             remaining = n - len(tags)
             batch_size = min(self.BATCH_SIZE, remaining)
-            
+
             batch_start = time.time()
             existing_tags = "\\n".join(f"  {j+1}. {t}" for j, t in enumerate(tags))
             prompt = f"""【情境】
@@ -172,7 +152,7 @@ class SeedPersonaGenerator:
 
 直接输出编号列表："""
             resp = self.llm.generate(prompt, temperature=0.9, max_tokens=1024)
-            
+
             # 解析编号列表
             lines = resp.strip().split("\\n")
             batch_tags = []
@@ -180,19 +160,17 @@ class SeedPersonaGenerator:
                 line = line.strip().lstrip("01234567890.-) ").strip()
                 if line and len(line) > 10:
                     batch_tags.append(line)
-            
+
             tags.extend(batch_tags[:batch_size])
             batch_elapsed = time.time() - batch_start
             print(f"    [Stage1] Batch {batch_idx+1}/{total_batches} 完成: {batch_elapsed:.2f}s ({len(batch_tags)}个标签)")
-        
+
         total_elapsed = time.time() - total_start
         print(f"    [Stage1] 全部完成: {total_elapsed:.2f}s")
         return tags[:n]
 
-    async def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
-        """异步生成单个人格."""
-        import time
-        start = time.time()
+    def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
+        """同步生成单个人格."""
         prompt = f"""【情境】
 {context}
 
@@ -208,10 +186,7 @@ class SeedPersonaGenerator:
 4. 说话风格和社交模式
 
 用第三人称"他/她"。"""
-        resp = await self.llm.generate_async(prompt, temperature=0.8, max_tokens=512)
-        elapsed = time.time() - start
-        # 单人格耗时打印已禁用
-        pass
+        resp = self.llm.generate(prompt, temperature=0.8, max_tokens=512)
         return resp.strip()
 
     def stage2(self, context: str, dimensions: list, high_level_tags: list) -> list:
@@ -219,34 +194,29 @@ class SeedPersonaGenerator:
         import time
         print(f"    [Stage2] 开始生成 {len(high_level_tags)} 个人格...")
         total_start = time.time()
-        
-        async def _run_all():
-            tasks = [self._stage2_single(context, dimensions, tag, i) for i, tag in enumerate(high_level_tags)]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-        
-        try:
-            results = asyncio.run(_run_all())
-        except RuntimeError:
-            import nest_asyncio
-            nest_asyncio.apply()
-            loop = asyncio.get_event_loop()
-            results = loop.run_until_complete(_run_all())
-        
+
+        results = [None] * len(high_level_tags)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(self._stage2_single, context, dimensions, tag, i): i
+                for i, tag in enumerate(high_level_tags)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    persona = future.result()
+                    results[i] = persona
+                except Exception:
+                    results[i] = "Error"
+
         total_elapsed = time.time() - total_start
         print(f"    [Stage2] 全部完成: {total_elapsed:.2f}s")
-        
-        personas = []
-        for result in results:
-            if isinstance(result, Exception):
-                personas.append("Error")
-            else:
-                personas.append(result)
-        return personas
+        return results
 '''
 
 
 SEED3_CODE = '''
-import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 class SeedPersonaGenerator:
@@ -255,10 +225,8 @@ class SeedPersonaGenerator:
     def __init__(self, llm_client):
         self.llm = llm_client
 
-    async def _stage1_single(self, context: str, dimensions: list, coords: list, i: int) -> str:
-        """异步生成单个标签."""
-        import time
-        start = time.time()
+    def _stage1_single(self, context: str, dimensions: list, coords: list, i: int) -> str:
+        """同步生成单个标签."""
         coords_str = ", ".join(f"{d}={c:.2f}" for d, c in zip(dimensions, coords))
         prompt = f"""【情境】
 {context}
@@ -269,11 +237,8 @@ class SeedPersonaGenerator:
 【任务】
 将上述坐标翻译为一段人格高层定位标签（2-3 句话）。
 描述这个人在各维度上的位置和行为特征。"""
-        resp = await self.llm.generate_async(prompt, temperature=0.9, max_tokens=256)
+        resp = self.llm.generate(prompt, temperature=0.9, max_tokens=256)
         tag = resp.strip().lstrip("0123456789. ").strip()
-        elapsed = time.time() - start
-        # 单标签耗时打印已禁用
-        pass
         return tag
 
     def stage1(self, context: str, dimensions: list, n: int) -> list:
@@ -281,7 +246,7 @@ class SeedPersonaGenerator:
         import time
         print(f"    [Stage1] 开始生成 {n} 个标签（蒙特卡洛采样）...")
         total_start = time.time()
-        
+
         k = len(dimensions)
         try:
             from scipy.stats import qmc
@@ -289,34 +254,27 @@ class SeedPersonaGenerator:
             points = sampler.random(n=n)
         except Exception:
             points = np.random.rand(n, k)
-        
-        async def _run_all():
-            tasks = [self._stage1_single(context, dimensions, coords.tolist(), i) for i, coords in enumerate(points)]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-        
-        try:
-            results = asyncio.run(_run_all())
-        except RuntimeError:
-            import nest_asyncio
-            nest_asyncio.apply()
-            loop = asyncio.get_event_loop()
-            results = loop.run_until_complete(_run_all())
-        
+
+        results = [None] * n
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(self._stage1_single, context, dimensions, coords.tolist(), i): i
+                for i, coords in enumerate(points)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    tag = future.result()
+                    results[i] = tag
+                except Exception:
+                    results[i] = "Error"
+
         total_elapsed = time.time() - total_start
         print(f"    [Stage1] 全部完成: {total_elapsed:.2f}s")
-        
-        tags = []
-        for result in results:
-            if isinstance(result, Exception):
-                tags.append("Error")
-            else:
-                tags.append(result)
-        return tags
+        return results
 
-    async def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
-        """异步生成单个人格."""
-        import time
-        start = time.time()
+    def _stage2_single(self, context: str, dimensions: list, tag: str, idx: int) -> str:
+        """同步生成单个人格."""
         prompt = f"""【情境】
 {context}
 
@@ -332,10 +290,7 @@ class SeedPersonaGenerator:
 4. 说话风格和社交模式
 
 用第三人称"他/她"。"""
-        resp = await self.llm.generate_async(prompt, temperature=0.8, max_tokens=512)
-        elapsed = time.time() - start
-        # 单人格耗时打印已禁用
-        pass
+        resp = self.llm.generate(prompt, temperature=0.8, max_tokens=512)
         return resp.strip()
 
     def stage2(self, context: str, dimensions: list, high_level_tags: list) -> list:
@@ -343,29 +298,24 @@ class SeedPersonaGenerator:
         import time
         print(f"    [Stage2] 开始生成 {len(high_level_tags)} 个人格...")
         total_start = time.time()
-        
-        async def _run_all():
-            tasks = [self._stage2_single(context, dimensions, tag, i) for i, tag in enumerate(high_level_tags)]
-            return await asyncio.gather(*tasks, return_exceptions=True)
-        
-        try:
-            results = asyncio.run(_run_all())
-        except RuntimeError:
-            import nest_asyncio
-            nest_asyncio.apply()
-            loop = asyncio.get_event_loop()
-            results = loop.run_until_complete(_run_all())
-        
+
+        results = [None] * len(high_level_tags)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(self._stage2_single, context, dimensions, tag, i): i
+                for i, tag in enumerate(high_level_tags)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    persona = future.result()
+                    results[i] = persona
+                except Exception:
+                    results[i] = "Error"
+
         total_elapsed = time.time() - total_start
         print(f"    [Stage2] 全部完成: {total_elapsed:.2f}s")
-        
-        personas = []
-        for result in results:
-            if isinstance(result, Exception):
-                personas.append("Error")
-            else:
-                personas.append(result)
-        return personas
+        return results
 '''
 
 

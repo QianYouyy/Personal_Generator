@@ -3,6 +3,7 @@
 import copy
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -219,12 +220,56 @@ class OpenEvolve:
             for k, v in avg_fitness.items():
                 logger.metric(k, v)
 
+    def _mutate_single(self, parent_code: str, island_id: int, child_idx: int, children_per_island: int) -> Optional[str]:
+        """变异单个候选解（用于线程池并行）."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"[Island {island_id}] 候选 {child_idx+1}/{children_per_island} 变异... (attempt {attempt + 1}/{max_retries})")
+                child_code = self.mutator.mutate(parent_code)
+                return child_code
+            except Exception as e:
+                logger.warn(f"[Island {island_id}] 候选 {child_idx+1} 变异失败 (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    continue
+                else:
+                    logger.error(f"[Island {island_id}] 候选 {child_idx+1} 变异失败 {max_retries} 次，跳过")
+        return None
+
+    def _evaluate_single(self, child_code: str, island_id: int, child_idx: int, total_children: int, seed_name: str) -> Optional[Candidate]:
+        """评估单个候选解（用于线程池并行）."""
+        try:
+            logger.debug(f"[Island {island_id}] 候选 {child_idx+1}/{total_children} 评估中...")
+            child_fitness = self.evaluator.evaluate(child_code)
+            return Candidate(
+                code=child_code,
+                fitness=child_fitness,
+                generation=self.generation,
+                island_id=island_id,
+                seed_name=seed_name,
+            )
+        except Exception as e:
+            logger.error(f"[Island {island_id}] 候选 {child_idx+1} 评估失败: {e}")
+            return None
+
     def evolve_once(self) -> dict:
-        """单轮进化."""
+        """单轮进化 — 大群体 + 并行评估版本.
+        
+        每轮每个岛屿产生多个候选解（默认3个），同一岛屿的候选解并行评估。
+        这样每轮总评估数 = 岛屿数 × 每岛候选数 = 10 × 3 = 30个。
+        并行后每轮时间 ≈ 岛屿数 × max(候选评估时间) = 10 × T（而非 30 × T）
+        """
         self.generation += 1
         gen_start = time.time()
+        
+        # 每岛候选数（大群体进化参数）
+        children_per_island = getattr(self, 'children_per_island', 3)
+        # 每岛并行线程数（默认等于候选数，即全部并行）
+        max_workers_per_island = children_per_island
 
         logger.section(f"Generation {self.generation}/{self.max_generations if hasattr(self, 'max_generations') else '?'}")
+        logger.info(f"大群体进化: {len(self.islands)} 岛屿 × {children_per_island} 候选 = {len(self.islands) * children_per_island} 评估/轮")
+        logger.info(f"并行策略: 每岛 {max_workers_per_island} 线程并行评估")
 
         round_stats = {
             "generation": self.generation,
@@ -233,7 +278,7 @@ class OpenEvolve:
             "time": time.time(),
         }
 
-        # 每轮处理所有岛屿
+        # 每轮处理所有岛屿（岛屿间仍串行，避免竞争）
         total_islands = len(self.islands)
         for idx, island in enumerate(self.islands):
             island.generation = self.generation
@@ -246,53 +291,57 @@ class OpenEvolve:
             if not elites:
                 logger.warn(f"[Island {island.id}] 无精英，跳过")
                 continue
-            parent = random.choice(elites)
-            logger.debug(f"[Island {island.id}] 选择父代 (gen={parent.generation}, seed={parent.seed_name})")
-
-            # 2. 变异（失败时重试，最多3次）
-            child_code = None
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    logger.debug(f"[Island {island.id}] 执行变异... (attempt {attempt + 1}/{max_retries})")
-                    child_code = self.mutator.mutate(parent.code)
-                    logger.debug(f"[Island {island.id}] 变异完成，代码长度: {len(child_code)} chars")
-                    break
-                except Exception as e:
-                    logger.warn(f"[Island {island.id}] 变异失败 (attempt {attempt + 1}): {e}")
-                    if attempt < max_retries - 1:
-                        logger.info(f"[Island {island.id}] 重试变异...")
-                    else:
-                        logger.error(f"[Island {island.id}] 变异失败 {max_retries} 次，跳过")
             
-            if child_code is None:
+            # 2. 串行变异（LLM 调用有速率限制，串行更安全）
+            island_children = []
+            parent_codes = []
+            for child_idx in range(children_per_island):
+                parent = random.choice(elites)
+                child_code = self._mutate_single(parent.code, island.id, child_idx, children_per_island)
+                if child_code is not None:
+                    island_children.append(child_code)
+                    parent_codes.append(parent.seed_name)
+            
+            if not island_children:
+                logger.warn(f"[Island {island.id}] 无成功变异，跳过")
                 continue
-
-            # 3. 评估
-            logger.debug(f"[Island {island.id}] 评估子代...")
-            eval_start = time.time()
-            child_fitness = self.evaluator.evaluate(child_code)
-            eval_time = time.time() - eval_start
-            round_stats["evaluations"] += 1
-            logger.debug(f"[Island {island.id}] 评估完成 ({eval_time:.1f}s)")
-
-            child = Candidate(
-                code=child_code,
-                fitness=child_fitness,
-                generation=self.generation,
-                island_id=island.id,
-                seed_name=parent.seed_name,
-            )
-
-            # 4. 更新精英
-            improved, metrics = island.update_elite(child)
-            if improved:
-                round_stats["improvements"] += 1
-                logger.success(f"[Island {island.id}] 🏆 打破 {len(metrics)} 项纪录: {metrics}")
-                for m in metrics:
-                    logger.metric(m, child_fitness.get(m, 0))
-            else:
-                logger.debug(f"[Island {island.id}] 未打破纪录")
+            
+            # 3. 并行评估所有候选解
+            logger.info(f"[Island {island.id}] 并行评估 {len(island_children)} 个候选解...")
+            island_eval_start = time.time()
+            
+            with ThreadPoolExecutor(max_workers=max_workers_per_island) as executor:
+                futures = {}
+                for child_idx, (child_code, seed_name) in enumerate(zip(island_children, parent_codes)):
+                    future = executor.submit(
+                        self._evaluate_single,
+                        child_code, island.id, child_idx, len(island_children), seed_name
+                    )
+                    futures[future] = child_idx
+                
+                for future in as_completed(futures):
+                    child_idx = futures[future]
+                    try:
+                        child = future.result()
+                        if child is None:
+                            continue
+                        
+                        round_stats["evaluations"] += 1
+                        
+                        # 4. 更新精英
+                        improved, metrics = island.update_elite(child)
+                        if improved:
+                            round_stats["improvements"] += 1
+                            logger.success(f"[Island {island.id}] 候选 {child_idx+1} 🏆 打破 {len(metrics)} 项纪录: {metrics}")
+                            for m in metrics:
+                                logger.metric(m, child.fitness.get(m, 0))
+                        else:
+                            logger.debug(f"[Island {island.id}] 候选 {child_idx+1} 未打破纪录")
+                    except Exception as e:
+                        logger.error(f"[Island {island.id}] 候选 {child_idx+1} 评估线程异常: {e}")
+            
+            island_eval_time = time.time() - island_eval_start
+            logger.info(f"[Island {island.id}] 并行评估完成: {island_eval_time:.1f}s")
 
         # 检查灭绝
         self._check_extinction()
@@ -566,13 +615,25 @@ class OpenEvolve:
         logger.info("  3. 最优保留: 最优岛屿不会被重置")
         logger.info("  4. 多指标选优: coverage(40%) + convex_hull(15%) + avg_dist(15%) + min_dist(10%) + dispersion(10%) + (1-KL)(10%)")
 
-    def run(self, max_generations: int = None, max_hours: float = None):
-        """主进化循环."""
+    def run(self, max_generations: int = None, max_hours: float = None, children_per_island: int = 3):
+        """主进化循环.
+        
+        Args:
+            max_generations: 最大进化轮数
+            max_hours: 最大运行时间（小时）
+            children_per_island: 每轮每岛产生的候选解数量（大群体进化参数，默认3）
+        """
         self.max_generations = max_generations
+        self.children_per_island = children_per_island
+        
         logger.section("Open-Evolve 进化引擎启动")
         logger.info(f"配置: 岛屿={self.num_islands}, 最大轮数={max_generations}")
+        logger.info(f"大群体进化: 每岛 {children_per_island} 候选 × {self.num_islands} 岛屿 = {children_per_island * self.num_islands} 评估/轮")
         logger.info(f"人格数: {self.evaluator.num_personas} 人/问卷 | 问卷数: {len(self.questionnaires)} 份")
-        logger.info(f"每轮评估: {self.num_islands} 岛屿 × {len(self.questionnaires)} 问卷 × {self.evaluator.num_personas} 人格 = {self.num_islands * len(self.questionnaires) * self.evaluator.num_personas} 次 API 调用")
+        
+        # 计算 API 调用量
+        evals_per_round = self.num_islands * children_per_island * len(self.questionnaires) * self.evaluator.num_personas
+        logger.info(f"每轮 API 调用: {self.num_islands} 岛 × {children_per_island} 候选 × {len(self.questionnaires)} 问卷 × {self.evaluator.num_personas} 人格 = {evals_per_round} 次")
         
         # 打印灭绝逻辑
         self._print_extinction_logic(max_generations)
