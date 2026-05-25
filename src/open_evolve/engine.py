@@ -140,6 +140,143 @@ class Island:
 class OpenEvolve:
     """Open-Evolve 进化引擎."""
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str,
+        mutator: Mutator,
+        evaluator: PersonaCodeEvaluator,
+        questionnaires: List,
+    ) -> "OpenEvolve":
+        """从 checkpoint 恢复进化状态.
+        
+        Args:
+            checkpoint_path: checkpoint JSON 文件路径
+            mutator: 变异算子（需重新传入）
+            evaluator: 评估器（需重新传入）
+            questionnaires: 问卷列表（需重新传入）
+            
+        Returns:
+            OpenEvolve: 恢复状态的进化引擎实例
+        """
+        import json
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint 不存在: {checkpoint_path}")
+        
+        logger.section(f"从 Checkpoint 恢复: {checkpoint_path}")
+        with open(path, "r", encoding="utf-8") as f:
+            checkpoint = json.load(f)
+        
+        # 创建新实例（不调用 __init__ 的初始化逻辑）
+        instance = cls.__new__(cls)
+        instance.mutator = mutator
+        instance.evaluator = evaluator
+        instance.questionnaires = questionnaires
+        
+        # 恢复灭绝机制状态（优先从 checkpoint 恢复，确保行为一致）
+        if "extinction_state" in checkpoint:
+            extinction_state = checkpoint["extinction_state"]
+            instance.extinction_interval = extinction_state["extinction_interval"]
+            instance.extinction_hours = extinction_state["extinction_hours"]
+            instance.extinction_stagnation_threshold = extinction_state["extinction_stagnation_threshold"]
+            instance.extinction_mode = extinction_state["extinction_mode"]
+            instance._effective_interval = extinction_state["_effective_interval"]
+            instance._effective_stagnation = extinction_state["_effective_stagnation"]
+            instance._last_extinction_gen = extinction_state["_last_extinction_gen"]
+            logger.info("灭绝机制状态已从 checkpoint 恢复")
+        else:
+            # 旧版 checkpoint：从配置文件读取（行为可能不一致）
+            cfg = get_config()
+            instance.extinction_interval = cfg.get("open_evolve.extinction_interval", 100)
+            instance.extinction_hours = cfg.get("open_evolve.extinction_interval_hours", 8)
+            instance.extinction_stagnation_threshold = max(2, instance.extinction_interval // 10)
+            instance.extinction_mode = cfg.get("open_evolve.extinction_mode", "adaptive")
+            logger.warn("Checkpoint 中无灭绝机制状态，使用配置文件默认值")
+        
+        # 恢复运行配置（优先从 checkpoint 恢复）
+        if "run_config" in checkpoint:
+            run_config = checkpoint["run_config"]
+            instance.num_islands = run_config["num_islands"]
+            instance.max_generations = run_config.get("max_generations")
+            instance.children_per_island = run_config.get("children_per_island", 3)
+            logger.info(f"运行配置已恢复: {instance.num_islands} 岛屿, children={instance.children_per_island}")
+        else:
+            cfg = get_config()
+            instance.num_islands = cfg.get("open_evolve.num_islands", 10)
+            instance.max_generations = None
+            instance.children_per_island = 3
+        
+        # 恢复基本状态
+        instance.generation = checkpoint["generation"]
+        instance.history = checkpoint.get("history", [])
+        instance._extinction_log = checkpoint.get("extinction_generations", [])
+        instance.start_time = time.time()  # 重置计时
+        
+        # checkpoint 保存路径
+        from src.utils.output_manager import output_manager
+        if output_manager.base_dir is None:
+            output_manager.setup("default")
+        instance.checkpoint_path = output_manager.outputs_dir
+        
+        # 恢复岛屿状态
+        instance.islands = []
+        if "islands" in checkpoint:
+            islands_state = checkpoint["islands"]
+            elite_codes_dir = path.parent / islands_state.get("_elite_codes_dir", "")
+            
+            for island_id in range(instance.num_islands):
+                island = Island(island_id)
+                island_data = islands_state.get(str(island_id), {})
+                
+                # 恢复岛屿统计
+                island.generation = island_data.get("generation", instance.generation)
+                island.last_improvement_gen = island_data.get("last_improvement_gen", 0)
+                island.total_evaluations = island_data.get("total_evaluations", 0)
+                island.total_improvements = island_data.get("total_improvements", 0)
+                
+                # 恢复 elites
+                elites_meta = island_data.get("elites", {})
+                for metric, meta in elites_meta.items():
+                    code_file = elite_codes_dir / meta["code_file"] if "code_file" in meta else None
+                    if code_file and code_file.exists():
+                        code = code_file.read_text(encoding="utf-8")
+                    else:
+                        # 回退：尝试从 code_file 路径直接读取
+                        alt_path = path.parent / meta.get("code_file", "")
+                        if alt_path.exists():
+                            code = alt_path.read_text(encoding="utf-8")
+                        else:
+                            logger.warn(f"[恢复] Island {island_id} {metric} 的代码文件不存在，跳过")
+                            continue
+                    
+                    candidate = Candidate(
+                        code=code,
+                        fitness=meta["fitness"],
+                        generation=meta["generation"],
+                        island_id=meta["island_id"],
+                        seed_name=meta["seed_name"],
+                    )
+                    island.elites[metric] = candidate
+                
+                instance.islands.append(island)
+            
+            logger.info(f"已恢复 {len(instance.islands)} 个岛屿，共 {sum(len(i.elites) for i in instance.islands)} 个 elite")
+        else:
+            # 旧版 checkpoint 没有 islands 字段，无法恢复详细状态
+            logger.warn("Checkpoint 中没有岛屿详细状态，无法断点续跑")
+            # 创建空岛屿
+            instance.islands = [Island(i) for i in range(instance.num_islands)]
+        
+        # 恢复 seed_baselines
+        if "seed_baselines" in checkpoint:
+            instance.seed_baselines = {}
+            for seed_name, fitness in checkpoint["seed_baselines"].items():
+                instance.seed_baselines[seed_name] = [fitness]  # 包装成列表保持兼容
+        
+        logger.success(f"Checkpoint 恢复完成: Gen {instance.generation}")
+        return instance
+
     def __init__(
         self,
         mutator: Mutator,
@@ -662,11 +799,33 @@ class OpenEvolve:
         return best
 
     def _save_checkpoint(self):
-        """保存进化状态."""
+        """保存进化状态.
+        
+        Checkpoint 结构:
+          - generation: 当前轮数
+          - history: 历史统计
+          - best: 全局最优（代码内联）
+          - seed_baselines: 初始种子基线
+          - islands: 各岛屿完整状态（elites 元数据，代码引用）
+          - islands_data: 各岛屿当前适应度（简化版，用于可视化）
+          - extinction_generations: 灭绝日志
+          - elite_codes_dir: elites 代码文件存放目录
+        """
         checkpoint = {
             "generation": self.generation,
             "history": self.history,
             "best": self.get_global_best().to_dict() if self.get_global_best() else None,
+        }
+        
+        # 保存灭绝机制运行时状态（确保恢复后行为一致）
+        checkpoint["extinction_state"] = {
+            "extinction_interval": self.extinction_interval,
+            "extinction_hours": self.extinction_hours,
+            "extinction_stagnation_threshold": self.extinction_stagnation_threshold,
+            "extinction_mode": self.extinction_mode,
+            "_effective_interval": getattr(self, '_effective_interval', self.extinction_interval),
+            "_effective_stagnation": getattr(self, '_effective_stagnation', self.extinction_stagnation_threshold),
+            "_last_extinction_gen": getattr(self, '_last_extinction_gen', 0),
         }
         
         # 保存seed baseline（初始化完成后才有）
@@ -691,6 +850,16 @@ class OpenEvolve:
         if hasattr(self, '_extinction_log') and self._extinction_log:
             checkpoint["extinction_generations"] = self._extinction_log
         
+        # 保存运行参数（确保恢复后配置一致）
+        checkpoint["run_config"] = {
+            "num_islands": self.num_islands,
+            "max_generations": getattr(self, 'max_generations', None),
+            "children_per_island": getattr(self, 'children_per_island', 3),
+        }
+        
+        # 保存岛屿详细状态（elites 元数据，代码存到单独文件）
+        checkpoint["islands"] = self._serialize_islands()
+        
         path = self.checkpoint_path / f"checkpoint_gen_{self.generation}.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(checkpoint, f, ensure_ascii=False, indent=2)
@@ -698,6 +867,45 @@ class OpenEvolve:
         
         # 更新后台状态文件
         self._update_background_status()
+    
+    def _serialize_islands(self) -> dict:
+        """序列化所有岛屿状态.
+        
+        elites 的代码保存到单独文件，checkpoint 中只存引用路径。
+        这样 checkpoint 文件不会过大，同时支持断点续跑。
+        """
+        # 创建 elites 代码目录
+        elite_codes_dir = self.checkpoint_path / f"elite_codes_gen_{self.generation}"
+        elite_codes_dir.mkdir(exist_ok=True)
+        
+        islands_state = {}
+        for island in self.islands:
+            elites_meta = {}
+            for metric, candidate in island.elites.items():
+                # 保存代码到单独文件
+                code_filename = f"island_{island.id}_{metric}_gen{candidate.generation}.py"
+                code_path = elite_codes_dir / code_filename
+                code_path.write_text(candidate.code, encoding="utf-8")
+                
+                # checkpoint 中只存元数据
+                elites_meta[metric] = {
+                    "fitness": candidate.fitness,
+                    "generation": candidate.generation,
+                    "island_id": candidate.island_id,
+                    "seed_name": candidate.seed_name,
+                    "code_file": str(code_path.relative_to(self.checkpoint_path)),
+                }
+            
+            islands_state[str(island.id)] = {
+                "elites": elites_meta,
+                "generation": island.generation,
+                "last_improvement_gen": island.last_improvement_gen,
+                "total_evaluations": island.total_evaluations,
+                "total_improvements": island.total_improvements,
+            }
+        
+        islands_state["_elite_codes_dir"] = str(elite_codes_dir.relative_to(self.checkpoint_path))
+        return islands_state
 
     def _update_background_status(self):
         """更新后台状态文件（供 run_background.py 轮询使用）."""
