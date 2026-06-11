@@ -3,7 +3,7 @@
 # ============================================
 .env.*
 !.env.example
-!.env
+.env
 .env.local
 .env.production
 *.pem

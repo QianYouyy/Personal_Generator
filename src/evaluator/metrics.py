@@ -1,11 +1,13 @@
 """多样性评估器 — 6 个多样性指标."""
 
+import warnings
+from typing import Dict, List
+
 import numpy as np
 from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.distance import cdist
-from scipy.stats import gaussian_kde, entropy
+from scipy.stats import entropy
 from scipy.stats import qmc
-from typing import Dict, List, Tuple
 
 
 class DiversityMetrics:
@@ -112,46 +114,29 @@ class DiversityMetrics:
     def kl_divergence(self, Z: np.ndarray, num_ref_points: int = 10000) -> float:
         """KL 散度: Z 的经验分布 vs Sobol 准随机参考分布.
 
-        在 Z 的实际包围盒内比较分布均匀性。
+        在固定的单位空间 [0, 1]^d 内比较分布均匀性。
         越小表示 Z 的分布越接近均匀。在适应度计算中会符号反转。
         """
         if len(Z) == 0:
             return 0.0
 
         n, dim = Z.shape
+        Z = np.clip(Z, 0.0, 1.0)
 
-        # Z 的包围盒
-        mins = Z.min(axis=0)
-        maxs = Z.max(axis=0)
-        range_vals = maxs - mins
-        range_vals[range_vals == 0] = 1.0  # 避免除零
-
-        # Sobol 参考分布采样，并映射到 Z 的包围盒
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                sampler = qmc.Sobol(d=dim, scramble=True)
-                ref_points = sampler.random(num_ref_points)
-        except Exception:
-            ref_points = np.random.rand(num_ref_points, dim)
-        
-        ref_points = ref_points * range_vals + mins
-        ref_points = np.clip(ref_points, mins, maxs)
-
-        # 使用直方图估计分布
+        # 使用固定单位空间直方图估计分布。
+        # 注意：如果按 Z 自己的包围盒归一化，聚成一小团的点也会被误判为均匀。
         # bin 数根据样本量自适应：每维约 N^(1/d) 个 bin，确保平均每 bin 有若干点
         bins_per_dim = max(3, int(n ** (1.0 / dim)))
         bins = [bins_per_dim] * dim
-        ranges = [(mins[i], maxs[i]) for i in range(dim)]
+        ranges = [(0.0, 1.0) for _ in range(dim)]
 
         # Z 的经验分布
         hist_z, _ = np.histogramdd(Z, bins=bins, range=ranges)
         hist_z = hist_z.flatten() + 1e-10
         hist_z = hist_z / hist_z.sum()
 
-        # 参考分布
-        hist_ref, _ = np.histogramdd(ref_points, bins=bins, range=ranges)
-        hist_ref = hist_ref.flatten() + 1e-10
+        # 单位空间上的均匀参考分布
+        hist_ref = np.ones_like(hist_z, dtype=float)
         hist_ref = hist_ref / hist_ref.sum()
 
         # KL(Z || Ref)
@@ -228,8 +213,7 @@ class DiversityMetrics:
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    sampler = qmc.Sobol(d=dim, scramble=True)
-                    points = sampler.random(n=n)
+                    points = cls._sobol_points(dim, n)
             except Exception:
                 points = np.random.rand(n, dim)
 
@@ -252,6 +236,15 @@ class DiversityMetrics:
             radii.append((r_low + r_high) / 2.0)
 
         return float(np.mean(radii))
+
+    @staticmethod
+    def _sobol_points(dim: int, n: int) -> np.ndarray:
+        """生成 Sobol 点，并避免 n 非 2 次幂时的均匀性警告."""
+        if n <= 0:
+            return np.empty((0, dim))
+        m = int(np.ceil(np.log2(n)))
+        sampler = qmc.Sobol(d=dim, scramble=True)
+        return sampler.random_base2(m=m)[:n]
 
     # ------------------------------------------------------------------
     # 内部辅助

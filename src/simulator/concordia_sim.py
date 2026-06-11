@@ -174,8 +174,12 @@ class ConcordiaSimulator:
         for dim_idx, dim in enumerate(dimensions):
             item_indices = dim_to_items.get(dim, [])
             if item_indices:
-                max_choice = len(items[0].get("choices", AGREEMENT_SCALE)) - 1
-                dim_scores = answers[:, item_indices] / max_choice
+                dim_scores = []
+                for item_idx in item_indices:
+                    item_choices = items[item_idx].get("choices", AGREEMENT_SCALE)
+                    max_choice = max(1, len(item_choices) - 1)
+                    dim_scores.append(answers[:, item_idx] / max_choice)
+                dim_scores = np.column_stack(dim_scores)
                 Z[:, dim_idx] = dim_scores.mean(axis=1)
 
         print(f"  [Simulator] 完成: Z.shape = {Z.shape}")

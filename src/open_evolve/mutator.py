@@ -237,33 +237,6 @@ class Mutator:
         # 限制在范围内
         return max(self.temp_range[0], min(self.temp_range[1], base))
 
-    def mutate(self, parent_code: str, prompt: str = None) -> str:
-        """对父代代码进行变异.
-
-        Args:
-            parent_code: 父代人格生成器代码 φ
-            prompt: 变异指令（None 则随机从实例提示词库中抽取）
-
-        Returns:
-            str: 子代代码 φ'
-        """
-        if prompt is None:
-            prompt = random.choice(self._prompts)
-
-        mutation_prompt = f"""【变异指令】
-{prompt}
-
-【父代代码】
-```python
-{parent_code}
-```
-
-【任务】
-请根据变异指令修改上述代码。
-只输出完整的修改后 Python 代码，不要任何解释或 markdown 标记。
-确保代码可以直接被 exec() 执行。
-"""
-
     def mutate(self, parent_code: str, prompt: str = None, generation: int = 0, stagnation: int = 0) -> str:
         """对父代代码进行变异.
 

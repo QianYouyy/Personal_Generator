@@ -106,7 +106,7 @@ class LLMClient:
     def __init__(self, model: str, api_key: str = None, base_url: str = None):
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        self.base_url = base_url or self._env_base_url()
         if not self.api_key:
             raise ValueError(
                 "API key 未设置。请将 API Key 写入 .env.development 文件\n"
@@ -130,9 +130,14 @@ class LLMClient:
         model = cfg.get(model_key)
         if not model:
             raise ValueError(f"配置中未找到 '{model_key}'，请检查 configs/default.yaml")
-        base_url = base_url or cfg.get("llm.api_base") or os.getenv("OPENAI_BASE_URL")
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
+        base_url = base_url or cfg.get("llm.api_base") or cls._env_base_url()
+        api_key = api_key or cfg.get("llm.api_key") or os.getenv("OPENAI_API_KEY")
         return cls(model=model, api_key=api_key, base_url=base_url)
+
+    @staticmethod
+    def _env_base_url() -> Optional[str]:
+        """兼容 OpenAI SDK 常用命名和旧 README 中的 OPENAI_API_BASE."""
+        return os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE")
     
     def generate(self, prompt: str, system_prompt: str = None, temperature: float = 0.7, max_tokens: int = 2048, **kwargs) -> str:
         """同步调用 LLM 生成文本."""

@@ -251,7 +251,8 @@ class SeedPersonaGenerator:
         try:
             from scipy.stats import qmc
             sampler = qmc.Sobol(d=k, scramble=True)
-            points = sampler.random(n=n)
+            m = int(np.ceil(np.log2(max(n, 1))))
+            points = sampler.random_base2(m=m)[:n]
         except Exception:
             points = np.random.rand(n, k)
 

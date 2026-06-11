@@ -610,7 +610,7 @@ class OpenEvolve:
                 f.get("avg_dist", 0) * 0.15 +
                 f.get("min_dist", 0) * 0.1 +
                 f.get("dispersion", 0) * 0.1 +
-                (1 - f.get("kl_divergence", 1)) * 0.1
+                f.get("kl_divergence", -1e9) * 0.1
             )
         return max(self.islands, key=score)
 
