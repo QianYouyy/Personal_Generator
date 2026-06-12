@@ -35,7 +35,12 @@ manifest + checkpoint + per-candidate artifacts
 - DeepMind pipeline 保留为 baseline 和基础设施：问卷生成、模拟、覆盖度指标、Open-Evolve。
 - 新实验的优化目标不只是“生成多样”，而是同时满足 **Schema 合法、语义不重复、目标空间覆盖好、问卷行为差异稳定**。
 - Shadow Survey 可以参考 HACHIMI 的做法，但优先使用非学业构念：价值观、动机、自我调节、归属感、心理健康、创造力、风险倾向、社会关系等。
-- Evolution 使用固定评分尺子和 held-out shadow surveys，避免候选通过“改评分规则”或“记住训练问卷”虚高。
+- Evolution 使用固定评分尺子和 held-out shadow surveys，避免候选通过”改评分规则”或”记住训练问卷”虚高。
+- 评分公式统一为乘法门控乘积（batch 实验与 evolution 共用 `compute_experiment_score`）：
+  ```
+  score = schema_fitness × (0.5 + 0.5 × behavior_coverage) × (0.5 + 0.5 × shadow_alignment) × generation_rate
+  ```
+  设计意图：behavior coverage 或 shadow alignment 极低时会被门控因子惩罚（最低 ×0.5），确保行为塌缩或对齐差的候选无法获得高分。
 - 长跑实验会保存 `manifest.json`、`checkpoint.json` 和每个候选的完整 `result.json`，支持断点续跑。
 
 ### 当前代码状态
@@ -49,14 +54,15 @@ manifest + checkpoint + per-candidate artifacts
 | Shadow Survey | ✅ 已加入 | `src/mega_persona/shadow_survey.py` |
 | Shadow Simulator | ✅ 已加入 | `src/mega_persona/shadow_simulator.py` |
 | Rule-based Baseline | ✅ 已加入 | `src/mega_persona/template_generator.py` |
-| MegaPersona Evaluator | ✅ 已加入 | `src/mega_persona/evaluation.py` |
+| MegaPersona Schema Evaluator | ✅ 已加入 | `src/mega_persona/evaluation.py`（schema 层面：合法率、近重复、覆盖度、diversity） |
+| Experiment Score & Batch Runner | ✅ 已加入 | `src/mega_persona/experiment.py` + `scripts/run_mega_persona_experiment.py` |
 | Fixed MegaPersona Generator | ✅ 已加入 | `src/mega_persona/generator.py` |
-| Batch Experiment Runner | ✅ 已加入 | `scripts/run_mega_persona_experiment.py` |
 | Durable Open-Evolve | ✅ 已加入 | `src/mega_persona/evolution.py`, `scripts/run_mega_persona_evolution.py` |
 | Held-out Evaluation | ✅ 已加入 | Evolution fitness 使用 held-out shadow behavior |
 | Prompt Profile Genome | ✅ 已加入 | LLM mode 下 evolution 可注入 prompt addendum |
 | Parallel Evaluation | ✅ 已加入 | `--max-workers` 并行评估候选 |
 | Experiment Manifest | ✅ 已加入 | `manifest.json` 记录命令、配置、Python/Git 状态 |
+| Result Visualization | ✅ 已加入 | `src/mega_persona/visualization.py`, `scripts/visualize_mega_persona_results.py` |
 | Symbolic Validator | ✅ 已加入 | `src/mega_persona/validator.py` |
 | MegaPersona CLI | ✅ 已加入 | `scripts/generate_mega_personas.py` |
 | Schema smoke test | ✅ 已加入 | `scripts/test_mega_persona_schema.py` |
@@ -98,6 +104,7 @@ Open-Evolve 进化引擎
 │   ├── generate_mega_personas.py     # 新实验: 生成 MegaPersona population
 │   ├── run_mega_persona_experiment.py # 新实验: 多 seed batch runner
 │   ├── run_mega_persona_evolution.py # 新实验: 可恢复 Open-Evolve 进化
+│   ├── visualize_mega_persona_results.py # 新实验: 输出散点图/曲线/指标图
 │   ├── test_mega_persona_schema.py  # MegaPersona Schema/Validator smoke test
 │   ├── test_mega_persona_experiment.py # MegaPersona sampling/survey/evaluation smoke test
 │   ├── test_mega_persona_generator.py  # MegaPersona multi-agent generator smoke test
@@ -136,6 +143,7 @@ Open-Evolve 进化引擎
 │   │   ├── evaluation.py
 │   │   ├── generator.py
 │   │   ├── evolution.py
+│   │   ├── visualization.py
 │   │   └── validator.py
 │   └── utils/
 │       ├── config.py        # 配置加载器
@@ -302,6 +310,21 @@ python scripts/run_mega_persona_evolution.py \
   --output-dir data/results/mega_persona_llm_evolution_run
 ```
 
+将单次生成、batch summary 或 evolution run 转成 PNG 图（默认）：
+
+```bash
+python scripts/visualize_mega_persona_results.py \
+  --input data/results/mega_persona_evolution_run
+```
+
+生成交互式 HTML 报告（Plotly.js，支持 3D 旋转缩放，浏览器直接打开）：
+
+```bash
+python scripts/visualize_mega_persona_results.py \
+  --input data/results/mega_persona_evolution_run \
+  --format html
+```
+
 `generate_mega_personas.py` 的输出默认保存到 `data/generated_personas/`，包含：
 - 目标 slots
 - 生成的人格 JSON
@@ -319,6 +342,7 @@ python scripts/run_mega_persona_evolution.py \
 - `candidates/candidate_*.json`
 - `generations/generation_*.json`
 - `evaluations/eval_*/result.json`
+- `figures/*.png`（运行可视化脚本后生成）
 
 ---
 
@@ -347,17 +371,16 @@ slots
 | 多 seed baseline | `python scripts/run_mega_persona_experiment.py --mode mock --n 25 --seeds 17,23,31` |
 | 可恢复 evolution baseline | `python scripts/run_mega_persona_evolution.py --generator-mode mock --n 25 --seeds 17,23,31 --generations 20 --population-size 8 --max-workers 4 --heldout-shadow-surveys 4 --output-dir data/results/mega_persona_evolution_run` |
 | LLM prompt-profile evolution | `python scripts/run_mega_persona_evolution.py --generator-mode llm --model-key llm.persona_model --n 10 --seeds 17 --generations 5 --population-size 4 --max-workers 1 --heldout-shadow-surveys 4 --output-dir data/results/mega_persona_llm_evolution_run` |
+| 结果可视化 | `python scripts/visualize_mega_persona_results.py --input data/results/mega_persona_evolution_run` |
 
 ### 下一步建议
 
 | 优先级 | 任务 | 目的 |
 |--------|------|------|
-| P0 | 清理 git 中的 `__pycache__` 追踪 | 避免提交无关二进制缓存 |
-| P1 | 加结果可视化 | 画 slot/persona/behavior axes、fitness 曲线、best genome 变化 |
 | P1 | 加 LLM Shadow Simulator | 用 LLM 回答 shadow survey，和规则版 simulator 对照 |
 | P2 | 更细粒度 prompt mutation | 从 coarse prompt profile 扩展到 agent-specific prompt fragments |
 | P2 | 增加 held-out survey families | 用不同构念组合测试泛化能力 |
-| P3 | 统计报告 | 多 run 均值/方差、best-vs-baseline 显著性和 ablation 表 |
+| P2 | 统计报告增强 | 多 run 均值/方差、best-vs-baseline 显著性和 ablation 表 |
 
 ## 配置驱动设计
 
@@ -529,7 +552,7 @@ best = engine.run(max_generations=100)
 | `template_generator.py` | 规则模板 baseline，用于离线生成可比较的 MegaPersona population |
 | `evaluation.py` | 聚合法率、覆盖度、距离、多样性和近重复惩罚 |
 | `generator.py` | 固定版 HACHIMI-style 多 Agent 生成流水线 |
-| `evolution.py` | MegaPersona 专用 Open-Evolve，进化采样/轴变换/shadow survey 选择/LLM prompt profile，并用 held-out shadow surveys 评估 |
+| `evolution.py` | MegaPersona 专用 Open-Evolve，进化采样/轴变换/shadow survey 选择/LLM prompt profile，并用 held-out shadow surveys 评估；评分公式与 batch 实验统一为乘法门控乘积 |
 | `validator.py` | 定义硬规则校验，避免人格全高、全低、字段冲突、表现与动机不一致等问题 |
 
 当前 Primary Axes：
@@ -569,8 +592,9 @@ best = engine.run(max_generations=100)
 | Phase 6 | Batch 实验 Runner | ✅ 完成初版 | 多 seed 运行，导出 JSON/Markdown 汇总报告 |
 | Phase 7 | 接入 Open-Evolve | ✅ 完成初版 | 进化配额权重、轴变换、shadow survey seed 和 LLM prompt profile；固定评分尺子，用 held-out shadow surveys 评估，每次评估持久化，可 resume |
 | Phase 8 | Manifest + 并行评估 | ✅ 完成初版 | `manifest.json` 记录实验环境；`--max-workers` 并行评估候选 |
-| Phase 9 | 可视化与统计报告 | ⏳ 下一步 | 进化曲线、空间散点、baseline 对照、ablation 表 |
-| Phase 10 | LLM Shadow Simulator | ⏳ 下一步 | 用 LLM 生成 shadow survey 回答，提高行为模拟真实性 |
+| Phase 9 | 可视化 | ✅ 完成初版 | 进化曲线、slot/persona/behavior 空间散点、best genome、指标图 |
+| Phase 10 | 统计报告 | ⏳ 下一步 | baseline 对照、ablation 表、多 run 显著性 |
+| Phase 11 | LLM Shadow Simulator | ⏳ 下一步 | 用 LLM 生成 shadow survey 回答，提高行为模拟真实性 |
 
 ---
 

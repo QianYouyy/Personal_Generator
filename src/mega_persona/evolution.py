@@ -58,11 +58,10 @@ class MegaEvolutionConfig:
     max_workers: int = 1
 
 
-FIXED_SCORE_WEIGHTS = {
-    "schema": 0.55,
-    "behavior_coverage": 0.25,
-    "shadow_alignment": 0.20,
-}
+# Score aggregation uses the same multiplicative gated formula as the batch
+# experiment (see src.mega_persona.experiment.compute_experiment_score).
+# The weights below are retained as a reference for ablation studies but are
+# NOT used in the default genome_score() computation.
 
 
 @dataclass
@@ -621,12 +620,18 @@ def genome_score(
     shadow_alignment: float,
     generation_rate: float,
 ) -> float:
-    weighted = (
-        FIXED_SCORE_WEIGHTS["schema"] * schema_fitness
-        + FIXED_SCORE_WEIGHTS["behavior_coverage"] * behavior_coverage
-        + FIXED_SCORE_WEIGHTS["shadow_alignment"] * shadow_alignment
-    )
-    return float(max(0.0, weighted) * generation_rate)
+    """Multiplicative gated score — same formula as the batch experiment.
+
+    This matches src.mega_persona.experiment.compute_experiment_score.
+    The gated product ensures that invalid, near-duplicate, or behaviorally
+    collapsed populations receive low scores even when one dimension appears
+    strong.
+    """
+    import numpy as np
+
+    behavior_gate = 0.5 + 0.5 * float(np.clip(behavior_coverage, 0.0, 1.0))
+    alignment_gate = 0.5 + 0.5 * float(np.clip(shadow_alignment, 0.0, 1.0))
+    return float(schema_fitness * behavior_gate * alignment_gate * generation_rate)
 
 
 def _aggregate_seed_metrics(per_seed: list[dict[str, Any]]) -> dict[str, Any]:

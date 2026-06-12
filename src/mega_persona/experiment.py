@@ -275,12 +275,23 @@ def _diversity_for_matrix(matrix: np.ndarray, coverage_radius: float) -> dict[st
     return DiversityMetrics(coverage_radius=coverage_radius).fitness(matrix)
 
 
-def _experiment_score(
+def compute_experiment_score(
     schema_fitness: float,
     behavior_coverage: float,
     shadow_alignment: float,
     generation_rate: float,
 ) -> float:
+    """Multiplicative gated score used by both batch experiments and evolution.
+
+    The gated product design ensures that invalid, near-duplicate, or
+    behaviorally collapsed populations cannot score highly even if one
+    dimension looks strong.  Each gate floors at 0.5 so the landscape
+    retains gradient for evolution.
+    """
     behavior_gate = 0.5 + 0.5 * float(np.clip(behavior_coverage, 0.0, 1.0))
     alignment_gate = 0.5 + 0.5 * float(np.clip(shadow_alignment, 0.0, 1.0))
     return float(schema_fitness * behavior_gate * alignment_gate * generation_rate)
+
+
+# retained for backward-compatibility within this module
+_experiment_score = compute_experiment_score

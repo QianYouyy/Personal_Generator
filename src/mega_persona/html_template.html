@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MegaPersona — {{TITLE}}</title>
+<script src="https://cdn.plot.ly/plotly-3.0.1.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #f5f5f5; color: #1a1a2e; line-height: 1.5;
+  }
+  header {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    color: #fff; padding: 20px 32px;
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+  }
+  header h1 { font-size: 1.4rem; font-weight: 600; }
+  header .meta { font-size: 0.85rem; opacity: 0.75; }
+  nav.tabs {
+    display: flex; flex-wrap: wrap; gap: 0;
+    background: #fff; border-bottom: 2px solid #e0e0e0;
+    padding: 0 16px; position: sticky; top: 0; z-index: 10;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }
+  nav.tabs button {
+    background: none; border: none; padding: 14px 20px;
+    font-size: 0.9rem; font-weight: 500; color: #666;
+    cursor: pointer; border-bottom: 3px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  nav.tabs button:hover { color: #1a73e8; }
+  nav.tabs button.active { color: #1a73e8; border-bottom-color: #1a73e8; }
+  .tab-content { display: none; padding: 24px 32px; animation: fadeIn 0.25s; }
+  .tab-content.active { display: block; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  .chart { width: 100%; height: 520px; margin-bottom: 20px; }
+  .chart-row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .chart-row .chart-sm { flex: 1; min-width: 320px; height: 420px; }
+  .controls { margin-bottom: 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .controls label { font-weight: 600; font-size: 0.9rem; }
+  .controls select, .controls button {
+    padding: 6px 14px; border: 1px solid #ccc; border-radius: 6px;
+    font-size: 0.88rem; background: #fff;
+  }
+  table.info { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  table.info th, table.info td {
+    text-align: left; padding: 8px 14px; border-bottom: 1px solid #eee;
+    font-size: 0.88rem;
+  }
+  table.info th { background: #fafafa; font-weight: 600; width: 260px; }
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 12px;
+    font-size: 0.78rem; font-weight: 600;
+  }
+  .badge-evolution { background: #e8f0fe; color: #1a73e8; }
+  .badge-experiment { background: #e6f4ea; color: #137333; }
+  .badge-generator { background: #fef7e0; color: #b06000; }
+  .empty { color: #999; font-style: italic; padding: 40px; text-align: center; }
+  footer {
+    text-align: center; padding: 16px; color: #aaa; font-size: 0.8rem;
+    border-top: 1px solid #e0e0e0; margin-top: 32px;
+  }
+
+  @media (max-width: 768px) {
+    header { padding: 16px; }
+    nav.tabs { padding: 0 8px; overflow-x: auto; }
+    nav.tabs button { padding: 10px 14px; font-size: 0.82rem; }
+    .tab-content { padding: 16px; }
+    .chart { height: 360px; }
+    .chart-row { flex-direction: column; }
+    .chart-row .chart-sm { min-width: unset; height: 340px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>MegaPersona Visualization</h1>
+    <div class="meta" id="header-meta">Loading&hellip;</div>
+  </div>
+  <span class="badge badge-evolution" id="run-type-badge">Loading</span>
+</header>
+
+<nav class="tabs">
+  <button class="active" data-tab="fitness">📈 Fitness Curve</button>
+  <button data-tab="scatter">🔬 3D Scatter</button>
+  <button data-tab="genome">🧬 Genome</button>
+  <button data-tab="metrics">📊 Metrics</button>
+  <button data-tab="seeds">🌱 Seed Comparison</button>
+  <button data-tab="info">ℹ️ Run Info</button>
+</nav>
+
+<!-- Tab: Fitness Curve -->
+<div id="tab-fitness" class="tab-content active">
+  <div class="controls">
+    <label for="fitness-metric">Metric:</label>
+    <select id="fitness-metric">
+      <option value="all">All sub-metrics</option>
+      <option value="fitness">Fitness</option>
+    </select>
+  </div>
+  <div id="fitness-chart" class="chart"></div>
+</div>
+
+<!-- Tab: 3D Scatter -->
+<div id="tab-scatter" class="tab-content">
+  <div class="controls">
+    <label for="scatter-mode">View:</label>
+    <select id="scatter-mode">
+      <option value="slot_axes">Slot Target Axes</option>
+      <option value="persona_axes">Persona Primary Axes</option>
+      <option value="behavior_axes">Behavior Axes</option>
+    </select>
+    <label for="scatter-seed" style="margin-left:8px;">Seed:</label>
+    <select id="scatter-seed"><option value="0">All seeds</option></select>
+  </div>
+  <div id="scatter-chart" class="chart"></div>
+</div>
+
+<!-- Tab: Genome -->
+<div id="tab-genome" class="tab-content">
+  <div class="chart-row">
+    <div id="genome-quota" class="chart-sm"></div>
+    <div id="genome-bias" class="chart-sm"></div>
+    <div id="genome-stretch" class="chart-sm"></div>
+  </div>
+</div>
+
+<!-- Tab: Metrics -->
+<div id="tab-metrics" class="tab-content">
+  <div id="metrics-chart" class="chart"></div>
+</div>
+
+<!-- Tab: Seed Comparison -->
+<div id="tab-seeds" class="tab-content">
+  <div id="seed-chart" class="chart"></div>
+  <div id="seed-table"></div>
+</div>
+
+<!-- Tab: Run Info -->
+<div id="tab-info" class="tab-content">
+  <h3 style="margin-bottom:12px;">Experiment Configuration</h3>
+  <table class="info" id="config-table"><tbody></tbody></table>
+  <h3 style="margin:24px 0 12px;">Run Metadata</h3>
+  <table class="info" id="meta-table"><tbody></tbody></table>
+  <h3 style="margin:24px 0 12px;">Best Candidate Genome</h3>
+  <pre id="genome-json" style="background:#fafafa;padding:16px;border-radius:8px;overflow-x:auto;font-size:0.85rem;max-height:400px;"></pre>
+</div>
+
+<footer>Generated by MegaPersona Visualizer — data embedded, no server needed</footer>
+
+<!-- ===== Embedded data ===== -->
+<script type="application/json" id="viz-data">{{JSON_DATA}}</script>
+
+<!-- ===== App logic ===== -->
+<script>
+(function() {
+  const DATA = JSON.parse(document.getElementById('viz-data').textContent);
+  const AXIS = DATA.scatter_data?.axis_names || ['Axis 1', 'Axis 2', 'Axis 3'];
+  const PLOT_CONFIG = { responsive: true, displayModeBar: true, modeBarButtonsToRemove: ['lasso2d', 'select2d'] };
+  const COLORS = ['#2563eb','#dc2626','#16a34a','#ca8a04','#9333ea','#0891b2','#d97706'];
+
+  // — header —
+  document.getElementById('header-meta').textContent =
+    `Type: ${DATA.type}  ·  Best fitness: ${(DATA.run_info?.best_fitness ?? 0).toFixed(4)}  ·  Best: ${DATA.run_info?.best_candidate_id ?? '—'}`;
+  const badge = document.getElementById('run-type-badge');
+  badge.textContent = DATA.type === 'evolution' ? 'Evolution Run' : DATA.type === 'experiment' ? 'Batch Experiment' : 'Generation';
+  badge.className = 'badge ' + (DATA.type === 'evolution' ? 'badge-evolution' : DATA.type === 'experiment' ? 'badge-experiment' : 'badge-generator');
+
+  // — tab switching —
+  document.querySelectorAll('nav.tabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('nav.tabs button').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      btn.classList.add('active');
+      const tab = document.getElementById('tab-' + btn.dataset.tab);
+      if (tab) tab.classList.add('active');
+      setTimeout(() => Plotly.Plots.resize(document.querySelectorAll('.tab-content.active .js-plotly-plot')[0] || document.querySelector('.js-plotly-plot')), 80);
+    });
+  });
+
+  // -------------------------------------------------------
+  // TAB 1 — Fitness Curve
+  // -------------------------------------------------------
+  function renderFitness() {
+    const history = DATA.fitness_history;
+    const chartEl = document.getElementById('fitness-chart');
+    if (!history || history.length === 0) {
+      chartEl.innerHTML = '<div class="empty">No generation history available (batch experiment or single-run data).</div>';
+      return;
+    }
+    const gens = history.map(h => h.generation);
+    const subKeys = Object.keys(history[0].best_fitness || {});
+    // Flatten structure: if best_fitness is {coverage, convex_hull, ...}, use those
+    const traces = subKeys.length ? subKeys.map((key, i) => ({
+      x: gens,
+      y: history.map(h => (h.best_fitness || {})[key] ?? null),
+      name: key.replace(/_/g, ' '),
+      type: 'scatter', mode: 'lines+markers',
+      line: { width: 2, color: COLORS[i % COLORS.length] },
+      marker: { size: 5 },
+      visible: i < 5 ? true : 'legendonly',
+    })) : [{
+      x: gens,
+      y: history.map(h => h.best_fitness ?? h.fitness ?? 0),
+      name: 'fitness',
+      type: 'scatter', mode: 'lines+markers',
+      line: { width: 2, color: COLORS[0] },
+    }];
+
+    // Also add a "fitness" trace if sub-metrics exist and we have a per-gen score
+    if (subKeys.length && history[0].fitness !== undefined) {
+      traces.unshift({
+        x: gens,
+        y: history.map(h => h.fitness ?? 0),
+        name: 'fitness',
+        type: 'scatter', mode: 'lines+markers',
+        line: { width: 3, color: '#111' },
+        marker: { size: 6 },
+      });
+    }
+
+    // Populate sub-metric selector
+    const sel = document.getElementById('fitness-metric');
+    sel.innerHTML = '<option value="all">All metrics</option>';
+    if (history[0]?.fitness !== undefined) sel.innerHTML += '<option value="fitness">Fitness (overall)</option>';
+    subKeys.forEach(k => { sel.innerHTML += `<option value="${k}">${k.replace(/_/g, ' ')}</option>`; });
+
+    sel.onchange = () => {
+      const chosen = sel.value;
+      const vis = traces.map((t, i) => {
+        if (chosen === 'all') return i < 8 ? true : 'legendonly';
+        return t.name === chosen || t.name === chosen.replace(/_/g, ' ');
+      });
+      Plotly.restyle(chartEl, { visible: vis });
+    };
+
+    Plotly.newPlot(chartEl, traces, {
+      title: 'Fitness Over Generations',
+      xaxis: { title: 'Generation', dtick: 1 },
+      yaxis: { title: 'Score', rangemode: 'tozero' },
+      legend: { orientation: 'h', y: -0.25 },
+      hovermode: 'x unified',
+    }, PLOT_CONFIG);
+  }
+
+  // -------------------------------------------------------
+  // TAB 2 — 3D Scatter
+  // -------------------------------------------------------
+  function renderScatter() {
+    const chartEl = document.getElementById('scatter-chart');
+    const scatter = DATA.scatter_data;
+    if (!scatter || (!scatter.slot_axes?.length && !scatter.persona_axes?.length)) {
+      chartEl.innerHTML = '<div class="empty">No scatter data available.</div>';
+      return;
+    }
+    const hasZ = AXIS.length >= 3;
+
+    function makeTrace(matrixKey, color) {
+      const pts = scatter[matrixKey] || [];
+      if (!pts.length) return null;
+      // If 3+ dims, use first 3; if 2 dims, use x/y and fake z=0.5
+      const xs = pts.map(p => p[0]);
+      const ys = pts.map(p => p[1]);
+      const zs = hasZ ? pts.map(p => p[2]) : pts.map(() => 0.5);
+      const base = {
+        x: xs, y: ys, z: zs,
+        type: hasZ ? 'scatter3d' : 'scatter',
+        mode: 'markers',
+        name: matrixKey.replace(/_/g, ' '),
+        marker: { size: 6, color: color, opacity: 0.8, line: { width: 0.5, color: '#333' } },
+      };
+      if (!hasZ) {
+        base.marker.color = pts.map((_, i) => i);
+        base.marker.colorscale = 'Viridis';
+        base.marker.showscale = true;
+      }
+      return base;
+    }
+
+    let currentTrace = makeTrace('slot_axes', COLORS[0]);
+    if (!currentTrace) currentTrace = makeTrace('persona_axes', COLORS[1]);
+    if (!currentTrace) currentTrace = makeTrace('behavior_axes', COLORS[2]);
+
+    const layout = hasZ ? {
+      title: '3D Axis Space',
+      scene: {
+        xaxis: { title: AXIS[0], range: [-0.05, 1.05] },
+        yaxis: { title: AXIS[1], range: [-0.05, 1.05] },
+        zaxis: { title: AXIS[2] || 'Z', range: [-0.05, 1.05] },
+      },
+    } : {
+      title: '2D Axis Space',
+      xaxis: { title: AXIS[0], range: [-0.05, 1.05] },
+      yaxis: { title: AXIS[1], range: [-0.05, 1.05] },
+    };
+
+    Plotly.newPlot(chartEl, [currentTrace], layout, PLOT_CONFIG).then(() => {
+      document.getElementById('scatter-mode').onchange = (e) => {
+        const key = e.target.value;
+        const t = makeTrace(key, COLORS[{slot_axes:0,persona_axes:1,behavior_axes:2}[key]]);
+        if (t) Plotly.react(chartEl, [t], layout);
+      };
+    });
+
+    // Seed selector
+    const seedSel = document.getElementById('scatter-seed');
+    seedSel.innerHTML = '<option value="0">All seeds (first available)</option>';
+    if (DATA.per_seed) {
+      DATA.per_seed.forEach((s, i) => {
+        seedSel.innerHTML += `<option value="${i+1}">Seed ${s.seed}</option>`;
+      });
+    }
+    seedSel.onchange = () => {
+      const idx = parseInt(seedSel.value) - 1;
+      if (idx < 0 || !DATA.per_seed) return;
+      const seedData = DATA.per_seed[idx];
+      // Use per-seed scatter if available
+      if (seedData.scatter) {
+        const t = makeTraceFromPoints(seedData.scatter.slot_axes || [], COLORS[0]);
+        if (t) Plotly.react(chartEl, [t], layout);
+      }
+    };
+  }
+
+  // -------------------------------------------------------
+  // TAB 3 — Genome
+  // -------------------------------------------------------
+  function renderGenome() {
+    const genome = DATA.genome;
+    if (!genome) { document.getElementById('tab-genome').innerHTML = '<div class="empty">No genome data.</div>'; return; }
+    function bar(id, dataObj, title, refLine) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const keys = Object.keys(dataObj || {});
+      const vals = Object.values(dataObj || {});
+      const trace = { type: 'bar', x: keys, y: vals, marker: { color: keys.map((_,i) => COLORS[i % COLORS.length]) } };
+      const layout = { title: title, margin: { b: 100 }, xaxis: { tickangle: -35, tickfont: { size: 10 } } };
+      if (refLine !== undefined) layout.shapes = [{ type: 'line', x0: -0.5, x1: keys.length - 0.5, y0: refLine, y1: refLine, line: { dash: 'dash', color: '#999' } }];
+      Plotly.newPlot(el, [trace], layout, PLOT_CONFIG);
+    }
+    bar('genome-quota', genome.quota_weights, 'Quota Weights');
+    bar('genome-bias', genome.axis_bias, 'Axis Bias', 0);
+    bar('genome-stretch', genome.axis_stretch, 'Axis Stretch', 1);
+  }
+
+  // -------------------------------------------------------
+  // TAB 4 — Metrics
+  // -------------------------------------------------------
+  function renderMetrics() {
+    const el = document.getElementById('metrics-chart');
+    const raw = DATA.metrics;
+    if (!raw || Object.keys(raw).length === 0) { el.innerHTML = '<div class="empty">No metrics data.</div>'; return; }
+    const entries = Object.entries(raw).filter(([k]) => k.endsWith('.mean')).sort((a,b) => b[1] - a[1]);
+    const trace = {
+      type: 'bar', orientation: 'h',
+      x: entries.map(e => e[1]),
+      y: entries.map(e => e[0].replace('.mean', '').replace(/_/g, ' ')),
+      marker: { color: entries.map((_,i) => COLORS[i % COLORS.length]) },
+      text: entries.map(e => e[1].toFixed(4)),
+      textposition: 'outside',
+    };
+    Plotly.newPlot(el, [trace], {
+      title: 'Aggregate Metrics (mean values)',
+      xaxis: { range: [0, Math.max(1, ...entries.map(e => e[1])) * 1.12] },
+      margin: { l: 220 },
+    }, PLOT_CONFIG);
+  }
+
+  // -------------------------------------------------------
+  // TAB 5 — Seed Comparison
+  // -------------------------------------------------------
+  function renderSeeds() {
+    const el = document.getElementById('seed-chart');
+    const tbl = document.getElementById('seed-table');
+    const seeds = DATA.per_seed;
+    if (!seeds || seeds.length <= 1) {
+      el.innerHTML = '<div class="empty">Only one seed available — no comparison needed.</div>';
+      tbl.innerHTML = '';
+      return;
+    }
+    const metricKeys = ['score', 'schema_fitness', 'validity_rate', 'behavior_coverage', 'shadow_alignment', 'slot_coverage'];
+    const available = metricKeys.filter(k => seeds[0][k] !== undefined || seeds[0].metrics?.[k] !== undefined);
+    const traces = seeds.map((s, i) => ({
+      type: 'bar', name: `Seed ${s.seed}`,
+      x: available.map(k => k.replace(/_/g, ' ')),
+      y: available.map(k => s[k] ?? s.metrics?.[k] ?? 0),
+      marker: { color: COLORS[i % COLORS.length] },
+    }));
+    Plotly.newPlot(el, traces, { title: 'Per-Seed Metric Comparison', barmode: 'group', yaxis: { rangemode: 'tozero' } }, PLOT_CONFIG);
+
+    // Table
+    let html = '<table class="info"><thead><tr><th>Metric</th>';
+    seeds.forEach(s => { html += `<th>Seed ${s.seed}</th>`; });
+    html += '</tr></thead><tbody>';
+    available.forEach(k => {
+      html += `<tr><td><strong>${k.replace(/_/g, ' ')}</strong></td>`;
+      seeds.forEach(s => { html += `<td>${(s[k] ?? s.metrics?.[k] ?? 0).toFixed(4)}</td>`; });
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    tbl.innerHTML = html;
+  }
+
+  // -------------------------------------------------------
+  // TAB 6 — Run Info
+  // -------------------------------------------------------
+  function renderInfo() {
+    // Config table
+    const cfg = DATA.config || {};
+    document.getElementById('config-table').querySelector('tbody').innerHTML =
+      Object.entries(cfg).map(([k,v]) => `<tr><th>${k}</th><td>${Array.isArray(v) ? v.join(', ') : v}</td></tr>`).join('');
+
+    // Meta table
+    const meta = DATA.run_info || {};
+    document.getElementById('meta-table').querySelector('tbody').innerHTML =
+      Object.entries(meta).filter(([k]) => k !== 'genome').map(([k,v]) => `<tr><th>${k}</th><td>${typeof v === 'object' ? JSON.stringify(v) : v}</td></tr>`).join('');
+
+    // Genome JSON pretty-print
+    document.getElementById('genome-json').textContent = JSON.stringify(DATA.genome || {}, null, 2);
+  }
+
+  // -------------------------------------------------------
+  // Init — render all visible tabs
+  // -------------------------------------------------------
+  renderFitness();
+  renderScatter();
+  renderGenome();
+  renderMetrics();
+  renderSeeds();
+  renderInfo();
+
+  // Resize handler
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      Plotly.Plots.resize(document.querySelectorAll('.js-plotly-plot'));
+    }, 200);
+  });
+})();
+</script>
+</body>
+</html>

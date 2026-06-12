@@ -10,6 +10,7 @@ from src.mega_persona.experiment import (
     MegaPersonaExperimentRun,
     MegaPersonaExperimentRunner,
     MegaPersonaExperimentSummary,
+    compute_experiment_score,
     write_experiment_artifacts,
 )
 from src.mega_persona.evolution import (
@@ -49,8 +50,10 @@ from src.mega_persona.slots import (
     SlotSampler,
     build_adaptive_constraints,
 )
+from src.mega_persona.html_viz import generate_html_report
 from src.mega_persona.template_generator import RuleBasedMegaPersonaBuilder
 from src.mega_persona.validator import ValidationIssue, ValidationReport, validate_mega_persona
+from src.mega_persona.visualization import visualize_result_path
 
 __all__ = [
     "AXIS_NAMES",
@@ -82,8 +85,10 @@ __all__ = [
     "build_initial_shadow_surveys",
     "build_run_manifest",
     "candidate_slots",
+    "compute_experiment_score",
     "default_genome",
     "evaluate_mega_personas",
+    "generate_html_report",
     "mutate_genome",
     "prompt_addendum_from_genome",
     "parse_json_object",
@@ -91,5 +96,6 @@ __all__ = [
     "score_shadow_survey",
     "shadow_behavior_axis_matrix",
     "validate_mega_persona",
+    "visualize_result_path",
     "write_experiment_artifacts",
 ]

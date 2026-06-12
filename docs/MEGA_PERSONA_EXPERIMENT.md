@@ -101,7 +101,7 @@ baseline for checking that metrics and artifacts work before spending LLM calls.
 
 ### Experiment Score
 
-The MVP score is a gated product:
+The MVP score is a gated product (used by both batch experiments and evolution):
 
 ```text
 experiment_score =
@@ -112,7 +112,11 @@ experiment_score =
 ```
 
 This makes invalid, duplicated, or behaviorally collapsed generations hard to
-score highly.
+score highly.  Each gate floors at 0.5 so the optimization landscape retains
+gradient for evolution.
+
+The implementation lives in `src/mega_persona/experiment.compute_experiment_score`
+and is reused by `src/mega_persona/evolution.genome_score`.
 
 ## Repeatable Batch Experiment
 
@@ -155,6 +159,7 @@ Outputs:
 | Fixed multi-agent LLM generator | Implemented |
 | Batch experiment runner | Implemented |
 | Durable Open-Evolve optimization | Implemented MVP |
+| Result visualization | Implemented MVP |
 
 ## Durable Open-Evolve MVP
 
@@ -240,6 +245,13 @@ data/results/mega_persona_evolution_run/
       result.json
     eval_000002_candidate_y/
       result.json
+  figures/
+    fitness_over_generations.png
+    best_slot_axes.png
+    best_persona_axes.png
+    best_behavior_axes.png
+    best_genome.png
+    best_metrics.png
 ```
 
 Each `result.json` stores the candidate genome, per-seed slots, generated
@@ -253,8 +265,20 @@ dirty flag, and `git status --short` output. Mock-mode evolution can safely use
 `--max-workers > 1`; LLM mode should usually start with `--max-workers 1` to
 avoid rate limits.
 
+Visualize an evolution run, batch `summary.json`, or single generation JSON:
+
+```bash
+python scripts/visualize_mega_persona_results.py \
+  --input data/results/mega_persona_evolution_run
+```
+
+The visualization script writes PNG figures for target slot coverage, generated
+persona axes, shadow behavior axes, evolution fitness, best genome parameters,
+and summary metrics.
+
 ## Next Experimental Extension
 
-The genome now controls coarse prompt-profile fragments for LLM mode. The next
-extension is to let it evolve more granular agent-specific prompt fragments and
-adaptive-constraint templates.
+The genome now controls coarse prompt-profile fragments for LLM mode and the
+current run artifacts can be visualized. The next extension is to let evolution
+use more granular agent-specific prompt fragments, add a stronger statistical
+report, and compare the rule-based shadow simulator with an LLM shadow simulator.

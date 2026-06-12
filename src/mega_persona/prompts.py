@@ -26,9 +26,11 @@ def cognition_motivation_agent_prompt(
     whiteboard_json: str,
     target_axes_json: str,
     prior_constraints: str = "",
+    hard_constraints: str = "",
 ) -> str:
     """Prompt for the agent that replaces the old academic/teaching profile."""
     constraints_block = prior_constraints.strip() or "No extra adaptive constraints."
+    hc_block = hard_constraints.strip() or ""
     return f"""You are filling ONLY the `cognitive_motivation_profile` and
 `derived_academic_tendency` sections of a MegaPersona JSON object.
 
@@ -44,6 +46,9 @@ Target primary axes for this persona:
 
 Adaptive constraints:
 {constraints_block}
+
+Hard constraints (MUST satisfy):
+{hc_block}
 
 Required output keys:
 - cognitive_motivation_profile
@@ -100,10 +105,12 @@ moral tension that can shape future behavior.
 def values_identity_agent_prompt(
     whiteboard_json: str,
     slot_context_json: str,
+    hard_constraints: str = "",
 ) -> str:
+    hc_block = f"\nHard constraints (MUST satisfy):\n{hard_constraints}" if hard_constraints.strip() else ""
     return f"""Create ONLY the `values_identity` section for a MegaPersona.
 
-Shared whiteboard:
+Shared whiteboard (relevant fields only):
 ```json
 {whiteboard_json}
 ```
@@ -111,7 +118,7 @@ Shared whiteboard:
 Target slot:
 ```json
 {slot_context_json}
-```
+```{hc_block}
 
 Required output key:
 - values_identity
@@ -136,10 +143,12 @@ and target social-extraversion coordinates.
 def social_creative_agent_prompt(
     whiteboard_json: str,
     slot_context_json: str,
+    hard_constraints: str = "",
 ) -> str:
+    hc_block = f"\nHard constraints (MUST satisfy):\n{hard_constraints}" if hard_constraints.strip() else ""
     return f"""Create ONLY the `social_creative_profile` section for a MegaPersona.
 
-Shared whiteboard:
+Shared whiteboard (relevant fields only):
 ```json
 {whiteboard_json}
 ```
@@ -147,7 +156,7 @@ Shared whiteboard:
 Target slot:
 ```json
 {slot_context_json}
-```
+```{hc_block}
 
 Required output key:
 - social_creative_profile
@@ -172,10 +181,12 @@ simulation and consistent with self-regulation.
 def mental_health_agent_prompt(
     whiteboard_json: str,
     slot_context_json: str,
+    hard_constraints: str = "",
 ) -> str:
+    hc_block = f"\nHard constraints (MUST satisfy):\n{hard_constraints}" if hard_constraints.strip() else ""
     return f"""Create ONLY the `mental_health_context` section for a MegaPersona.
 
-Shared whiteboard:
+Shared whiteboard (relevant fields only):
 ```json
 {whiteboard_json}
 ```
@@ -183,7 +194,7 @@ Shared whiteboard:
 Target slot:
 ```json
 {slot_context_json}
-```
+```{hc_block}
 
 Required output key:
 - mental_health_context
