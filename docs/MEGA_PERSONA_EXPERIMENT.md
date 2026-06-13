@@ -56,20 +56,35 @@ coverage is computed over a compact target space to avoid dimensional collapse.
 
 ## Shadow Surveys
 
-The initial shadow surveys are original, non-academic Likert items. They are
-construct-oriented rather than copied from published instruments.
+The shadow-survey protocol follows the HACHIMI paper's external-evaluation
+logic: personas are instantiated as agents and asked CEPS/PISA-style survey
+items, then behavior is scored at the construct level. The code uses
+construct-faithful local items tagged with scientific scale metadata rather
+than redistributing verbatim CEPS/PISA questionnaire text.
 
-Construct families:
+Current non-academic scale families:
 
-- cognitive abstraction
-- ambiguity tolerance
-- autonomous and intrinsic motivation
-- external pressure sensitivity
-- self-regulation and metacognition
-- emotional regulation
-- stress and recovery
-- identity clarity and value tension
-- belonging, peer influence, creativity, risk, help-seeking
+| Source | Scale IDs | Role in this project |
+|---|---|---|
+| PISA 2022 | `CURIOAGR`, `GROSAGR` | curiosity, growth mindset, autonomous motivation |
+| PISA 2022 | `CREATEFF`, `CREATOP` | creative self-efficacy, openness to intellect |
+| PISA 2022 | `RELATST`, `BELONG`, `BULLIED` | relationships, belonging, social threat |
+| PISA 2022 | `PSYCHSYM`, `LIFESAT`, `WORKHOME` | distress, life satisfaction, workload/balance |
+| CEPS | `CESD`, `TEACHREL`, `PEERREL`, `MISBEHAVIOR` | depressive symptoms, teacher/peer relations, behavioral regulation |
+
+The official HACHIMI paper also uses academic PISA constructs such as
+`MATHEFF` and `MATHEF21`; this project intentionally excludes those from the
+main non-academic shadow-survey score.
+
+Evolution uses frozen splits:
+
+- `train`: persisted for analysis and future ablations
+- `validation`: used for fitness and candidate selection
+- `test`: sealed during evolution; evaluated only once for the final selected best candidate
+
+The shadow simulator receives narrative/categorical persona evidence only. It
+does not receive hidden numeric primary-axis scores, reducing circular
+alignment inflation.
 
 ## Baselines
 
@@ -172,16 +187,18 @@ Current evolvable fields:
 - quota bucket weights
 - primary-axis bias
 - primary-axis stretch
-- shadow survey seed offset
 - prompt profile for LLM mode
 
 The score aggregation weights are fixed. This prevents a candidate from
 improving by changing the evaluation ruler rather than improving the generated
 population.
 
-Fitness is computed with held-out shadow surveys. Training shadow surveys are
-still persisted for analysis, but the final candidate score uses held-out
-behavior coverage and held-out persona-behavior alignment.
+Fitness is computed with frozen validation shadow surveys. Training shadow
+surveys are persisted for analysis. Test shadow surveys are frozen and hashed at
+run start, but they are not evaluated during candidate selection; after the best
+candidate is selected, the system runs one sealed test evaluation and writes
+`final_test_report.json`. The survey splits are independent of candidate
+genomes, so evolution cannot improve by changing validation or test questions.
 
 Run:
 
@@ -193,7 +210,8 @@ python scripts/run_mega_persona_evolution.py \
   --generations 20 \
   --population-size 8 \
   --max-workers 4 \
-  --heldout-shadow-surveys 4 \
+  --validation-shadow-surveys 4 \
+  --test-shadow-surveys 4 \
   --output-dir data/results/mega_persona_evolution_run
 ```
 
@@ -206,7 +224,8 @@ python scripts/run_mega_persona_evolution.py \
   --generations 20 \
   --population-size 8 \
   --max-workers 4 \
-  --heldout-shadow-surveys 4 \
+  --validation-shadow-surveys 4 \
+  --test-shadow-surveys 4 \
   --output-dir data/results/mega_persona_evolution_run \
   --resume
 ```
@@ -222,7 +241,8 @@ python scripts/run_mega_persona_evolution.py \
   --generations 5 \
   --population-size 4 \
   --max-workers 1 \
-  --heldout-shadow-surveys 4 \
+  --validation-shadow-surveys 4 \
+  --test-shadow-surveys 4 \
   --output-dir data/results/mega_persona_llm_evolution_run
 ```
 
@@ -234,6 +254,12 @@ data/results/mega_persona_evolution_run/
   checkpoint.json
   final_summary.json
   final_summary.md
+  final_test_report.json
+  shadow_surveys/
+    train.json
+    validation.json
+    test.json
+    hashes.json
   candidates/
     candidate_*.json
   generations/
@@ -254,16 +280,18 @@ data/results/mega_persona_evolution_run/
     best_metrics.png
 ```
 
-Each `result.json` stores the candidate genome, per-seed slots, generated
-personas, schema metrics, train/held-out shadow behavior, train/held-out
-behavior diversity, and shadow survey responses. The checkpoint is written after
-every candidate evaluation, so the run can continue after process death, machine
-sleep, or network interruption.
+Each candidate `result.json` stores the candidate genome, per-seed slots,
+generated personas, schema metrics, frozen survey hashes, train/validation
+shadow behavior, train/validation behavior diversity, and train/validation
+shadow survey responses. It deliberately excludes test behavior. The selected
+best candidate's sealed test behavior is stored only in `final_test_report.json`.
+The checkpoint is written after every candidate evaluation, so the run can
+continue after process death, machine sleep, or network interruption.
 
-`manifest.json` stores the command, config, Python version, git commit, branch,
-dirty flag, and `git status --short` output. Mock-mode evolution can safely use
-`--max-workers > 1`; LLM mode should usually start with `--max-workers 1` to
-avoid rate limits.
+`manifest.json` stores the command, config, frozen survey hashes, Python
+version, git commit, branch, dirty flag, and `git status --short` output.
+Mock-mode evolution can safely use `--max-workers > 1`; LLM mode should usually
+start with `--max-workers 1` to avoid rate limits.
 
 Visualize an evolution run, batch `summary.json`, or single generation JSON:
 

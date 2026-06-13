@@ -17,6 +17,28 @@ from src.mega_persona import (
 )
 
 
+class _MockSimulatorLLM:
+    """Returns neutral Likert responses for every simulate_persona call."""
+
+    def generate(self, prompt: str, system_prompt: str = "", temperature: float = 0.0,
+                 max_tokens: int = 1500) -> str:
+        import json
+        # Extract item_ids from the prompt
+        lines = prompt.split("\n")
+        ids = []
+        for line in lines:
+            if line.strip().startswith('"') and '":' in line:
+                item_id = line.strip().split('"')[1] if line.strip().startswith('"') else None
+                if item_id:
+                    ids.append(item_id)
+        if not ids:
+            return '{"unknown": 3}'
+        return json.dumps({iid: 3 for iid in ids})
+
+
+_MOCK_SIM = _MockSimulatorLLM()
+
+
 def test_evolution_persistence_and_resume():
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir) / "evolution"
@@ -31,15 +53,21 @@ def test_evolution_persistence_and_resume():
             items_per_shadow_survey=6,
             random_seed=9,
         )
-        first = MegaPersonaEvolver(config=config, output_dir=output_dir).run()
+        first = MegaPersonaEvolver(config=config, output_dir=output_dir, simulator_llm_client=_MOCK_SIM).run()
         assert first.fitness is not None
         assert (output_dir / "checkpoint.json").exists()
         assert (output_dir / "final_summary.json").exists()
+        assert (output_dir / "final_test_report.json").exists()
+        assert (output_dir / "shadow_surveys" / "train.json").exists()
+        assert (output_dir / "shadow_surveys" / "validation.json").exists()
+        assert (output_dir / "shadow_surveys" / "test.json").exists()
+        assert (output_dir / "shadow_surveys" / "hashes.json").exists()
         evals_after_first = sorted((output_dir / "evaluations").glob("eval_*"))
         assert len(evals_after_first) == 3
 
         checkpoint = json.loads((output_dir / "checkpoint.json").read_text(encoding="utf-8"))
         assert checkpoint["evaluation_count"] == 3
+        assert set(checkpoint["survey_hashes"]) == {"train", "validation", "test"}
 
         resume_config = MegaEvolutionConfig(
             n=4,
@@ -56,6 +84,7 @@ def test_evolution_persistence_and_resume():
             config=resume_config,
             output_dir=output_dir,
             resume=True,
+            simulator_llm_client=_MOCK_SIM,
         ).run()
         assert second.fitness is not None
         evals_after_resume = sorted((output_dir / "evaluations").glob("eval_*"))
@@ -67,9 +96,17 @@ def test_evolution_persistence_and_resume():
         result = json.loads(result_path.read_text(encoding="utf-8"))
         seed_result = result["per_seed"][0]
         assert "train_shadow_behavior" in seed_result
-        assert "heldout_shadow_behavior" in seed_result
-        assert "heldout_behavior_diversity" in seed_result
-        assert "heldout_shadow_alignment.mean" in result["metrics"]
+        assert "validation_shadow_behavior" in seed_result
+        assert "validation_behavior_diversity" in seed_result
+        assert "test_shadow_behavior" not in seed_result
+        assert "test_behavior_diversity" not in seed_result
+        assert "shadow_survey_hashes" in seed_result
+        assert "validation_shadow_alignment.mean" in result["metrics"]
+        assert "test_shadow_alignment.mean" not in result["metrics"]
+        test_report = json.loads((output_dir / "final_test_report.json").read_text(encoding="utf-8"))
+        assert test_report["test_used_for_selection"] is False
+        assert "test_shadow_alignment.mean" in test_report["metrics"]
+        assert "test_behavior_coverage.mean" in test_report["metrics"]
 
 
 def test_resume_rejects_config_mismatch():
@@ -85,7 +122,7 @@ def test_resume_rejects_config_mismatch():
             shadow_surveys=2,
             items_per_shadow_survey=6,
         )
-        MegaPersonaEvolver(config=config, output_dir=output_dir).run()
+        MegaPersonaEvolver(config=config, output_dir=output_dir, simulator_llm_client=_MOCK_SIM).run()
 
         mismatched = MegaEvolutionConfig(
             n=5,
@@ -98,7 +135,7 @@ def test_resume_rejects_config_mismatch():
             items_per_shadow_survey=6,
         )
         try:
-            MegaPersonaEvolver(config=mismatched, output_dir=output_dir, resume=True)
+            MegaPersonaEvolver(config=mismatched, output_dir=output_dir, resume=True, simulator_llm_client=_MOCK_SIM)
         except ValueError as exc:
             assert "Resume config does not match checkpoint" in str(exc)
         else:
@@ -116,11 +153,12 @@ def test_parallel_evolution_and_manifest():
             children_per_generation=2,
             elite_count=1,
             shadow_surveys=2,
-            heldout_shadow_surveys=2,
+            validation_shadow_surveys=2,
+            test_shadow_surveys=1,
             items_per_shadow_survey=6,
             max_workers=2,
         )
-        evolver = MegaPersonaEvolver(config=config, output_dir=output_dir)
+        evolver = MegaPersonaEvolver(config=config, output_dir=output_dir, simulator_llm_client=_MOCK_SIM)
         evolver.store.write_manifest(
             build_run_manifest(config, argv=["test"], resume=False, model_key=None)
         )
@@ -138,7 +176,8 @@ def test_parallel_evolution_and_manifest():
             children_per_generation=2,
             elite_count=1,
             shadow_surveys=2,
-            heldout_shadow_surveys=2,
+            validation_shadow_surveys=2,
+            test_shadow_surveys=1,
             items_per_shadow_survey=6,
             max_workers=1,
         )
@@ -146,6 +185,7 @@ def test_parallel_evolution_and_manifest():
             config=resume_config,
             output_dir=output_dir,
             resume=True,
+            simulator_llm_client=_MOCK_SIM,
         ).run()
         assert resumed.fitness is not None
 
@@ -178,13 +218,15 @@ def test_llm_mode_uses_prompt_genome():
             children_per_generation=1,
             elite_count=1,
             shadow_surveys=1,
-            heldout_shadow_surveys=1,
+            validation_shadow_surveys=1,
+            test_shadow_surveys=1,
             items_per_shadow_survey=6,
         )
         best = MegaPersonaEvolver(
             config=config,
             output_dir=output_dir,
             llm_client=llm,
+            simulator_llm_client=_MOCK_SIM,
         ).run()
         assert best.fitness is not None
         assert llm.calls

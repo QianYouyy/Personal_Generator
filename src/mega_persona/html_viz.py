@@ -189,8 +189,8 @@ def _build_per_seed(best_result: dict[str, Any] | None) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for seed_entry in per_seed:
         schema_ev = seed_entry.get("schema_evaluation", {})
-        heldout = seed_entry.get("heldout_shadow_behavior", {})
-        hd_div = seed_entry.get("heldout_behavior_diversity", {})
+        heldout = seed_entry.get("validation_shadow_behavior") or seed_entry.get("heldout_shadow_behavior", {})
+        hd_div = seed_entry.get("validation_behavior_diversity") or seed_entry.get("heldout_behavior_diversity", {})
         result.append({
             "seed": seed_entry.get("seed"),
             "score": seed_entry.get("score"),
@@ -354,8 +354,10 @@ def _extract_behavior_axes(seed_entry: dict[str, Any]) -> list[list[float]]:
         for p in seed_entry.get("personas", [])
         if p and p.get("persona_id")
     }
-    # Prefer held-out simulations, fall back to train
-    sims = seed_entry.get("heldout_shadow_simulations") or seed_entry.get(
+    # Prefer validation simulations, fall back to legacy held-out, then train.
+    sims = seed_entry.get("validation_shadow_simulations") or seed_entry.get(
+        "heldout_shadow_simulations"
+    ) or seed_entry.get(
         "train_shadow_simulations", []
     )
     return _extract_behavior_axes_from_sims(

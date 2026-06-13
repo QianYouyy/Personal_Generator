@@ -12,7 +12,7 @@ from src.mega_persona.evaluation import MegaPersonaEvaluation, evaluate_mega_per
 from src.mega_persona.generator import MegaPersonaGenerator
 from src.mega_persona.schema import MegaPersona
 from src.mega_persona.shadow_simulator import (
-    RuleBasedShadowSimulator,
+    LLMShadowSimulator,
     ShadowBehaviorReport,
     ShadowSurveySimulation,
     aggregate_shadow_behavior,
@@ -35,7 +35,6 @@ class MegaPersonaExperimentConfig:
     items_per_shadow_survey: int = 12
     coverage_radius: float = 0.28
     duplicate_threshold: float = 0.82
-    shadow_noise: float = 0.08
 
 
 @dataclass
@@ -175,11 +174,15 @@ class MegaPersonaExperimentRunner:
         self,
         config: MegaPersonaExperimentConfig,
         llm_client=None,
+        simulator_llm_client=None,
     ):
         self.config = config
         self.llm_client = llm_client
+        self.simulator_llm_client = simulator_llm_client
         if config.mode == "llm" and llm_client is None:
             raise ValueError("llm_client is required when mode='llm'")
+        if simulator_llm_client is None:
+            raise ValueError("simulator_llm_client is required (LLMShadowSimulator is the only simulator)")
 
     def run(self) -> MegaPersonaExperimentSummary:
         return MegaPersonaExperimentSummary(
@@ -201,9 +204,8 @@ class MegaPersonaExperimentRunner:
             coverage_radius=self.config.coverage_radius,
             duplicate_threshold=self.config.duplicate_threshold,
         )
-        shadow_simulations = RuleBasedShadowSimulator(
-            noise=self.config.shadow_noise,
-            seed=seed,
+        shadow_simulations = LLMShadowSimulator(
+            self.simulator_llm_client,
         ).simulate_population(personas, shadow_surveys)
         shadow_behavior = aggregate_shadow_behavior(personas, shadow_simulations)
         slot_diversity = _diversity_for_matrix(

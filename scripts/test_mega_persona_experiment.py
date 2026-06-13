@@ -9,16 +9,44 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.test_mega_persona_schema import sample_persona
 from src.mega_persona import (
     AXIS_NAMES,
+    LLMShadowSimulator,
     MegaPersona,
     RuleBasedMegaPersonaBuilder,
-    RuleBasedShadowSimulator,
     SlotSampler,
     aggregate_shadow_behavior,
     build_initial_shadow_surveys,
+    build_shadow_survey_splits,
     evaluate_mega_personas,
     personas_to_axis_matrix,
     score_shadow_survey,
 )
+
+
+# ---------------------------------------------------------------------------
+# Mock LLM client for smoke tests — returns neutral responses (3=neutral)
+# so we can test the full pipeline without an actual API key.
+# ---------------------------------------------------------------------------
+
+class _MockLLMClient:
+    """Returns a JSON blob of neutral responses for every simulate_persona call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, prompt: str, system_prompt: str = "", temperature: float = 0.0,
+                 max_tokens: int = 1500) -> str:
+        self.calls.append({"prompt": prompt, "system_prompt": system_prompt})
+        # We need to parse the prompt to figure out how many items to respond to,
+        # then return {"item_id": 3, ...} for all of them.
+        import re
+        item_ids = re.findall(r'"([^"]+)":\s*"([^"]*)"', prompt.split("ITEMS:")[-1]) if "ITEMS:" in prompt else []
+        ids = [m[0] for m in item_ids]
+        responses = {iid: 3 for iid in ids}
+        import json
+        return json.dumps(responses)
+
+
+_MOCK_LLM = _MockLLMClient()
 
 
 def persona_variant(index: int, axes: dict[str, float]) -> dict:
@@ -106,6 +134,22 @@ def test_shadow_surveys():
     for axis_name in AXIS_NAMES:
         assert f"axis.{axis_name}" in scores
         assert 0.0 <= scores[f"axis.{axis_name}"] <= 1.0
+    assert first.split == "train"
+    assert all(item.scale_id for item in first.items)
+
+    splits = build_shadow_survey_splits(
+        train_surveys=2,
+        validation_surveys=1,
+        test_surveys=1,
+        items_per_survey=6,
+        seed=19,
+    )
+    assert len(splits.train) == 2
+    assert len(splits.validation) == 1
+    assert len(splits.test) == 1
+    assert splits.train[0].survey_id.startswith("shadow_train")
+    assert splits.validation[0].survey_id.startswith("shadow_validation")
+    assert splits.test[0].survey_id.startswith("shadow_test")
 
 
 def test_population_evaluation():
@@ -140,10 +184,11 @@ def test_shadow_behavior_simulation():
         for persona in personas
     ]
     surveys = build_initial_shadow_surveys(num_surveys=3)
-    simulations = RuleBasedShadowSimulator(seed=3).simulate_population(persona_objects, surveys)
+    sim = LLMShadowSimulator(_MOCK_LLM)
+    simulations = sim.simulate_population(persona_objects, surveys)
 
     assert len(simulations) == 15
-    assert all(1 <= response <= 5 for sim in simulations for response in sim.responses.values())
+    assert all(1 <= response <= 5 for sim_obj in simulations for response in sim_obj.responses.values())
 
     report = aggregate_shadow_behavior(persona_objects, simulations)
     assert report.sample_size == 5
@@ -152,6 +197,12 @@ def test_shadow_behavior_simulation():
     for axis in AXIS_NAMES:
         assert axis in report.behavior_axis_mean
         assert axis in report.persona_behavior_mae
+
+    prompt = _MOCK_LLM.calls[-1]["prompt"]
+    assert "Abstraction level (0=concrete" not in prompt
+    assert "Intrinsic motivation (0-1)" not in prompt
+    assert "Resilience:" not in prompt
+    assert "DERIVED ACADEMIC TENDENCY" not in prompt
 
 
 def test_rule_based_baseline_builder():
@@ -164,7 +215,8 @@ def test_rule_based_baseline_builder():
     assert evaluation.validity_rate == 1.0
 
     surveys = build_initial_shadow_surveys(num_surveys=2)
-    simulations = RuleBasedShadowSimulator(seed=9).simulate_population(personas, surveys)
+    sim = LLMShadowSimulator(_MOCK_LLM)
+    simulations = sim.simulate_population(personas, surveys)
     behavior = aggregate_shadow_behavior(personas, simulations)
     assert behavior.sample_size == 6
     assert behavior.survey_count == 2

@@ -19,27 +19,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run MegaPersona experiment batches.")
     parser.add_argument("--mode", choices=["mock", "llm"], default="mock")
     parser.add_argument("--n", type=int, default=25)
-    parser.add_argument(
-        "--seeds",
-        default="17,23,31",
-        help="Comma-separated random seeds.",
-    )
+    parser.add_argument("--seeds", default="17,23,31", help="Comma-separated random seeds.")
     parser.add_argument("--shadow-surveys", type=int, default=12)
     parser.add_argument("--items-per-shadow-survey", type=int, default=12)
     parser.add_argument("--coverage-radius", type=float, default=0.28)
     parser.add_argument("--duplicate-threshold", type=float, default=0.82)
-    parser.add_argument("--shadow-noise", type=float, default=0.08)
     parser.add_argument("--model-key", default="llm.persona_model")
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Defaults to data/results/mega_persona_experiment_<timestamp>",
-    )
-    parser.add_argument(
-        "--no-personas",
-        action="store_true",
-        help="Do not include full persona JSON in summary.json.",
-    )
+    parser.add_argument("--simulator-model-key", default="llm.simulator_model",
+                        help="Config key for the LLM simulator model.")
+    parser.add_argument("--output-dir", default=None,
+                        help="Defaults to data/results/mega_persona_experiment_<timestamp>")
+    parser.add_argument("--no-personas", action="store_true",
+                        help="Do not include full persona JSON in summary.json.")
     return parser.parse_args()
 
 
@@ -54,15 +45,17 @@ def main() -> None:
         items_per_shadow_survey=args.items_per_shadow_survey,
         coverage_radius=args.coverage_radius,
         duplicate_threshold=args.duplicate_threshold,
-        shadow_noise=args.shadow_noise,
     )
-    llm = LLMClient.from_config(args.model_key) if args.mode == "llm" else None
-    summary = MegaPersonaExperimentRunner(config=config, llm_client=llm).run()
+    gen_llm = LLMClient.from_config(args.model_key) if args.mode == "llm" else None
+    sim_llm = LLMClient.from_config(args.simulator_model_key)
+    summary = MegaPersonaExperimentRunner(
+        config=config,
+        llm_client=gen_llm,
+        simulator_llm_client=sim_llm,
+    ).run()
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir()
     json_path, markdown_path = write_experiment_artifacts(
-        summary,
-        output_dir=output_dir,
-        include_personas=not args.no_personas,
+        summary, output_dir=output_dir, include_personas=not args.no_personas,
     )
     aggregate = summary.aggregate_metrics()
     print(f"Saved MegaPersona experiment JSON to {json_path}")

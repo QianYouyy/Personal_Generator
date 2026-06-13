@@ -10,9 +10,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.mega_persona import (
+    LLMShadowSimulator,
     MegaPersonaGenerator,
     RuleBasedMegaPersonaBuilder,
-    RuleBasedShadowSimulator,
     SlotSampler,
     aggregate_shadow_behavior,
     build_initial_shadow_surveys,
@@ -28,7 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-key",
         default="llm.persona_model",
-        help="Config key used to create the LLM client.",
+        help="Config key for the persona-generation LLM client.",
+    )
+    parser.add_argument(
+        "--simulator-model-key",
+        default="llm.simulator_model",
+        help="Config key for the shadow-simulator LLM client.",
     )
     parser.add_argument(
         "--output",
@@ -38,12 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Only generate slots and initial shadow surveys; do not call an LLM.",
+        help="Only generate slots and initial shadow surveys; do not call any LLM.",
     )
     parser.add_argument(
         "--mock",
         action="store_true",
-        help="Generate rule-based baseline personas without calling an LLM.",
+        help="Generate rule-based baseline personas without calling an LLM for generation (simulator still uses LLM).",
     )
     return parser.parse_args()
 
@@ -76,8 +81,8 @@ def main() -> None:
         }
         mode = "mock"
     else:
-        llm = LLMClient.from_config(args.model_key)
-        generator = MegaPersonaGenerator(llm)
+        gen_llm = LLMClient.from_config(args.model_key)
+        generator = MegaPersonaGenerator(gen_llm)
         results = generator.generate_from_slots(slots)
         valid_personas = [result.persona for result in results if result.persona is not None]
         generation_payload = {
@@ -98,9 +103,11 @@ def main() -> None:
         mode = "generated"
 
     evaluation = evaluate_mega_personas(valid_personas)
-    shadow_simulations = RuleBasedShadowSimulator(seed=args.seed).simulate_population(
-        valid_personas,
-        shadow_surveys,
+
+    # All shadow surveys are simulated via LLM — the only simulator now.
+    sim_llm = LLMClient.from_config(args.simulator_model_key)
+    shadow_simulations = LLMShadowSimulator(sim_llm).simulate_population(
+        valid_personas, shadow_surveys,
     )
     shadow_behavior = aggregate_shadow_behavior(valid_personas, shadow_simulations)
 

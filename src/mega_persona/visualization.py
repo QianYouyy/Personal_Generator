@@ -199,7 +199,12 @@ def plot_metric_bars(metrics: dict[str, Any], save_path: Path) -> Path:
 def _plot_seed_result(seed_result: dict[str, Any], output_dir: Path, prefix: str) -> list[Path]:
     slots = seed_result.get("slots", [])
     personas = seed_result.get("personas", [])
-    heldout = seed_result.get("heldout_shadow_simulations") or seed_result.get("shadow_simulations") or []
+    heldout = (
+        seed_result.get("validation_shadow_simulations")
+        or seed_result.get("heldout_shadow_simulations")
+        or seed_result.get("shadow_simulations")
+        or []
+    )
 
     slot_axes = np.array(
         [[slot["target_axes"][axis] for axis in AXIS_NAMES] for slot in slots],

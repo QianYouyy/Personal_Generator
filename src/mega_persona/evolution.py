@@ -21,12 +21,19 @@ import numpy as np
 from src.evaluator.metrics import DiversityMetrics
 from src.mega_persona.evaluation import evaluate_mega_personas
 from src.mega_persona.generator import MegaPersonaGenerator
+from src.mega_persona.schema import MegaPersona
 from src.mega_persona.shadow_simulator import (
-    RuleBasedShadowSimulator,
+    LLMShadowSimulator,
     aggregate_shadow_behavior,
     shadow_behavior_axis_matrix,
 )
-from src.mega_persona.shadow_survey import build_initial_shadow_surveys
+from src.mega_persona.shadow_survey import (
+    ShadowSurveySplit,
+    build_shadow_survey_splits,
+    read_shadow_survey_splits,
+    shadow_survey_split_hashes,
+    write_shadow_survey_splits,
+)
 from src.mega_persona.slots import (
     AXIS_NAMES,
     DEFAULT_QUOTA_BUCKETS,
@@ -50,10 +57,10 @@ class MegaEvolutionConfig:
     coverage_radius: float = 0.28
     duplicate_threshold: float = 0.82
     shadow_surveys: int = 12
-    heldout_shadow_surveys: int = 4
+    validation_shadow_surveys: int = 4
+    test_shadow_surveys: int = 4
     items_per_shadow_survey: int = 12
-    shadow_noise: float = 0.08
-    heldout_seed_offset: int = 10000
+    survey_seed: int = 17
     random_seed: int = 1234
     max_workers: int = 1
 
@@ -91,26 +98,45 @@ class MegaPersonaEvolver:
         output_dir: Path,
         resume: bool = False,
         llm_client=None,
+        simulator_llm_client=None,
     ):
         self.config = config
         self.output_dir = output_dir
         self.store = EvolutionStore(output_dir)
         self.rng = np.random.default_rng(config.random_seed)
         self.llm_client = llm_client
+        self.simulator_llm_client = simulator_llm_client
         self.generation = 0
         self.population: list[MegaEvolutionCandidate] = []
         self.evaluation_count = 0
         self.best_candidate_id: str | None = None
+        self.survey_splits: ShadowSurveySplit
+        self.survey_hashes: dict[str, str]
 
         if config.generator_mode not in {"mock", "llm"}:
             raise ValueError("generator_mode must be 'mock' or 'llm'")
         if config.generator_mode == "llm" and llm_client is None:
             raise ValueError("llm_client is required when generator_mode='llm'")
+        if simulator_llm_client is None:
+            raise ValueError("simulator_llm_client is required (LLMShadowSimulator is the only simulator)")
 
         if resume:
             self._load_checkpoint()
+            self.survey_splits = read_shadow_survey_splits(self.store.surveys_dir)
+            self.survey_hashes = shadow_survey_split_hashes(self.survey_splits)
         else:
             self.store.initialize()
+            self.survey_splits = build_shadow_survey_splits(
+                train_surveys=self.config.shadow_surveys,
+                validation_surveys=self.config.validation_shadow_surveys,
+                test_surveys=self.config.test_shadow_surveys,
+                items_per_survey=self.config.items_per_shadow_survey,
+                seed=self.config.survey_seed,
+            )
+            self.survey_hashes = write_shadow_survey_splits(
+                self.survey_splits,
+                self.store.surveys_dir,
+            )
             self.population = self._initial_population()
             self._save_checkpoint()
 
@@ -128,7 +154,9 @@ class MegaPersonaEvolver:
         self._write_generation_summary()
         self._save_checkpoint()
         best = self.best_candidate()
-        self.store.write_final_summary(best, self.population, self.config)
+        final_test_report = self.evaluate_final_test(best)
+        self.store.write_final_test_report(final_test_report)
+        self.store.write_final_summary(best, self.population, self.config, final_test_report)
         return best
 
     def best_candidate(self) -> MegaEvolutionCandidate:
@@ -213,36 +241,17 @@ class MegaPersonaEvolver:
                 coverage_radius=self.config.coverage_radius,
                 duplicate_threshold=self.config.duplicate_threshold,
             )
-            train_surveys = build_initial_shadow_surveys(
-                num_surveys=self.config.shadow_surveys,
-                items_per_survey=self.config.items_per_shadow_survey,
-                seed=seed + int(candidate.genome["shadow_survey_seed_offset"]),
-            )
-            heldout_surveys = build_initial_shadow_surveys(
-                num_surveys=self.config.heldout_shadow_surveys,
-                items_per_survey=self.config.items_per_shadow_survey,
-                seed=(
-                    seed
-                    + self.config.heldout_seed_offset
-                    + int(candidate.genome["shadow_survey_seed_offset"])
-                ),
-            )
-            train_simulations = RuleBasedShadowSimulator(
-                noise=self.config.shadow_noise,
-                seed=seed,
-            ).simulate_population(personas, train_surveys)
-            heldout_simulations = RuleBasedShadowSimulator(
-                noise=self.config.shadow_noise,
-                seed=seed + self.config.heldout_seed_offset,
-            ).simulate_population(personas, heldout_surveys)
+            simulator = LLMShadowSimulator(self.simulator_llm_client)
+            train_simulations = simulator.simulate_population(personas, list(self.survey_splits.train))
+            validation_simulations = simulator.simulate_population(personas, list(self.survey_splits.validation))
             train_shadow_behavior = aggregate_shadow_behavior(personas, train_simulations)
-            heldout_shadow_behavior = aggregate_shadow_behavior(personas, heldout_simulations)
+            validation_shadow_behavior = aggregate_shadow_behavior(personas, validation_simulations)
             train_behavior_diversity = _diversity_for_matrix(
                 shadow_behavior_axis_matrix(personas, train_simulations),
                 self.config.coverage_radius,
             )
-            heldout_behavior_diversity = _diversity_for_matrix(
-                shadow_behavior_axis_matrix(personas, heldout_simulations),
+            validation_behavior_diversity = _diversity_for_matrix(
+                shadow_behavior_axis_matrix(personas, validation_simulations),
                 self.config.coverage_radius,
             )
             slot_diversity = _diversity_for_matrix(
@@ -252,8 +261,8 @@ class MegaPersonaEvolver:
             seed_score = genome_score(
                 genome=candidate.genome,
                 schema_fitness=schema_evaluation.fitness,
-                behavior_coverage=heldout_behavior_diversity.get("coverage", 0.0),
-                shadow_alignment=heldout_shadow_behavior.overall_alignment,
+                behavior_coverage=validation_behavior_diversity.get("coverage", 0.0),
+                shadow_alignment=validation_shadow_behavior.overall_alignment,
                 generation_rate=len(personas) / len(slots) if slots else 0.0,
             )
             per_seed.append(
@@ -264,15 +273,16 @@ class MegaPersonaEvolver:
                     "personas": [persona.model_dump() for persona in personas],
                     "schema_evaluation": schema_evaluation.to_dict(),
                     "train_shadow_behavior": train_shadow_behavior.to_dict(),
-                    "heldout_shadow_behavior": heldout_shadow_behavior.to_dict(),
+                    "validation_shadow_behavior": validation_shadow_behavior.to_dict(),
                     "train_behavior_diversity": train_behavior_diversity,
-                    "heldout_behavior_diversity": heldout_behavior_diversity,
+                    "validation_behavior_diversity": validation_behavior_diversity,
                     "slot_diversity": slot_diversity,
+                    "shadow_survey_hashes": self.survey_hashes,
                     "train_shadow_simulations": [
                         asdict(simulation) for simulation in train_simulations
                     ],
-                    "heldout_shadow_simulations": [
-                        asdict(simulation) for simulation in heldout_simulations
+                    "validation_shadow_simulations": [
+                        asdict(simulation) for simulation in validation_simulations
                     ],
                 }
             )
@@ -284,6 +294,49 @@ class MegaPersonaEvolver:
             "fitness": fitness,
             "metrics": metrics,
             "per_seed": per_seed,
+        }
+
+    def evaluate_final_test(self, best: MegaEvolutionCandidate) -> dict[str, Any]:
+        """Evaluate the selected best candidate on the sealed test split once."""
+        best_result = self.store.find_candidate_result(best.candidate_id)
+        if best_result is None:
+            raise FileNotFoundError(f"missing stored evaluation for best candidate {best.candidate_id}")
+
+        simulator = LLMShadowSimulator(self.simulator_llm_client)
+        per_seed = []
+        for seed_result in best_result.get("per_seed", []):
+            personas = [
+                MegaPersona.model_validate(persona)
+                for persona in seed_result.get("personas", [])
+            ]
+            test_simulations = simulator.simulate_population(personas, list(self.survey_splits.test))
+            test_shadow_behavior = aggregate_shadow_behavior(personas, test_simulations)
+            test_behavior_diversity = _diversity_for_matrix(
+                shadow_behavior_axis_matrix(personas, test_simulations),
+                self.config.coverage_radius,
+            )
+            per_seed.append(
+                {
+                    "seed": seed_result["seed"],
+                    "candidate_id": best.candidate_id,
+                    "test_shadow_behavior": test_shadow_behavior.to_dict(),
+                    "test_behavior_diversity": test_behavior_diversity,
+                    "test_shadow_simulations": [
+                        asdict(simulation) for simulation in test_simulations
+                    ],
+                }
+            )
+
+        metrics = _aggregate_final_test_metrics(per_seed)
+        return {
+            "candidate_id": best.candidate_id,
+            "candidate_fitness": best.fitness,
+            "selection_metric": "validation",
+            "test_used_for_selection": False,
+            "survey_hashes": self.survey_hashes,
+            "metrics": metrics,
+            "per_seed": per_seed,
+            "created_at": datetime.now().isoformat(),
         }
 
     def _generate_personas(
@@ -362,6 +415,7 @@ class MegaPersonaEvolver:
             "generation": self.generation,
             "evaluation_count": self.evaluation_count,
             "best_candidate_id": self.best_candidate_id,
+            "survey_hashes": self.survey_hashes,
             "rng_state": self.rng.bit_generator.state,
             "population": [candidate.to_dict() for candidate in self.population],
             "updated_at": datetime.now().isoformat(),
@@ -380,6 +434,15 @@ class MegaPersonaEvolver:
         ]
         if "rng_state" in state:
             self.rng.bit_generator.state = state["rng_state"]
+        saved_hashes = state.get("survey_hashes")
+        if saved_hashes:
+            loaded_splits = read_shadow_survey_splits(self.store.surveys_dir)
+            loaded_hashes = shadow_survey_split_hashes(loaded_splits)
+            if loaded_hashes != saved_hashes:
+                raise ValueError(
+                    "Frozen shadow survey hashes do not match checkpoint. "
+                    f"checkpoint={saved_hashes}, current={loaded_hashes}"
+                )
 
     def _validate_resume_config(self, state: dict[str, Any]) -> None:
         saved_config = state.get("config")
@@ -412,12 +475,14 @@ class EvolutionStore:
         self.evaluations_dir = output_dir / "evaluations"
         self.generations_dir = output_dir / "generations"
         self.candidates_dir = output_dir / "candidates"
+        self.surveys_dir = output_dir / "shadow_surveys"
         self.checkpoint_path = output_dir / "checkpoint.json"
 
     def initialize(self) -> None:
         self.evaluations_dir.mkdir(parents=True, exist_ok=True)
         self.generations_dir.mkdir(parents=True, exist_ok=True)
         self.candidates_dir.mkdir(parents=True, exist_ok=True)
+        self.surveys_dir.mkdir(parents=True, exist_ok=True)
 
     def write_evaluation(
         self,
@@ -469,17 +534,31 @@ class EvolutionStore:
         with open(self.checkpoint_path, "r", encoding="utf-8") as file:
             return json.load(file)
 
+    def find_candidate_result(self, candidate_id: str) -> dict[str, Any] | None:
+        for path in sorted(self.evaluations_dir.glob("eval_*_*/result.json")):
+            with open(path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+            if payload.get("candidate", {}).get("candidate_id") == candidate_id:
+                return payload
+        return None
+
+    def write_final_test_report(self, payload: dict[str, Any]) -> None:
+        self.initialize()
+        _atomic_write_json(self.output_dir / "final_test_report.json", payload)
+
     def write_final_summary(
         self,
         best: MegaEvolutionCandidate,
         population: list[MegaEvolutionCandidate],
         config: MegaEvolutionConfig,
+        final_test_report: dict[str, Any] | None = None,
     ) -> None:
         self.initialize()
         payload = {
             "config": _config_to_dict(config),
             "best": best.to_dict(),
             "population": [candidate.to_dict() for candidate in population],
+            "final_test_report": final_test_report,
             "completed_at": datetime.now().isoformat(),
         }
         _atomic_write_json(self.output_dir / "final_summary.json", payload)
@@ -497,7 +576,6 @@ def default_genome() -> dict[str, Any]:
         },
         "axis_bias": {axis: 0.0 for axis in AXIS_NAMES},
         "axis_stretch": {axis: 1.0 for axis in AXIS_NAMES},
-        "shadow_survey_seed_offset": 0,
         "prompt_profile": {
             "mechanism_focus": "balanced",
             "tension_level": "moderate",
@@ -548,9 +626,6 @@ def mutate_genome(
             1.75,
         )
 
-    mutated["shadow_survey_seed_offset"] = int(
-        max(0, mutated["shadow_survey_seed_offset"] + rng.integers(-2, 4))
-    )
     mutated.setdefault(
         "prompt_profile",
         json.loads(json.dumps(default_genome()["prompt_profile"])),
@@ -645,16 +720,39 @@ def _aggregate_seed_metrics(per_seed: list[dict[str, Any]]) -> dict[str, Any]:
         "train_shadow_alignment": [
             item["train_shadow_behavior"]["overall_alignment"] for item in per_seed
         ],
-        "heldout_shadow_alignment": [
-            item["heldout_shadow_behavior"]["overall_alignment"] for item in per_seed
+        "validation_shadow_alignment": [
+            item["validation_shadow_behavior"]["overall_alignment"] for item in per_seed
         ],
         "train_behavior_coverage": [
             item["train_behavior_diversity"]["coverage"] for item in per_seed
         ],
-        "heldout_behavior_coverage": [
-            item["heldout_behavior_diversity"]["coverage"] for item in per_seed
+        "validation_behavior_coverage": [
+            item["validation_behavior_diversity"]["coverage"] for item in per_seed
         ],
         "slot_coverage": [item["slot_diversity"]["coverage"] for item in per_seed],
+    }
+    return {
+        f"{key}.mean": float(np.mean(values))
+        for key, values in numeric_keys.items()
+    } | {
+        f"{key}.std": float(np.std(values))
+        for key, values in numeric_keys.items()
+    }
+
+
+def _aggregate_final_test_metrics(per_seed: list[dict[str, Any]]) -> dict[str, Any]:
+    if not per_seed:
+        return {}
+    numeric_keys = {
+        "test_shadow_alignment": [
+            item["test_shadow_behavior"]["overall_alignment"] for item in per_seed
+        ],
+        "test_behavior_coverage": [
+            item["test_behavior_diversity"]["coverage"] for item in per_seed
+        ],
+        "test_behavior_avg_dist": [
+            item["test_behavior_diversity"]["avg_dist"] for item in per_seed
+        ],
     }
     return {
         f"{key}.mean": float(np.mean(values))
@@ -807,13 +905,40 @@ def _final_markdown(payload: dict[str, Any]) -> str:
         "validity_rate",
         "near_duplicate_rate",
         "train_shadow_alignment",
-        "heldout_shadow_alignment",
+        "validation_shadow_alignment",
         "train_behavior_coverage",
-        "heldout_behavior_coverage",
+        "validation_behavior_coverage",
         "slot_coverage",
     ]:
         lines.append(
             f"| {metric} | {metrics.get(metric + '.mean', 0.0):.4f} | "
             f"{metrics.get(metric + '.std', 0.0):.4f} |"
+        )
+    final_test = payload.get("final_test_report") or {}
+    test_metrics = final_test.get("metrics", {})
+    if test_metrics:
+        lines.extend(
+            [
+                "",
+                "## Sealed Test Report",
+                "",
+                "| Metric | Mean | Std |",
+                "|---|---:|---:|",
+            ]
+        )
+        for metric in [
+            "test_shadow_alignment",
+            "test_behavior_coverage",
+            "test_behavior_avg_dist",
+        ]:
+            lines.append(
+                f"| {metric} | {test_metrics.get(metric + '.mean', 0.0):.4f} | "
+                f"{test_metrics.get(metric + '.std', 0.0):.4f} |"
+            )
+        lines.extend(
+            [
+                "",
+                f"- test used for selection: `{final_test.get('test_used_for_selection', False)}`",
+            ]
         )
     return "\n".join(lines) + "\n"

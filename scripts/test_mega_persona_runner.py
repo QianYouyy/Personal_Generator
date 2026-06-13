@@ -14,6 +14,25 @@ from src.mega_persona import (
 )
 
 
+class _MockSimLLM:
+    """Returns neutral Likert responses for smoke tests."""
+
+    def generate(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
+        import json
+        lines = prompt.split("\n")
+        ids = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('"') and '":' in stripped:
+                item_id = stripped.split('"')[1] if len(stripped.split('"')) > 1 else None
+                if item_id:
+                    ids.append(item_id)
+        return json.dumps({iid: 3 for iid in ids} if ids else {"unknown": 3})
+
+
+_MOCK_SIM = _MockSimLLM()
+
+
 def test_runner_summary():
     config = MegaPersonaExperimentConfig(
         n=5,
@@ -22,7 +41,7 @@ def test_runner_summary():
         num_shadow_surveys=3,
         items_per_shadow_survey=8,
     )
-    summary = MegaPersonaExperimentRunner(config).run()
+    summary = MegaPersonaExperimentRunner(config, simulator_llm_client=_MOCK_SIM).run()
     assert len(summary.runs) == 2
     aggregate = summary.aggregate_metrics()
     assert aggregate["experiment_score.mean"] > 0.0
@@ -41,7 +60,7 @@ def test_write_artifacts():
         num_shadow_surveys=2,
         items_per_shadow_survey=8,
     )
-    summary = MegaPersonaExperimentRunner(config).run()
+    summary = MegaPersonaExperimentRunner(config, simulator_llm_client=_MOCK_SIM).run()
     with tempfile.TemporaryDirectory() as tmpdir:
         json_path, markdown_path = write_experiment_artifacts(
             summary,
