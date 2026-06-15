@@ -341,6 +341,7 @@ python scripts/visualize_mega_persona_results.py \
 
 `run_mega_persona_experiment.py` 和 `run_mega_persona_evolution.py` 的输出默认保存到 `data/results/`。进化实验会额外保存：
 - `manifest.json`
+- `run.log`
 - `checkpoint.json`
 - `final_summary.json`
 - `final_summary.md`

@@ -12,6 +12,8 @@ Key improvements over the original sequential design:
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import json
+import logging
+import time
 from typing import Any
 
 from src.mega_persona.prompts import (
@@ -29,7 +31,10 @@ from src.mega_persona.prompts import (
 )
 from src.mega_persona.schema import MegaPersona
 from src.mega_persona.slots import AXIS_NAMES, MegaPersonaSlot, SlotSampler
-from src.mega_persona.validator import ValidationReport, validate_mega_persona
+from src.mega_persona.validator import ValidationIssue, ValidationReport, validate_mega_persona
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentOutputError(ValueError):
@@ -88,7 +93,54 @@ class MegaPersonaGenerator:
         self,
         slots: list[MegaPersonaSlot],
     ) -> list[MegaPersonaGenerationResult]:
-        return [self.generate_one(slot) for slot in slots]
+        results: list[MegaPersonaGenerationResult] = []
+        total = len(slots)
+        for index, slot in enumerate(slots, start=1):
+            logger.info(
+                "MegaPersona generation %s/%s slot=%s quota=%s",
+                index,
+                total,
+                slot.slot_id,
+                slot.quota_label,
+            )
+            try:
+                result = self.generate_one(slot)
+            except Exception as exc:
+                logger.error(
+                    "MegaPersona generation %s/%s slot=%s failed (%s: %s)",
+                    index,
+                    total,
+                    slot.slot_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                result = MegaPersonaGenerationResult(
+                    slot=slot,
+                    persona=None,
+                    validation_report=ValidationReport(
+                        is_valid=False,
+                        schema_valid=False,
+                        issues=[
+                            ValidationIssue(
+                                rule_id="PIPELINE",
+                                severity="error",
+                                message=f"{type(exc).__name__}: {exc}",
+                            )
+                        ],
+                    ),
+                    raw_outputs={"pipeline_error": f"{type(exc).__name__}: {exc}"},
+                    candidate_json={"persona_id": slot.slot_id},
+                )
+            logger.info(
+                "MegaPersona generation %s/%s slot=%s valid=%s issues=%s",
+                index,
+                total,
+                slot.slot_id,
+                result.is_valid,
+                len(result.validation_report.issues),
+            )
+            results.append(result)
+        return results
 
     # ------------------------------------------------------------------
     # Core pipeline (optimised)
@@ -104,17 +156,20 @@ class MegaPersonaGenerator:
         slot_json = _json_dumps(slot.prompt_context())
 
         # ---- Agent 1: Demographics (must run alone — no prior context) ----
+        logger.info("Slot=%s agent=demographics start", slot.slot_id)
         demographics, raw_demo = self._call_agent(
             stage_name="demographics",
             prompt=demographics_agent_prompt(slot_json),
             system_prompt=self._system_prompt(DEMOGRAPHICS_AGENT_SYSTEM_PROMPT),
         )
+        logger.info("Slot=%s agent=demographics done", slot.slot_id)
         raw_outputs["demographics"] = raw_demo
         self._merge_stage(candidate, demographics, ("demographics",))
         whiteboard.update(demographics)
 
         # ---- Agent 2: Cognition & Motivation (needs demographics) ----
         hard_cc = _hard_constraints_for_cognition(slot)
+        logger.info("Slot=%s agent=cognition_motivation start", slot.slot_id)
         cognition, raw_cog = self._call_agent(
             stage_name="cognition_motivation",
             prompt=cognition_motivation_agent_prompt(
@@ -125,6 +180,7 @@ class MegaPersonaGenerator:
             ),
             system_prompt=self._system_prompt(COGNITION_MOTIVATION_AGENT_SYSTEM_PROMPT),
         )
+        logger.info("Slot=%s agent=cognition_motivation done", slot.slot_id)
         raw_outputs["cognition_motivation"] = raw_cog
         self._merge_stage(
             candidate,
@@ -169,6 +225,7 @@ class MegaPersonaGenerator:
     ) -> MegaPersonaGenerationResult:
         report = validate_mega_persona(candidate)
         if report.is_valid:
+            logger.info("Slot=%s validation passed", slot.slot_id)
             return MegaPersonaGenerationResult(
                 slot=slot,
                 persona=MegaPersona.model_validate(candidate),
@@ -179,6 +236,13 @@ class MegaPersonaGenerator:
 
         revised = candidate
         for attempt in range(self.max_revisions):
+            logger.info(
+                "Slot=%s validation failed; revision attempt=%s issues=%s",
+                slot.slot_id,
+                attempt + 1,
+                len(report.issues),
+            )
+            _log_validation_issues(slot.slot_id, report)
             issues = [
                 {
                     "rule_id": issue.rule_id,
@@ -187,8 +251,10 @@ class MegaPersonaGenerator:
                 }
                 for issue in report.issues
             ]
-            raw = self.llm.generate(
-                revision_prompt(
+            raw = _generate_with_retry(
+                llm=self.llm,
+                label=f"revision_{attempt + 1}",
+                prompt=revision_prompt(
                     candidate_json=_json_dumps(revised),
                     issues_json=_json_dumps(issues),
                 ),
@@ -197,9 +263,16 @@ class MegaPersonaGenerator:
                 max_tokens=self.max_tokens,
             )
             raw_outputs[f"revision_{attempt + 1}"] = raw
-            revised = parse_json_object(raw)
+            revised = _parse_or_repair_json(
+                llm=self.llm,
+                raw=raw,
+                stage_name=f"revision_{attempt + 1}",
+                temperature=0.0,
+                max_tokens=self.max_tokens,
+            )
             report = validate_mega_persona(revised)
             if report.is_valid:
+                logger.info("Slot=%s revision attempt=%s passed", slot.slot_id, attempt + 1)
                 return MegaPersonaGenerationResult(
                     slot=slot,
                     persona=MegaPersona.model_validate(revised),
@@ -208,6 +281,8 @@ class MegaPersonaGenerator:
                     candidate_json=revised,
                 )
 
+        logger.info("Slot=%s validation failed after revisions issues=%s", slot.slot_id, len(report.issues))
+        _log_validation_issues(slot.slot_id, report)
         return MegaPersonaGenerationResult(
             slot=slot,
             persona=None,
@@ -227,13 +302,22 @@ class MegaPersonaGenerator:
         system_prompt: str,
     ) -> tuple[dict[str, Any], str]:
         """Call the LLM and return (parsed_json, raw_text)."""
-        raw = self.llm.generate(
-            prompt,
+        raw = _generate_with_retry(
+            llm=self.llm,
+            label=stage_name,
+            prompt=prompt,
             system_prompt=system_prompt,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
-        return parse_json_object(raw), raw
+        parsed = _parse_or_repair_json(
+            llm=self.llm,
+            raw=raw,
+            stage_name=stage_name,
+            temperature=0.0,
+            max_tokens=self.max_tokens,
+        )
+        return parsed, raw
 
     def _system_prompt(self, base_prompt: str) -> str:
         if not self.prompt_addendum:
@@ -279,13 +363,24 @@ def _run_parallel_agents(
 
     def _call(agent_cfg: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
         """Single-agent wrapper used inside the thread pool."""
-        raw = llm.generate(
-            agent_cfg["prompt"],
+        logger.info("Slot=%s agent=%s start", slot.slot_id, agent_cfg["stage_name"])
+        raw = _generate_with_retry(
+            llm=llm,
+            label=agent_cfg["stage_name"],
+            prompt=agent_cfg["prompt"],
             system_prompt=system_prompt_fn(agent_cfg["system_prompt"]),
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        return agent_cfg["stage_name"], parse_json_object(raw), raw
+        logger.info("Slot=%s agent=%s done", slot.slot_id, agent_cfg["stage_name"])
+        parsed = _parse_or_repair_json(
+            llm=llm,
+            raw=raw,
+            stage_name=agent_cfg["stage_name"],
+            temperature=0.0,
+            max_tokens=max_tokens,
+        )
+        return agent_cfg["stage_name"], parsed, raw
 
     # Build per-agent configs with slim whiteboards
     configs: list[dict[str, Any]] = []
@@ -330,8 +425,11 @@ def _run_parallel_agents(
     })
 
     with ThreadPoolExecutor(max_workers=3) as executor:
+        logger.info("Slot=%s agents=values/social/mental_health parallel start", slot.slot_id)
         futures = [executor.submit(_call, cfg) for cfg in configs]
-        return [future.result() for future in as_completed(futures)]
+        results = [future.result() for future in as_completed(futures)]
+        logger.info("Slot=%s agents=values/social/mental_health parallel done", slot.slot_id)
+        return results
 
 
 # ======================================================================
@@ -340,8 +438,8 @@ def _run_parallel_agents(
 
 def _slim_wb_for_values(wb: dict[str, Any], slot: MegaPersonaSlot) -> dict[str, Any]:
     """Values agent needs: persona context + cognition basics."""
-    cog = wb.get("cognitive_motivation_profile", {})
-    demo = wb.get("demographics", {})
+    cog = _as_dict(wb.get("cognitive_motivation_profile", {}))
+    demo = _as_dict(wb.get("demographics", {}))
     return {
         "persona_id": wb["persona_id"],
         "demographics": {
@@ -362,8 +460,8 @@ def _slim_wb_for_values(wb: dict[str, Any], slot: MegaPersonaSlot) -> dict[str, 
 
 def _slim_wb_for_social(wb: dict[str, Any], slot: MegaPersonaSlot) -> dict[str, Any]:
     """Social agent needs: demographics + cognition motivation/thinking."""
-    cog = wb.get("cognitive_motivation_profile", {})
-    demo = wb.get("demographics", {})
+    cog = _as_dict(wb.get("cognitive_motivation_profile", {}))
+    demo = _as_dict(wb.get("demographics", {}))
     return {
         "persona_id": wb["persona_id"],
         "demographics": {
@@ -386,8 +484,8 @@ def _slim_wb_for_social(wb: dict[str, Any], slot: MegaPersonaSlot) -> dict[str, 
 
 def _slim_wb_for_health(wb: dict[str, Any], slot: MegaPersonaSlot) -> dict[str, Any]:
     """Mental Health agent needs: self-regulation details + stress context."""
-    cog = wb.get("cognitive_motivation_profile", {})
-    demo = wb.get("demographics", {})
+    cog = _as_dict(wb.get("cognitive_motivation_profile", {}))
+    demo = _as_dict(wb.get("demographics", {}))
     return {
         "persona_id": wb["persona_id"],
         "demographics": {
@@ -452,8 +550,8 @@ def _hard_constraints_for_cognition(slot: MegaPersonaSlot) -> str:
 
 def _hard_constraints_for_values(wb: dict[str, Any], slot: MegaPersonaSlot) -> str:
     """Alignment hints for values based on motivation profile."""
-    cog = wb.get("cognitive_motivation_profile", {})
-    mot = cog.get("motivation_system", {})
+    cog = _as_dict(wb.get("cognitive_motivation_profile", {}))
+    mot = _as_dict(cog.get("motivation_system", {}))
     primary = mot.get("primary_drive", "mastery")
     intrinsic = mot.get("intrinsic_motivation", 0.5)
     autonomy = slot.target_axes.get("motivation_autonomy", 0.5)
@@ -520,10 +618,18 @@ def _hard_constraints_for_health(wb: dict[str, Any], slot: MegaPersonaSlot) -> s
 # ======================================================================
 
 def _pick_keys(d: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(d, dict):
+        return {}
     return {k: d[k] for k in keys if k in d}
 
 
-def _truncate(text: str, max_len: int) -> str:
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _truncate(text: Any, max_len: int) -> str:
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
     if len(text) <= max_len:
         return text
     return text[:max_len] + "…"
@@ -541,6 +647,62 @@ def parse_json_object(raw: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise AgentOutputError("agent response must be a JSON object")
     return parsed
+
+
+def _parse_or_repair_json(
+    *,
+    llm,
+    raw: str,
+    stage_name: str,
+    temperature: float,
+    max_tokens: int,
+) -> dict[str, Any]:
+    try:
+        return parse_json_object(raw)
+    except Exception as first_error:
+        logger.warning(
+            "Malformed JSON from stage=%s; requesting one syntax repair (%s: %s)",
+            stage_name,
+            type(first_error).__name__,
+            first_error,
+        )
+        repaired = _generate_with_retry(
+            llm=llm,
+            label=f"{stage_name}_json_repair",
+            prompt=_json_repair_prompt(stage_name, raw),
+            system_prompt=(
+                "You repair malformed JSON from an LLM pipeline. Return ONLY one "
+                "valid JSON object. Do not add markdown, commentary, or new fields."
+            ),
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        try:
+            return parse_json_object(repaired)
+        except Exception as second_error:
+            logger.error(
+                "JSON repair failed for stage=%s (%s: %s)",
+                stage_name,
+                type(second_error).__name__,
+                second_error,
+            )
+            raise first_error
+
+
+def _json_repair_prompt(stage_name: str, raw: str) -> str:
+    return (
+        f"Repair the malformed JSON object for stage `{stage_name}`.\n"
+        "Rules:\n"
+        "1. Return exactly one valid JSON object.\n"
+        "2. Preserve the original keys, values, and language as much as possible.\n"
+        "3. Fix only syntax problems such as missing colons, unescaped quotes, "
+        "trailing commas, or markdown fences.\n"
+        "4. Do not explain anything.\n\n"
+        "Malformed JSON:\n"
+        "```text\n"
+        f"{raw}\n"
+        "```"
+    )
 
 
 def _strip_fence(text: str) -> str:
@@ -584,3 +746,61 @@ def _extract_first_json_object(text: str) -> str:
 
 def _json_dumps(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _generate_with_retry(
+    *,
+    llm,
+    label: str,
+    prompt: str,
+    system_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    max_retries: int = 2,
+    retry_backoff_seconds: float = 1.5,
+) -> str:
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "connection",
+        "rate limit",
+        "temporarily",
+        "server",
+        "overloaded",
+    )
+    for attempt in range(max_retries + 1):
+        try:
+            return llm.generate(
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            transient = any(marker in message for marker in transient_markers)
+            if attempt >= max_retries or not transient:
+                raise
+            wait_seconds = retry_backoff_seconds * (2 ** attempt)
+            logger.warning(
+                "MegaPersona LLM transient failure; retrying stage=%s attempt=%s/%s wait=%.1fs (%s: %s)",
+                label,
+                attempt + 1,
+                max_retries,
+                wait_seconds,
+                type(exc).__name__,
+                exc,
+            )
+            time.sleep(wait_seconds)
+    raise RuntimeError("unreachable retry state")
+
+
+def _log_validation_issues(slot_id: str, report: ValidationReport) -> None:
+    for issue in report.issues[:8]:
+        logger.info(
+            "Slot=%s validation issue rule=%s severity=%s message=%s",
+            slot_id,
+            issue.rule_id,
+            issue.severity,
+            issue.message.replace("\n", " ")[:500],
+        )

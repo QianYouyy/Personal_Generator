@@ -9,11 +9,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.test_mega_persona_generator import MockMegaPersonaLLM
 from src.mega_persona import (
+    EVOLUTION_PROMPT_OPERATORS,
+    MegaEvolutionCandidate,
     MegaEvolutionConfig,
     MegaPersonaEvolver,
     build_run_manifest,
     default_genome,
+    mutate_genome,
     prompt_addendum_from_genome,
+)
+from scripts.run_mega_persona_operator_ablation import (
+    build_ablation_candidates,
+    summarize_ablation_results,
 )
 
 
@@ -157,6 +164,7 @@ def test_parallel_evolution_and_manifest():
             test_shadow_surveys=1,
             items_per_shadow_survey=6,
             max_workers=2,
+            shadow_max_workers=2,
         )
         evolver = MegaPersonaEvolver(config=config, output_dir=output_dir, simulator_llm_client=_MOCK_SIM)
         evolver.store.write_manifest(
@@ -180,6 +188,7 @@ def test_parallel_evolution_and_manifest():
             test_shadow_surveys=1,
             items_per_shadow_survey=6,
             max_workers=1,
+            shadow_max_workers=1,
         )
         resumed = MegaPersonaEvolver(
             config=resume_config,
@@ -191,18 +200,140 @@ def test_parallel_evolution_and_manifest():
 
 
 def test_prompt_addendum_from_genome():
+    assert len(EVOLUTION_PROMPT_OPERATORS) == 8
+    assert len({operator["id"] for operator in EVOLUTION_PROMPT_OPERATORS}) == 8
+    operator_instructions = " ".join(operator["instruction"] for operator in EVOLUTION_PROMPT_OPERATORS)
+    assert "deadline" in operator_instructions
+    assert "peer pressure" in operator_instructions
+    assert "failure cycle" in operator_instructions
+    assert "field lengths" in operator_instructions
+
     genome = default_genome()
     genome["prompt_profile"] = {
         "mechanism_focus": "motivational",
         "tension_level": "high",
         "specificity": "behavioral",
         "anti_stereotype": "counterexample",
+        "axis_binding": "orthogonal",
+        "coverage_strategy": "edge_cases",
+        "behavioral_signal": "mixed_evidence",
     }
     addendum = prompt_addendum_from_genome(genome)
+    assert "Respect all schema length limits" in addendum
     assert "motives" in addendum
     assert "two interacting tensions" in addendum
     assert "behaviorally testable" in addendum
     assert "counter-stereotypical" in addendum
+    assert "partially independent" in addendum
+    assert "edge cases" in addendum
+    assert "self-image and behavior evidence" in addendum
+
+
+def test_mutation_records_evolution_operator():
+    import numpy as np
+
+    mutated = mutate_genome(default_genome(), np.random.default_rng(3), 0.2)
+    operator = mutated["last_evolution_operator"]
+    assert operator["id"] in {item["id"] for item in EVOLUTION_PROMPT_OPERATORS}
+    addendum = prompt_addendum_from_genome(mutated)
+    assert "Selected evolution operator" in addendum
+    assert operator["instruction"] in addendum
+
+
+def test_mutation_modes_are_diagnostic():
+    import numpy as np
+
+    base = default_genome()
+    prompt_only = mutate_genome(
+        base,
+        np.random.default_rng(4),
+        0.2,
+        mutation_mode="prompt_only",
+        operator_id="op05_failure_recovery_cycle",
+    )
+    assert prompt_only["quota_weights"] == base["quota_weights"]
+    assert prompt_only["axis_bias"] == base["axis_bias"]
+    assert prompt_only["axis_stretch"] == base["axis_stretch"]
+    assert prompt_only["last_mutation"]["mode"] == "prompt_only"
+    assert prompt_only["last_evolution_operator"]["id"] == "op05_failure_recovery_cycle"
+
+    numeric_only = mutate_genome(
+        base,
+        np.random.default_rng(5),
+        0.2,
+        mutation_mode="numeric_only",
+    )
+    assert numeric_only["last_mutation"]["mode"] == "numeric_only"
+    assert numeric_only["last_evolution_operator"] is None
+    assert numeric_only["prompt_profile"] == base["prompt_profile"]
+    assert numeric_only["axis_bias"] != base["axis_bias"]
+
+
+def test_operator_ablation_candidate_design():
+    parent = {
+        "candidate_id": "candidate_parent",
+        "genome": default_genome(),
+    }
+    candidates = build_ablation_candidates(
+        parent_candidate=parent,
+        operators=["op01_axis_decoupling", "op02_behavioral_evidence"],
+        mutation_modes=["parent_replay", "prompt_only", "operator_only", "mixed", "numeric_only"],
+        replicates=2,
+        mutation_scale=0.08,
+        random_seed=11,
+    )
+    # parent replay and numeric_only are one per replicate; the
+    # three operator-bound modes are crossed with operators and replicates.
+    assert len(candidates) == 2 + 2 + (2 * 3 * 2)
+    assert candidates[0].genome["last_mutation"]["mode"] == "parent_replay"
+    assert candidates[0].genome["last_evolution_operator"] is None
+    assert {candidate.parent_id for candidate in candidates} == {"candidate_parent"}
+
+    modes = [candidate.genome["last_mutation"]["mode"] for candidate in candidates]
+    assert modes.count("parent_replay") == 2
+    assert modes.count("numeric_only") == 2
+    assert modes.count("prompt_only") == 4
+    assert modes.count("operator_only") == 4
+    assert modes.count("mixed") == 4
+
+    operator_ids = {
+        candidate.genome["last_evolution_operator"]["id"]
+        for candidate in candidates
+        if isinstance(candidate.genome.get("last_evolution_operator"), dict)
+    }
+    assert operator_ids == {"op01_axis_decoupling", "op02_behavioral_evidence"}
+
+
+def test_operator_ablation_summary_groups_against_parent():
+    parent = MegaEvolutionCandidate(
+        candidate_id="ablation_0000_parent_replay",
+        genome={**default_genome(), "last_mutation": {"mode": "parent_replay", "scale": 0.0}},
+        parent_id="candidate_parent",
+        fitness=0.2,
+        evaluated=True,
+    )
+    child_genome = mutate_genome(
+        default_genome(),
+        __import__("numpy").random.default_rng(2),
+        0.08,
+        mutation_mode="prompt_only",
+        operator_id="op02_behavioral_evidence",
+    )
+    child = MegaEvolutionCandidate(
+        candidate_id="ablation_0001_op02_behavioral_evidence_prompt_only_r01",
+        genome=child_genome,
+        parent_id="candidate_parent",
+        fitness=0.21,
+        evaluated=True,
+    )
+    summary = summarize_ablation_results([parent, child], parent_candidate_id="candidate_parent")
+    assert summary["parent_replay_fitness"] == 0.2
+    assert summary["parent_replay_n"] == 1
+    assert summary["parent_replay_std"] == 0.0
+    assert summary["rows"][0]["candidate_id"] == child.candidate_id
+    op_group = next(group for group in summary["groups"] if group["operator_id"] == "op02_behavioral_evidence")
+    assert op_group["beats_parent"] is True
+    assert round(op_group["delta_vs_parent"], 6) == 0.01
 
 
 def test_llm_mode_uses_prompt_genome():
@@ -238,6 +369,10 @@ def main():
     test_resume_rejects_config_mismatch()
     test_parallel_evolution_and_manifest()
     test_prompt_addendum_from_genome()
+    test_mutation_records_evolution_operator()
+    test_mutation_modes_are_diagnostic()
+    test_operator_ablation_candidate_design()
+    test_operator_ablation_summary_groups_against_parent()
     test_llm_mode_uses_prompt_genome()
     print("MegaPersona evolution tests passed.")
 

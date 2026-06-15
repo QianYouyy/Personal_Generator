@@ -306,7 +306,8 @@ and summary metrics.
 
 ## Next Experimental Extension
 
-The genome now controls coarse prompt-profile fragments for LLM mode and the
-current run artifacts can be visualized. The next extension is to let evolution
-use more granular agent-specific prompt fragments, add a stronger statistical
-report, and compare the rule-based shadow simulator with an LLM shadow simulator.
+The genome now controls prompt-profile fragments for LLM mode and records one
+selected evolution operator from a 20-item mutation prompt bank on each mutated
+candidate. Current run artifacts can be visualized. The next extension is to add
+a stronger statistical report and compare operator families across repeated
+formal runs.

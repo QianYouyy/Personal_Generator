@@ -25,14 +25,17 @@ class DiversityMetrics:
     NUM_RANDOM_POINTS = 1000   # 从10000减少到1000
     COVERAGE_TARGET = 0.99
     COVERAGE_CALIBRATION_TRIALS = 100  # 从1000减少到100
+    DEFAULT_RANDOM_SEED = 20260613
 
-    def __init__(self, coverage_radius: float = None):
+    def __init__(self, coverage_radius: float = None, random_seed: int | None = None):
         """
         Args:
             coverage_radius: Coverage 球的半径 k。
                 若为 None，则自动根据 N=25, dim=2/3 校准。
+            random_seed: 参考点采样种子。默认固定，保证同一输入重复评估一致。
         """
         self.k = coverage_radius
+        self.random_seed = self.DEFAULT_RANDOM_SEED if random_seed is None else random_seed
 
     # ------------------------------------------------------------------
     # 6 个核心指标
@@ -53,7 +56,7 @@ class DiversityMetrics:
         k = self._get_coverage_radius(n, dim)
 
         # 在单位空间 [0,1]^d 内撒点（与校准时的采样空间一致）
-        random_points = np.random.rand(self.NUM_RANDOM_POINTS, dim)
+        random_points = self._reference_points(dim, salt=1)
 
         # 用 cKDTree 加速近邻查询
         tree = cKDTree(Z)
@@ -105,7 +108,7 @@ class DiversityMetrics:
         n, dim = Z.shape
 
         # 在单位空间 [0,1]^d 内撒点
-        random_points = np.random.rand(self.NUM_RANDOM_POINTS, dim)
+        random_points = self._reference_points(dim, salt=2)
 
         tree = cKDTree(Z)
         distances, _ = tree.query(random_points, k=1)
@@ -223,7 +226,8 @@ class DiversityMetrics:
                 r_mid = (r_low + r_high) / 2.0
 
                 # 检查覆盖比例
-                random_pts = np.random.rand(cls.NUM_RANDOM_POINTS, dim)
+                rng = np.random.default_rng(20260613 + dim * 1009 + n * 9176 + len(radii))
+                random_pts = rng.random((cls.NUM_RANDOM_POINTS, dim))
                 tree = cKDTree(points)
                 dists, _ = tree.query(random_pts, k=1)
                 coverage = (dists <= r_mid).mean()
@@ -243,7 +247,11 @@ class DiversityMetrics:
         if n <= 0:
             return np.empty((0, dim))
         m = int(np.ceil(np.log2(n)))
-        sampler = qmc.Sobol(d=dim, scramble=True)
+        sampler = qmc.Sobol(
+            d=dim,
+            scramble=True,
+            seed=DiversityMetrics.DEFAULT_RANDOM_SEED + dim * 1009 + n * 9176,
+        )
         return sampler.random_base2(m=m)[:n]
 
     # ------------------------------------------------------------------
@@ -263,6 +271,10 @@ class DiversityMetrics:
             self._cached_radius[cache_key] = self.calibrate_coverage_radius(n=n, dim=dim)
             print(f"  [Evaluator] 校准完成: k = {self._cached_radius[cache_key]:.4f}")
         return self._cached_radius[cache_key]
+
+    def _reference_points(self, dim: int, salt: int) -> np.ndarray:
+        rng = np.random.default_rng(self.random_seed + dim * 1009 + salt * 9176)
+        return rng.random((self.NUM_RANDOM_POINTS, dim))
 
 
 class MultiQuestionnaireEvaluator:

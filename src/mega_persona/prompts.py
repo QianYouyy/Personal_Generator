@@ -6,6 +6,111 @@ from src.mega_persona.schema import MegaPersona
 MEGA_PERSONA_JSON_SCHEMA = MegaPersona.model_json_schema()
 
 
+DEMOGRAPHICS_SECTION_CONTRACT = """\
+Schema contract for `demographics`:
+{
+  "demographics": {
+    "age": integer from 10 to 30,
+    "grade_or_stage": one of ["middle_school", "high_school", "vocational", "undergraduate", "graduate", "early_career"],
+    "region_type": one of ["urban", "suburban", "rural", "migrant", "international"],
+    "family_context": string, 20-800 characters
+  }
+}"""
+
+
+COGNITION_SECTION_CONTRACT = """\
+Schema contract for cognition output:
+{
+  "cognitive_motivation_profile": {
+    "thinking_style": {
+      "dominant_mode": one of ["analytical", "intuitive", "associative", "practical", "reflective", "exploratory"],
+      "abstraction_level": number 0-1,
+      "ambiguity_tolerance": number 0-1,
+      "evidence_preference": one of ["data", "authority", "experience", "peer_consensus", "personal_values"],
+      "typical_blind_spot": string, 10-300 characters
+    },
+    "motivation_system": {
+      "primary_drive": one of ["mastery", "achievement", "belonging", "autonomy", "security", "recognition", "curiosity", "avoidance"],
+      "secondary_drive": string, 3-120 characters,
+      "intrinsic_motivation": number 0-1,
+      "external_pressure_sensitivity": number 0-1,
+      "failure_sensitivity": number 0-1,
+      "reward_preference": one of ["praise", "progress", "grades", "independence", "social_status", "usefulness"]
+    },
+    "learning_orientation": {
+      "goal_orientation": one of ["mastery", "performance", "avoidance", "mixed"],
+      "preferred_learning_mode": one of ["reading", "discussion", "practice", "visual", "project_based", "imitation", "trial_and_error"],
+      "attention_pattern": one of ["sustained", "bursty", "easily_shifted", "hyperfocused"],
+      "curiosity_scope": one of ["narrow_deep", "broad_shallow", "situational", "low"],
+      "help_seeking_style": one of ["proactive", "reluctant", "peer_first", "adult_first", "avoids_help"]
+    },
+    "self_regulation": {
+      "planning_style": one of ["structured", "reactive", "deadline_driven", "ritual_based", "chaotic"],
+      "persistence": number 0-1,
+      "emotional_regulation": number 0-1,
+      "metacognition": number 0-1,
+      "habit_stability": number 0-1
+    },
+    "challenge_response": {
+      "under_difficulty": one of ["doubles_down", "seeks_help", "freezes", "reframes", "distracts", "rebels"],
+      "under_criticism": one of ["defensive", "curious", "ashamed", "motivated", "dismissive"],
+      "under_success": one of ["confident", "complacent", "anxious_to_maintain", "generous", "exploratory"]
+    },
+    "decision_pattern": {
+      "risk_appetite": number 0-1,
+      "time_horizon": one of ["short", "medium", "long"],
+      "tradeoff_style": one of ["safe_choice", "optimize_score", "protect_identity", "seek_growth", "maintain_relationships"],
+      "typical_rationale": string, 20-500 characters
+    },
+    "narrative": string, 250-1800 characters
+  },
+  "derived_academic_tendency": {
+    "likely_performance_band": one of ["poor", "low", "mid", "high"],
+    "reasoning": string, 40-800 characters
+  }
+}"""
+
+
+VALUES_SECTION_CONTRACT = """\
+Schema contract for `values_identity`:
+{
+  "values_identity": {
+    "core_values": list of 2-6 strings,
+    "identity_anchor": string, 20-400 characters,
+    "moral_tension": string, 20-500 characters,
+    "aspiration": string, 20-500 characters
+  }
+}"""
+
+
+SOCIAL_SECTION_CONTRACT = """\
+Schema contract for `social_creative_profile`:
+{
+  "social_creative_profile": {
+    "social_energy": number 0-1,
+    "collaboration_style": one of ["leader", "supporter", "observer", "challenger", "mediator", "solo"],
+    "expressiveness": number 0-1,
+    "creative_mode": one of ["original", "remixing", "practical", "aesthetic", "strategic", "low_expression"],
+    "peer_influence_sensitivity": number 0-1,
+    "narrative": string, 120-1200 characters
+  }
+}"""
+
+
+MENTAL_HEALTH_SECTION_CONTRACT = """\
+Schema contract for `mental_health_context`:
+{
+  "mental_health_context": {
+    "stress_load": number 0-1,
+    "resilience": number 0-1,
+    "coping_style": one of ["problem_solving", "emotional_support", "avoidance", "humor", "control", "withdrawal"],
+    "protective_factors": list of 1-5 strings,
+    "risk_factors": list of 1-5 strings,
+    "narrative": string, 120-1200 characters
+  }
+}"""
+
+
 COGNITION_MOTIVATION_AGENT_SYSTEM_PROMPT = """You are the Cognition & Motivation Agent in a multi-agent persona pipeline.
 
 Your job is not to write an academic resume. Your job is to explain the person's
@@ -50,6 +155,8 @@ Adaptive constraints:
 Hard constraints (MUST satisfy):
 {hc_block}
 
+{COGNITION_SECTION_CONTRACT}
+
 Required output keys:
 - cognitive_motivation_profile
 - derived_academic_tendency
@@ -81,6 +188,8 @@ Target slot:
 ```json
 {slot_context_json}
 ```
+
+{DEMOGRAPHICS_SECTION_CONTRACT}
 
 Required output key:
 - demographics
@@ -120,6 +229,8 @@ Target slot:
 {slot_context_json}
 ```{hc_block}
 
+{VALUES_SECTION_CONTRACT}
+
 Required output key:
 - values_identity
 
@@ -158,6 +269,8 @@ Target slot:
 {slot_context_json}
 ```{hc_block}
 
+{SOCIAL_SECTION_CONTRACT}
+
 Required output key:
 - social_creative_profile
 
@@ -195,6 +308,8 @@ Target slot:
 ```json
 {slot_context_json}
 ```{hc_block}
+
+{MENTAL_HEALTH_SECTION_CONTRACT}
 
 Required output key:
 - mental_health_context

@@ -7,7 +7,11 @@ behavior in another channel. The gap between declared axes and behavioral axes
 is the key experimental signal.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+import logging
+import re
+import time
 from typing import Any
 
 import numpy as np
@@ -18,6 +22,9 @@ from src.mega_persona.shadow_survey import (
     score_shadow_survey,
 )
 from src.mega_persona.slots import AXIS_NAMES
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -270,22 +277,93 @@ class LLMShadowSimulator:
         llm_client,
         temperature: float = 0.3,
         max_tokens: int = 1500,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 1.5,
+        max_workers: int = 1,
     ):
         if llm_client is None:
             raise ValueError("llm_client is required for LLMShadowSimulator")
         self.llm = llm_client
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
+        self.max_workers = max(1, int(max_workers))
 
     def simulate_population(
         self,
         personas: list[MegaPersona],
         surveys: list[ShadowSurvey],
     ) -> list[ShadowSurveySimulation]:
+        total_calls = len(personas) * len(surveys)
+        logger.info(
+            "Shadow simulation start personas=%s surveys=%s calls=%s max_workers=%s",
+            len(personas),
+            len(surveys),
+            total_calls,
+            self.max_workers,
+        )
+        if self.max_workers <= 1 or total_calls <= 1:
+            return self._simulate_population_sequential(personas, surveys, total_calls)
+
+        tasks = []
+        call_index = 0
+        for persona_index, persona in enumerate(personas, start=1):
+            for survey_index, survey in enumerate(surveys, start=1):
+                call_index += 1
+                tasks.append((call_index, persona_index, survey_index, persona, survey))
+
+        ordered: list[ShadowSurveySimulation | None] = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, total_calls)) as executor:
+            futures = {}
+            for call_index, persona_index, survey_index, persona, survey in tasks:
+                logger.info(
+                    "Shadow simulation call %s/%s queued persona=%s survey=%s (%s/%s)",
+                    call_index,
+                    total_calls,
+                    persona.persona_id,
+                    survey.survey_id,
+                    survey_index,
+                    len(surveys),
+                )
+                futures[executor.submit(self.simulate_persona, persona, survey)] = call_index
+            for future in as_completed(futures):
+                call_index = futures[future]
+                ordered[call_index - 1] = future.result()
+                logger.info("Shadow simulation call %s/%s done", call_index, total_calls)
+
+        simulations = [simulation for simulation in ordered if simulation is not None]
+        logger.info("Shadow simulation done calls=%s", len(simulations))
+        return simulations
+
+    def _simulate_population_sequential(
+        self,
+        personas: list[MegaPersona],
+        surveys: list[ShadowSurvey],
+        total_calls: int,
+    ) -> list[ShadowSurveySimulation]:
         simulations: list[ShadowSurveySimulation] = []
-        for persona in personas:
-            for survey in surveys:
+        call_index = 0
+        for persona_index, persona in enumerate(personas, start=1):
+            logger.info(
+                "Shadow simulation persona %s/%s id=%s",
+                persona_index,
+                len(personas),
+                persona.persona_id,
+            )
+            for survey_index, survey in enumerate(surveys, start=1):
+                call_index += 1
+                logger.info(
+                    "Shadow simulation call %s/%s persona=%s survey=%s (%s/%s)",
+                    call_index,
+                    total_calls,
+                    persona.persona_id,
+                    survey.survey_id,
+                    survey_index,
+                    len(surveys),
+                )
                 simulations.append(self.simulate_persona(persona, survey))
+        logger.info("Shadow simulation done calls=%s", len(simulations))
         return simulations
 
     def simulate_persona(
@@ -298,11 +376,15 @@ class LLMShadowSimulator:
         All items in the survey are sent in a single LLM call to save cost.
         """
         user_prompt = _llm_simulator_user_prompt(persona, survey)
-        raw = self.llm.generate(
-            user_prompt,
+        raw = _generate_with_retry(
+            llm=self.llm,
+            prompt=user_prompt,
             system_prompt=_LLM_SIMULATOR_SYSTEM_PROMPT,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            max_retries=self.max_retries,
+            retry_backoff_seconds=self.retry_backoff_seconds,
+            label=f"persona={persona.persona_id} survey={survey.survey_id}",
         )
         responses = _parse_simulator_response(raw, survey)
         scores = score_shadow_survey(survey, responses)
@@ -324,6 +406,54 @@ class LLMShadowSimulator:
         )
 
 
+def _generate_with_retry(
+    *,
+    llm,
+    prompt: str,
+    system_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    max_retries: int,
+    retry_backoff_seconds: float,
+    label: str,
+) -> str:
+    """Retry transient LLM failures so one timeout does not zero a whole seed."""
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "connection",
+        "rate limit",
+        "temporarily",
+        "server",
+        "overloaded",
+    )
+    for attempt in range(max_retries + 1):
+        try:
+            return llm.generate(
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            transient = any(marker in message for marker in transient_markers)
+            if attempt >= max_retries or not transient:
+                raise
+            wait_seconds = retry_backoff_seconds * (2 ** attempt)
+            logger.warning(
+                "Shadow simulator transient failure; retrying attempt=%s/%s wait=%.1fs %s (%s: %s)",
+                attempt + 1,
+                max_retries,
+                wait_seconds,
+                label,
+                type(exc).__name__,
+                exc,
+            )
+            time.sleep(wait_seconds)
+    raise RuntimeError("unreachable retry state")
+
+
 def _parse_simulator_response(
     raw: str,
     survey: ShadowSurvey,
@@ -340,26 +470,54 @@ def _parse_simulator_response(
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
+    parsed = None
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         start = text.find("{")
-        if start == -1:
-            raise ValueError(f"LLM simulator did not return a JSON object: {raw[:200]}")
-        depth = 0
-        for idx in range(start, len(text)):
-            if text[idx] == "{":
-                depth += 1
-            elif text[idx] == "}":
-                depth -= 1
-                if depth == 0:
-                    parsed = json.loads(text[start:idx + 1])
-                    break
-        else:
-            raise ValueError(f"LLM simulator returned incomplete JSON: {raw[:200]}")
+        if start != -1:
+            depth = 0
+            in_string = False
+            escaped = False
+            for idx in range(start, len(text)):
+                char = text[idx]
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            parsed = json.loads(text[start:idx + 1])
+                        except json.JSONDecodeError:
+                            parsed = None
+                        break
+        if parsed is None:
+            logger.warning(
+                "Malformed simulator JSON for survey=%s; using regex/neutral fallback (%s: %s)",
+                survey.survey_id,
+                type(exc).__name__,
+                exc,
+            )
+            return _fallback_simulator_responses(text, survey)
 
     if not isinstance(parsed, dict):
-        raise ValueError(f"LLM simulator response must be a JSON object, got {type(parsed)}")
+        logger.warning(
+            "Simulator response for survey=%s was %s, expected object; using neutral fallback",
+            survey.survey_id,
+            type(parsed).__name__,
+        )
+        return {item.item_id: 3 for item in survey.items}
 
     responses: dict[str, int] = {}
     for item in survey.items:
@@ -369,4 +527,24 @@ def _parse_simulator_response(
         except (ValueError, TypeError):
             value = 3
         responses[item.item_id] = max(1, min(5, value))
+    return responses
+
+
+def _fallback_simulator_responses(text: str, survey: ShadowSurvey) -> dict[str, int]:
+    responses: dict[str, int] = {}
+    extracted = 0
+    for item in survey.items:
+        pattern = rf'["\']{re.escape(item.item_id)}["\']\s*[:=]?\s*["\']?([1-5])'
+        match = re.search(pattern, text)
+        if match:
+            responses[item.item_id] = int(match.group(1))
+            extracted += 1
+        else:
+            responses[item.item_id] = 3
+    logger.warning(
+        "Simulator fallback recovered %s/%s responses for survey=%s",
+        extracted,
+        len(survey.items),
+        survey.survey_id,
+    )
     return responses

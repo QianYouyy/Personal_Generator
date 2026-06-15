@@ -45,6 +45,8 @@ class MockMegaPersonaLLM:
             )
         if "Repair this MegaPersona JSON" in prompt:
             return json.dumps(self.sample)
+        if "Repair the malformed JSON object" in prompt:
+            return self._payload("demographics")
         raise AssertionError(f"Unexpected prompt: {prompt[:120]}")
 
     def _payload(self, key: str) -> str:
@@ -73,6 +75,55 @@ def test_generate_one_valid_persona():
         "mental_health",
     }
     assert len(llm.calls) == 5
+
+
+def test_malformed_agent_json_is_repaired():
+    class MalformedOnceLLM(MockMegaPersonaLLM):
+        def __init__(self):
+            super().__init__()
+            self.sent_bad_demographics = False
+
+        def generate(self, prompt, system_prompt=None, **kwargs):
+            if (
+                "Create ONLY the `demographics` section" in prompt
+                and not self.sent_bad_demographics
+            ):
+                self.sent_bad_demographics = True
+                self.calls.append(
+                    {"prompt": prompt, "system_prompt": system_prompt, "kwargs": kwargs}
+                )
+                return '{"demographics" {"age": 16}}'
+            return super().generate(prompt, system_prompt=system_prompt, **kwargs)
+
+    slots = SlotSampler().sample(1, seed=9)
+    llm = MalformedOnceLLM()
+    result = MegaPersonaGenerator(llm).generate_one(slots[0])
+
+    assert result.is_valid
+    assert any("Repair the malformed JSON object" in call["prompt"] for call in llm.calls)
+
+
+def test_transient_agent_failure_is_retried():
+    class TimeoutOnceLLM(MockMegaPersonaLLM):
+        def __init__(self):
+            super().__init__()
+            self.failed_once = False
+
+        def generate(self, prompt, system_prompt=None, **kwargs):
+            if (
+                "Create ONLY the `demographics` section" in prompt
+                and not self.failed_once
+            ):
+                self.failed_once = True
+                raise TimeoutError("Request timed out.")
+            return super().generate(prompt, system_prompt=system_prompt, **kwargs)
+
+    slots = SlotSampler().sample(1, seed=13)
+    llm = TimeoutOnceLLM()
+    result = MegaPersonaGenerator(llm).generate_one(slots[0])
+
+    assert result.is_valid
+    assert llm.failed_once
 
 
 def test_prompt_addendum_is_injected():
@@ -106,6 +157,8 @@ def test_generate_batch_and_evaluate():
 def main():
     test_parse_json_object_from_fence()
     test_generate_one_valid_persona()
+    test_malformed_agent_json_is_repaired()
+    test_transient_agent_failure_is_retried()
     test_prompt_addendum_is_injected()
     test_generate_batch_and_evaluate()
     print("MegaPersona generator tests passed.")

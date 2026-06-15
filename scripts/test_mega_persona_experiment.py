@@ -205,6 +205,58 @@ def test_shadow_behavior_simulation():
     assert "DERIVED ACADEMIC TENDENCY" not in prompt
 
 
+def test_shadow_simulator_malformed_json_fallback():
+    class BadJsonLLM:
+        def generate(self, prompt: str, system_prompt: str = "", temperature: float = 0.0,
+                     max_tokens: int = 1500) -> str:
+            import re
+            ids = [
+                match[0]
+                for match in re.findall(
+                    r'"([^"]+)":\s*"([^"]*)"',
+                    prompt.split("ITEMS:")[-1],
+                )
+            ]
+            if not ids:
+                return "not json"
+            return f'{{"{ids[0]}" 4, "{ids[1]}": 2}}'
+
+    persona = MegaPersona.model_validate(sample_persona())
+    survey = build_initial_shadow_surveys(num_surveys=1, items_per_survey=6)[0]
+    simulation = LLMShadowSimulator(BadJsonLLM()).simulate_persona(persona, survey)
+
+    assert set(simulation.responses) == set(survey.item_ids())
+    assert simulation.responses[survey.item_ids()[0]] == 4
+    assert simulation.responses[survey.item_ids()[1]] == 2
+    assert all(1 <= value <= 5 for value in simulation.responses.values())
+
+
+def test_shadow_simulator_retries_transient_failure():
+    class TimeoutOnceLLM(_MockLLMClient):
+        def __init__(self):
+            super().__init__()
+            self.failures = 0
+
+        def generate(self, prompt: str, system_prompt: str = "", temperature: float = 0.0,
+                     max_tokens: int = 1500) -> str:
+            if self.failures == 0:
+                self.failures += 1
+                raise TimeoutError("Request timed out.")
+            return super().generate(prompt, system_prompt, temperature, max_tokens)
+
+    persona = MegaPersona.model_validate(sample_persona())
+    survey = build_initial_shadow_surveys(num_surveys=1, items_per_survey=6)[0]
+    llm = TimeoutOnceLLM()
+    simulation = LLMShadowSimulator(
+        llm,
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    ).simulate_persona(persona, survey)
+
+    assert llm.failures == 1
+    assert set(simulation.responses) == set(survey.item_ids())
+
+
 def test_rule_based_baseline_builder():
     slots = SlotSampler().sample(6, seed=31)
     personas = RuleBasedMegaPersonaBuilder().build_population(slots)
@@ -228,6 +280,8 @@ def main():
     test_shadow_surveys()
     test_population_evaluation()
     test_shadow_behavior_simulation()
+    test_shadow_simulator_malformed_json_fallback()
+    test_shadow_simulator_retries_transient_failure()
     test_rule_based_baseline_builder()
     print("MegaPersona experiment tests passed.")
 

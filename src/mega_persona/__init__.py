@@ -14,6 +14,7 @@ from src.mega_persona.experiment import (
     write_experiment_artifacts,
 )
 from src.mega_persona.evolution import (
+    EVOLUTION_PROMPT_OPERATORS,
     MegaEvolutionCandidate,
     MegaEvolutionConfig,
     MegaPersonaEvolver,
@@ -64,6 +65,7 @@ from src.mega_persona.visualization import visualize_result_path
 __all__ = [
     "AXIS_NAMES",
     "AgentOutputError",
+    "EVOLUTION_PROMPT_OPERATORS",
     "MegaPersonaEvaluation",
     "MegaPersonaExperimentConfig",
     "MegaPersonaExperimentRun",
