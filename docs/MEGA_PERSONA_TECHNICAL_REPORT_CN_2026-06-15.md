@@ -25,7 +25,7 @@
 ```text
 进化层
   优化对象：prompt profile、operator、采样策略、轴变换
-  方法：Open-Evolve 风格的 population / mutation / selection
+  方法：接入 `src.open_evolve.engine.OpenEvolve` 的岛屿式进化优化
 
 生成层
   方法：HACHIMI-style 多 Agent 流水线
@@ -99,6 +99,18 @@ fitness = schema_fitness
 
 这让我们可以区分：提升到底来自提示词、采样数值，还是两者组合。
 
+### 2.4 OpenEvolve 接入方式
+
+最新代码已经将 MegaPersona 主进化入口替换为仓库内 `src.open_evolve.engine.OpenEvolve` 引擎调度。具体做法是：
+
+- MegaPersona 仍固定多 Agent schema 与评估逻辑，避免 LLM 直接改坏主流程。
+- 将 MegaPersona genome 序列化为 OpenEvolve 的候选 `code` 字段。
+- 使用 OpenEvolve 负责 island、metric elites、mutation、checkpoint 与 resume。
+- 使用 MegaPersona evaluator 负责生成、schema 校验、shadow survey validation fitness 和 sealed test。
+- 主入口为 `scripts/run_mega_persona_evolution.py`。
+
+因此当前项目不是只“仿照 Open-Evolve”，而是由 OpenEvolve 引擎直接承担进化机制；MegaPersona 侧只保留 genome、评估和结果持久化。
+
 ## 三、实验方案设计
 
 ### 3.1 数据拆分
@@ -134,7 +146,7 @@ selection 只使用 validation；sealed test 只用于最终报告。这是为�
 
 - `run_mega_persona_operator_ablation.py --resume`
 - `--shadow-max-workers`，用于 shadow survey 内部并发加速
-- resume 时允许调整 `max_workers` 和 `shadow_max_workers`
+- resume 时允许调整 shadow survey 内部并发数；主进化并发由 OpenEvolve 的 `children_per_island` 控制
 
 ### 3.3 Operator 消融
 
@@ -457,18 +469,18 @@ Parent replay baseline：
 已完成：
 
 - persona 内部后 3 个 agent 并发
-- candidate 级 `--max-workers`
+- OpenEvolve island/child 级进化调度
 - 新增 shadow survey 内部并发参数 `--shadow-max-workers`
 - 新增 ablation resume 支持
 
 建议使用：
 
 ```bash
---max-workers 1
+--children-per-island 1
 --shadow-max-workers 4
 ```
 
-这样 candidate 仍然顺序评估，保证 checkpoint 清晰；但每个 candidate 内部的 shadow survey 请求可以并行，速度更快。
+这样每个 island 每代只生成 1 个 child，便于观察进化轨迹；但每个 candidate 内部的 shadow survey 请求可以并行，速度更快。
 
 ## 十、当前阶段性判断
 

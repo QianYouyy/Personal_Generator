@@ -1,9 +1,9 @@
-"""Durable Open-Evolve style optimization for MegaPersona experiments.
+"""MegaPersona genome utilities, evaluator backend, and artifact store.
 
-The evolvable surface is deliberately narrow and JSON-serializable. The fixed
-MegaPersona architecture stays stable while evolution tunes sampling strategy,
-axis transforms, and shadow-survey selection. The score aggregation weights are
-fixed so candidates cannot improve by changing the ruler used to judge them.
+The evolvable surface is deliberately narrow and JSON-serializable. The shared
+OpenEvolve engine mutates these genomes through src.mega_persona.openevolve_adapter,
+while this module keeps the fixed MegaPersona architecture, scientific scoring,
+and durable evaluation artifacts.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -95,7 +95,7 @@ class MegaEvolutionCandidate:
 
 
 class MegaPersonaEvolver:
-    """Persistent evolutionary optimizer for MegaPersona candidate genomes."""
+    """Evaluation and persistence backend for OpenEvolve MegaPersona genomes."""
 
     def __init__(
         self,
@@ -160,39 +160,11 @@ class MegaPersonaEvolver:
             logger.info("Frozen shadow survey hashes: %s", self.survey_hashes)
 
     def run(self) -> MegaEvolutionCandidate:
-        logger.info("Starting evolution loop target_generations=%s", self.config.generations)
-        while self.generation < self.config.generations:
-            logger.info("Generation %s: evaluating population", self.generation)
-            self._evaluate_population()
-            self._write_generation_summary()
-            best = self.best_candidate()
-            logger.info(
-                "Generation %s complete: best=%s fitness=%.4f",
-                self.generation,
-                best.candidate_id,
-                best.fitness or 0.0,
-            )
-            if self.generation >= self.config.generations:
-                break
-            self.population = self._next_generation()
-            self.generation += 1
-            self._save_checkpoint()
-
-        logger.info("Final population evaluation at generation %s", self.generation)
-        self._evaluate_population()
-        self._write_generation_summary()
-        self._save_checkpoint()
-        best = self.best_candidate()
-        logger.info(
-            "Selected best candidate=%s validation_fitness=%.4f; running sealed test",
-            best.candidate_id,
-            best.fitness or 0.0,
+        raise RuntimeError(
+            "MegaPersonaEvolver.run() has been retired. Use "
+            "MegaPersonaOpenEvolveRunner or scripts/run_mega_persona_evolution.py, "
+            "which run through src.open_evolve.engine.OpenEvolve."
         )
-        final_test_report = self.evaluate_final_test(best)
-        self.store.write_final_test_report(final_test_report)
-        self.store.write_final_summary(best, self.population, self.config, final_test_report)
-        logger.info("Evolution finished. Final artifacts written to %s", self.output_dir)
-        return best
 
     def best_candidate(self) -> MegaEvolutionCandidate:
         evaluated = [candidate for candidate in self.population if candidate.evaluated]

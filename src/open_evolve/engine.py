@@ -289,13 +289,19 @@ class OpenEvolve:
         mutator: Mutator,
         evaluator: PersonaCodeEvaluator,
         questionnaires: List,
+        seed_codes: Optional[Dict[str, str]] = None,
+        initial_seed_distribution: Optional[Dict[str, int]] = None,
+        num_islands: Optional[int] = None,
+        checkpoint_path: Optional[str | Path] = None,
+        initialize: bool = True,
     ):
         self.mutator = mutator
         self.evaluator = evaluator
         self.questionnaires = questionnaires
+        self.seed_codes = seed_codes or SEED_CODES
 
         cfg = get_config()
-        self.num_islands = cfg.get("open_evolve.num_islands", 10)
+        self.num_islands = num_islands or cfg.get("open_evolve.num_islands", 10)
         self.extinction_interval = cfg.get("open_evolve.extinction_interval", 100)
         self.extinction_hours = cfg.get("open_evolve.extinction_interval_hours", 8)
         # 动态灭绝阈值：根据总轮数自适应（至少2轮）
@@ -303,12 +309,12 @@ class OpenEvolve:
         # 灭绝模式: "interval" | "stagnation" | "adaptive"
         self.extinction_mode = cfg.get("open_evolve.extinction_mode", "adaptive")
 
-        distribution = cfg.get("open_evolve.initial_seed_distribution", {
+        distribution = initial_seed_distribution or cfg.get("open_evolve.initial_seed_distribution", {
             "seed1": 4, "seed2": 3, "seed3": 3,
         })
 
         self.islands = [Island(i) for i in range(self.num_islands)]
-        self._initialize_islands(distribution)
+        self.seed_baselines: Dict[str, List[Dict]] = {}
 
         self.generation = 0
         self.start_time = time.time()
@@ -316,23 +322,28 @@ class OpenEvolve:
         self._extinction_log: List[int] = []  # 记录灭绝发生的轮数
         
         # checkpoint 保存到统一输出目录
-        from src.utils.output_manager import output_manager
-        if output_manager.base_dir is None:
-            output_manager.setup("default")
-        self.checkpoint_path = output_manager.outputs_dir
+        if checkpoint_path is not None:
+            self.checkpoint_path = Path(checkpoint_path)
+            self.checkpoint_path.mkdir(parents=True, exist_ok=True)
+        else:
+            from src.utils.output_manager import output_manager
+            if output_manager.base_dir is None:
+                output_manager.setup("default")
+            self.checkpoint_path = output_manager.outputs_dir
+
+        if initialize:
+            self._initialize_islands(distribution)
 
     def _initialize_islands(self, distribution: Dict[str, int]):
         """初始种子轮询分配."""
         seed_list = []
         for seed_name, count in distribution.items():
-            code = SEED_CODES.get(seed_name, SEED_CODES["seed1"])
+            fallback_code = next(iter(self.seed_codes.values()))
+            code = self.seed_codes.get(seed_name, fallback_code)
             for _ in range(count):
                 seed_list.append((seed_name, code))
 
         logger.info(f"初始化 {self.num_islands} 个岛屿...")
-        
-        # 记录每个seed的baseline（用于最终对比）
-        self.seed_baselines: Dict[str, List[Dict]] = {}
         
         for i, island in enumerate(self.islands):
             seed_name, code = seed_list[i % len(seed_list)]
@@ -723,7 +734,7 @@ class OpenEvolve:
         logger.section("🧬 灭绝逻辑配置")
         
         # 根据总轮数动态调整
-        if max_generations:
+        if max_generations is not None:
             # 自适应阈值
             adaptive_interval = max(2, max_generations // 2)
             adaptive_stagnation = max(2, max_generations // 3)
@@ -784,17 +795,19 @@ class OpenEvolve:
         logger.section("Open-Evolve 进化引擎启动")
         logger.info(f"配置: 岛屿={self.num_islands}, 最大轮数={max_generations}")
         logger.info(f"大群体进化: 每岛 {children_per_island} 候选 × {self.num_islands} 岛屿 = {children_per_island * self.num_islands} 评估/轮")
-        logger.info(f"人格数: {self.evaluator.num_personas} 人/问卷 | 问卷数: {len(self.questionnaires)} 份")
+        num_personas = getattr(self.evaluator, "num_personas", "?")
+        logger.info(f"人格数: {num_personas} 人/问卷 | 问卷数: {len(self.questionnaires)} 份")
         
         # 计算 API 调用量
-        evals_per_round = self.num_islands * children_per_island * len(self.questionnaires) * self.evaluator.num_personas
-        logger.info(f"每轮 API 调用: {self.num_islands} 岛 × {children_per_island} 候选 × {len(self.questionnaires)} 问卷 × {self.evaluator.num_personas} 人格 = {evals_per_round} 次")
+        if isinstance(num_personas, int):
+            evals_per_round = self.num_islands * children_per_island * len(self.questionnaires) * num_personas
+            logger.info(f"每轮 API 调用: {self.num_islands} 岛 × {children_per_island} 候选 × {len(self.questionnaires)} 问卷 × {num_personas} 人格 = {evals_per_round} 次")
         
         # 打印灭绝逻辑
         self._print_extinction_logic(max_generations)
 
         while True:
-            if max_generations and self.generation >= max_generations:
+            if max_generations is not None and self.generation >= max_generations:
                 logger.success(f"达到最大轮数 {max_generations}，停止进化")
                 break
 
@@ -884,6 +897,9 @@ class OpenEvolve:
         
         path = self.checkpoint_path / f"checkpoint_gen_{self.generation}.json"
         with open(path, "w", encoding="utf-8") as f:
+            json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+        latest_path = self.checkpoint_path / "checkpoint.json"
+        with open(latest_path, "w", encoding="utf-8") as f:
             json.dump(checkpoint, f, ensure_ascii=False, indent=2)
         logger.debug(f"Checkpoint 已保存: {path}")
         

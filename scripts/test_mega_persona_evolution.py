@@ -1,4 +1,4 @@
-"""Smoke tests for durable MegaPersona evolution."""
+"""Smoke tests for MegaPersona's OpenEvolve integration."""
 
 import json
 from pathlib import Path
@@ -12,8 +12,7 @@ from src.mega_persona import (
     EVOLUTION_PROMPT_OPERATORS,
     MegaEvolutionCandidate,
     MegaEvolutionConfig,
-    MegaPersonaEvolver,
-    build_run_manifest,
+    MegaPersonaOpenEvolveRunner,
     default_genome,
     mutate_genome,
     prompt_addendum_from_genome,
@@ -46,60 +45,68 @@ class _MockSimulatorLLM:
 _MOCK_SIM = _MockSimulatorLLM()
 
 
-def test_evolution_persistence_and_resume():
+def test_openevolve_persistence_and_resume():
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir) / "evolution"
         config = MegaEvolutionConfig(
             n=4,
             seeds=(17,),
-            generations=0,
-            population_size=3,
-            children_per_generation=2,
+            generations=1,
+            population_size=2,
+            children_per_generation=1,
             elite_count=1,
             shadow_surveys=2,
             items_per_shadow_survey=6,
             random_seed=9,
         )
-        first = MegaPersonaEvolver(config=config, output_dir=output_dir, simulator_llm_client=_MOCK_SIM).run()
+        first = MegaPersonaOpenEvolveRunner(
+            config=config,
+            output_dir=output_dir,
+            simulator_llm_client=_MOCK_SIM,
+            children_per_island=1,
+        ).run()
         assert first.fitness is not None
-        assert (output_dir / "checkpoint.json").exists()
+        mega_eval_dir = output_dir / "mega_eval"
+        assert (output_dir / "open_evolve" / "checkpoint.json").exists()
         assert (output_dir / "final_summary.json").exists()
-        assert (output_dir / "final_test_report.json").exists()
-        assert (output_dir / "shadow_surveys" / "train.json").exists()
-        assert (output_dir / "shadow_surveys" / "validation.json").exists()
-        assert (output_dir / "shadow_surveys" / "test.json").exists()
-        assert (output_dir / "shadow_surveys" / "hashes.json").exists()
-        evals_after_first = sorted((output_dir / "evaluations").glob("eval_*"))
-        assert len(evals_after_first) == 3
+        assert (mega_eval_dir / "final_summary.json").exists()
+        assert (mega_eval_dir / "final_test_report.json").exists()
+        assert (mega_eval_dir / "shadow_surveys" / "train.json").exists()
+        assert (mega_eval_dir / "shadow_surveys" / "validation.json").exists()
+        assert (mega_eval_dir / "shadow_surveys" / "test.json").exists()
+        assert (mega_eval_dir / "shadow_surveys" / "hashes.json").exists()
+        evals_after_first = sorted((mega_eval_dir / "evaluations").glob("eval_*"))
+        assert len(evals_after_first) >= 2
 
-        checkpoint = json.loads((output_dir / "checkpoint.json").read_text(encoding="utf-8"))
-        assert checkpoint["evaluation_count"] == 3
+        checkpoint = json.loads((mega_eval_dir / "checkpoint.json").read_text(encoding="utf-8"))
+        assert checkpoint["evaluation_count"] >= 2
         assert set(checkpoint["survey_hashes"]) == {"train", "validation", "test"}
 
         resume_config = MegaEvolutionConfig(
             n=4,
             seeds=(17,),
-            generations=1,
-            population_size=3,
-            children_per_generation=2,
+            generations=2,
+            population_size=2,
+            children_per_generation=1,
             elite_count=1,
             shadow_surveys=2,
             items_per_shadow_survey=6,
             random_seed=9,
         )
-        second = MegaPersonaEvolver(
+        second = MegaPersonaOpenEvolveRunner(
             config=resume_config,
             output_dir=output_dir,
             resume=True,
             simulator_llm_client=_MOCK_SIM,
+            children_per_island=1,
         ).run()
         assert second.fitness is not None
-        evals_after_resume = sorted((output_dir / "evaluations").glob("eval_*"))
+        evals_after_resume = sorted((mega_eval_dir / "evaluations").glob("eval_*"))
         assert len(evals_after_resume) > len(evals_after_first)
 
         final_summary = json.loads((output_dir / "final_summary.json").read_text(encoding="utf-8"))
         assert final_summary["best"]["fitness"] is not None
-        result_path = next((output_dir / "evaluations").glob("eval_*/*"))
+        result_path = next((mega_eval_dir / "evaluations").glob("eval_*/*"))
         result = json.loads(result_path.read_text(encoding="utf-8"))
         seed_result = result["per_seed"][0]
         assert "train_shadow_behavior" in seed_result
@@ -110,7 +117,7 @@ def test_evolution_persistence_and_resume():
         assert "shadow_survey_hashes" in seed_result
         assert "validation_shadow_alignment.mean" in result["metrics"]
         assert "test_shadow_alignment.mean" not in result["metrics"]
-        test_report = json.loads((output_dir / "final_test_report.json").read_text(encoding="utf-8"))
+        test_report = json.loads((mega_eval_dir / "final_test_report.json").read_text(encoding="utf-8"))
         assert test_report["test_used_for_selection"] is False
         assert "test_shadow_alignment.mean" in test_report["metrics"]
         assert "test_behavior_coverage.mean" in test_report["metrics"]
@@ -122,42 +129,53 @@ def test_resume_rejects_config_mismatch():
         config = MegaEvolutionConfig(
             n=4,
             seeds=(17,),
-            generations=0,
-            population_size=3,
-            children_per_generation=2,
+            generations=1,
+            population_size=2,
+            children_per_generation=1,
             elite_count=1,
             shadow_surveys=2,
             items_per_shadow_survey=6,
         )
-        MegaPersonaEvolver(config=config, output_dir=output_dir, simulator_llm_client=_MOCK_SIM).run()
+        MegaPersonaOpenEvolveRunner(
+            config=config,
+            output_dir=output_dir,
+            simulator_llm_client=_MOCK_SIM,
+            children_per_island=1,
+        ).run()
 
         mismatched = MegaEvolutionConfig(
             n=5,
             seeds=(17,),
-            generations=1,
-            population_size=3,
-            children_per_generation=2,
+            generations=2,
+            population_size=2,
+            children_per_generation=1,
             elite_count=1,
             shadow_surveys=2,
             items_per_shadow_survey=6,
         )
         try:
-            MegaPersonaEvolver(config=mismatched, output_dir=output_dir, resume=True, simulator_llm_client=_MOCK_SIM)
+            MegaPersonaOpenEvolveRunner(
+                config=mismatched,
+                output_dir=output_dir,
+                resume=True,
+                simulator_llm_client=_MOCK_SIM,
+                children_per_island=1,
+            )
         except ValueError as exc:
             assert "Resume config does not match checkpoint" in str(exc)
         else:
             raise AssertionError("Expected resume config mismatch to fail")
 
 
-def test_parallel_evolution_and_manifest():
+def test_openevolve_manifest_and_artifacts():
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir) / "parallel_evolution"
         config = MegaEvolutionConfig(
             n=4,
             seeds=(17,),
             generations=1,
-            population_size=4,
-            children_per_generation=2,
+            population_size=2,
+            children_per_generation=1,
             elite_count=1,
             shadow_surveys=2,
             validation_shadow_surveys=2,
@@ -166,22 +184,23 @@ def test_parallel_evolution_and_manifest():
             max_workers=2,
             shadow_max_workers=2,
         )
-        evolver = MegaPersonaEvolver(config=config, output_dir=output_dir, simulator_llm_client=_MOCK_SIM)
-        evolver.store.write_manifest(
-            build_run_manifest(config, argv=["test"], resume=False, model_key=None)
-        )
-        best = evolver.run()
+        best = MegaPersonaOpenEvolveRunner(
+            config=config,
+            output_dir=output_dir,
+            simulator_llm_client=_MOCK_SIM,
+            children_per_island=1,
+        ).run(argv=["test"], model_key=None)
         assert best.fitness is not None
         assert (output_dir / "manifest.json").exists()
-        assert (output_dir / "checkpoint.json").exists()
-        assert len(list((output_dir / "evaluations").glob("eval_*"))) >= 4
+        assert (output_dir / "open_evolve" / "checkpoint.json").exists()
+        assert len(list((output_dir / "mega_eval" / "evaluations").glob("eval_*"))) >= 2
 
         resume_config = MegaEvolutionConfig(
             n=4,
             seeds=(17,),
             generations=2,
-            population_size=4,
-            children_per_generation=2,
+            population_size=2,
+            children_per_generation=1,
             elite_count=1,
             shadow_surveys=2,
             validation_shadow_surveys=2,
@@ -190,11 +209,12 @@ def test_parallel_evolution_and_manifest():
             max_workers=1,
             shadow_max_workers=1,
         )
-        resumed = MegaPersonaEvolver(
+        resumed = MegaPersonaOpenEvolveRunner(
             config=resume_config,
             output_dir=output_dir,
             resume=True,
             simulator_llm_client=_MOCK_SIM,
+            children_per_island=1,
         ).run()
         assert resumed.fitness is not None
 
@@ -353,11 +373,12 @@ def test_llm_mode_uses_prompt_genome():
             test_shadow_surveys=1,
             items_per_shadow_survey=6,
         )
-        best = MegaPersonaEvolver(
+        best = MegaPersonaOpenEvolveRunner(
             config=config,
             output_dir=output_dir,
             llm_client=llm,
             simulator_llm_client=_MOCK_SIM,
+            children_per_island=1,
         ).run()
         assert best.fitness is not None
         assert llm.calls
@@ -365,9 +386,9 @@ def test_llm_mode_uses_prompt_genome():
 
 
 def main():
-    test_evolution_persistence_and_resume()
+    test_openevolve_persistence_and_resume()
     test_resume_rejects_config_mismatch()
-    test_parallel_evolution_and_manifest()
+    test_openevolve_manifest_and_artifacts()
     test_prompt_addendum_from_genome()
     test_mutation_records_evolution_operator()
     test_mutation_modes_are_diagnostic()

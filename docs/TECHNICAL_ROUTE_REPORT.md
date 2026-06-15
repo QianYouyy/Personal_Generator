@@ -52,7 +52,7 @@ Sealed Test Report
 |---|---|---|
 | 生成层 | 生成结构化 MegaPersona | `src/mega_persona/schema.py`, `generator.py`, `template_generator.py` |
 | 评估层 | 计算合法率、覆盖度、行为对齐度 | `evaluation.py`, `shadow_survey.py`, `shadow_simulator.py` |
-| 进化层 | 优化采样、轴变换、prompt profile | `evolution.py`, `scripts/run_mega_persona_evolution.py` |
+| 进化层 | 优化采样、轴变换、prompt profile | `src.open_evolve.engine.OpenEvolve`, `openevolve_adapter.py`, `scripts/run_mega_persona_evolution.py` |
 
 ---
 
@@ -264,7 +264,7 @@ data/results/mega_persona_evolution_run/
 - 每个 candidate 评估完成后立即写 `result.json`。
 - 每次评估后更新 `checkpoint.json`。
 - Resume 时校验 config 和 frozen survey hashes。
-- 允许 `--generations` 和 `--max-workers` 在 resume 时变化。
+- 允许 `--generations` 在 resume 时增加；OpenEvolve 的 island 状态从 checkpoint 恢复。
 - 断线、机器休眠或 API 中断后可以继续跑。
 
 ---

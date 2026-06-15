@@ -42,7 +42,7 @@ manifest + checkpoint + per-candidate artifacts
   score = schema_fitness × (0.5 + 0.5 × behavior_coverage) × (0.5 + 0.5 × shadow_alignment) × generation_rate
   ```
   设计意图：behavior coverage 或 shadow alignment 极低时会被门控因子惩罚（最低 ×0.5），确保行为塌缩或对齐差的候选无法获得高分。
-- 长跑实验会保存 `manifest.json`、`checkpoint.json` 和每个候选的完整 `result.json`，支持断点续跑。
+- 长跑实验会保存 `manifest.json`、`open_evolve/checkpoint.json`、`mega_eval/checkpoint.json` 和每个候选的完整 `result.json`，支持断点续跑。
 
 ### 当前代码状态
 
@@ -58,11 +58,11 @@ manifest + checkpoint + per-candidate artifacts
 | MegaPersona Schema Evaluator | ✅ 已加入 | `src/mega_persona/evaluation.py`（schema 层面：合法率、近重复、覆盖度、diversity） |
 | Experiment Score & Batch Runner | ✅ 已加入 | `src/mega_persona/experiment.py` + `scripts/run_mega_persona_experiment.py` |
 | Fixed MegaPersona Generator | ✅ 已加入 | `src/mega_persona/generator.py` |
-| Durable Open-Evolve | ✅ 已加入 | `src/mega_persona/evolution.py`, `scripts/run_mega_persona_evolution.py` |
+| OpenEvolve Evolution | ✅ 已接入 | `src/open_evolve/engine.py` + `src/mega_persona/openevolve_adapter.py` + `scripts/run_mega_persona_evolution.py` |
 | Scientific Shadow Surveys | ✅ 已加入 | 按 HACHIMI 的 CEPS/PISA 2022 shadow-survey 思路组织构念和量表元数据 |
 | Validation/Test Split | ✅ 已加入 | Evolution fitness 使用 validation behavior；sealed test 只在最终 best 上运行 |
 | Prompt Profile Genome | ✅ 已加入 | LLM mode 下 evolution 可注入 prompt addendum |
-| Parallel Evaluation | ✅ 已加入 | `--max-workers` 并行评估候选 |
+| Parallel Shadow Simulation | ✅ 已加入 | `--shadow-max-workers` 并行 shadow survey 模拟 |
 | Experiment Manifest | ✅ 已加入 | `manifest.json` 记录命令、配置、Python/Git 状态 |
 | Result Visualization | ✅ 已加入 | `src/mega_persona/visualization.py`, `scripts/visualize_mega_persona_results.py` |
 | Symbolic Validator | ✅ 已加入 | `src/mega_persona/validator.py` |
@@ -270,32 +270,44 @@ python scripts/run_mega_persona_experiment.py \
   --seeds 17,23,31
 ```
 
-运行可恢复的 MegaPersona Open-Evolve：
+运行可恢复的 MegaPersona OpenEvolve 主流程：
 
 ```bash
 python scripts/run_mega_persona_evolution.py \
-  --n 25 \
-  --seeds 17,23,31 \
-  --generations 20 \
-  --population-size 8 \
-  --max-workers 4 \
-  --validation-shadow-surveys 4 \
-  --test-shadow-surveys 4 \
-  --output-dir data/results/mega_persona_evolution_run
+  --generator-mode llm \
+  --model-key llm.persona_model \
+  --simulator-model-key llm.simulator_model \
+  --n 10 \
+  --seeds 17,23 \
+  --generations 3 \
+  --population-size 4 \
+  --children-per-island 1 \
+  --shadow-surveys 3 \
+  --validation-shadow-surveys 2 \
+  --test-shadow-surveys 2 \
+  --items-per-shadow-survey 8 \
+  --shadow-max-workers 4 \
+  --output-dir data/results/mega_persona_openevolve_smoke
 ```
 
-断线或中断后继续：
+中断后续跑：
 
 ```bash
 python scripts/run_mega_persona_evolution.py \
-  --n 25 \
-  --seeds 17,23,31 \
-  --generations 20 \
-  --population-size 8 \
-  --max-workers 4 \
-  --validation-shadow-surveys 4 \
-  --test-shadow-surveys 4 \
-  --output-dir data/results/mega_persona_evolution_run \
+  --generator-mode llm \
+  --model-key llm.persona_model \
+  --simulator-model-key llm.simulator_model \
+  --n 10 \
+  --seeds 17,23 \
+  --generations 5 \
+  --population-size 4 \
+  --children-per-island 1 \
+  --shadow-surveys 3 \
+  --validation-shadow-surveys 2 \
+  --test-shadow-surveys 2 \
+  --items-per-shadow-survey 8 \
+  --shadow-max-workers 4 \
+  --output-dir data/results/mega_persona_openevolve_smoke \
   --resume
 ```
 
@@ -309,7 +321,7 @@ python scripts/run_mega_persona_evolution.py \
   --seeds 17 \
   --generations 5 \
   --population-size 4 \
-  --max-workers 1 \
+  --children-per-island 1 \
   --validation-shadow-surveys 4 \
   --test-shadow-surveys 4 \
   --output-dir data/results/mega_persona_llm_evolution_run
@@ -342,17 +354,19 @@ python scripts/visualize_mega_persona_results.py \
 `run_mega_persona_experiment.py` 和 `run_mega_persona_evolution.py` 的输出默认保存到 `data/results/`。进化实验会额外保存：
 - `manifest.json`
 - `run.log`
-- `checkpoint.json`
+- `open_evolve/checkpoint.json`
+- `open_evolve/checkpoint_gen_*.json`
+- `open_evolve/elite_codes_gen_*/`
+- `mega_eval/checkpoint.json`
 - `final_summary.json`
 - `final_summary.md`
-- `final_test_report.json`
-- `shadow_surveys/train.json`
-- `shadow_surveys/validation.json`
-- `shadow_surveys/test.json`
-- `shadow_surveys/hashes.json`
-- `candidates/candidate_*.json`
-- `generations/generation_*.json`
-- `evaluations/eval_*/result.json`
+- `mega_eval/final_test_report.json`
+- `mega_eval/shadow_surveys/train.json`
+- `mega_eval/shadow_surveys/validation.json`
+- `mega_eval/shadow_surveys/test.json`
+- `mega_eval/shadow_surveys/hashes.json`
+- `mega_eval/candidates/candidate_*.json`
+- `mega_eval/evaluations/eval_*/result.json`
 - `figures/*.png`（运行可视化脚本后生成）
 
 ---
@@ -371,7 +385,7 @@ slots
   -> behavior simulation
   -> validation selection
   -> sealed test only for final best
-  -> durable Open-Evolve
+  -> src.open_evolve.engine.OpenEvolve
   -> manifest/checkpoint/artifacts
 ```
 
@@ -381,8 +395,8 @@ slots
 |------|------|
 | 单次离线 baseline | `python scripts/generate_mega_personas.py --n 25 --seed 17 --mock` |
 | 多 seed baseline | `python scripts/run_mega_persona_experiment.py --mode mock --n 25 --seeds 17,23,31` |
-| 可恢复 evolution baseline | `python scripts/run_mega_persona_evolution.py --generator-mode mock --n 25 --seeds 17,23,31 --generations 20 --population-size 8 --max-workers 4 --validation-shadow-surveys 4 --test-shadow-surveys 4 --output-dir data/results/mega_persona_evolution_run` |
-| LLM prompt-profile evolution | `python scripts/run_mega_persona_evolution.py --generator-mode llm --model-key llm.persona_model --n 10 --seeds 17 --generations 5 --population-size 4 --max-workers 1 --validation-shadow-surveys 4 --test-shadow-surveys 4 --output-dir data/results/mega_persona_llm_evolution_run` |
+| 可恢复 OpenEvolve baseline | `python scripts/run_mega_persona_evolution.py --generator-mode mock --n 25 --seeds 17,23,31 --generations 20 --population-size 8 --children-per-island 1 --validation-shadow-surveys 4 --test-shadow-surveys 4 --output-dir data/results/mega_persona_evolution_run` |
+| LLM prompt-profile OpenEvolve | `python scripts/run_mega_persona_evolution.py --generator-mode llm --model-key llm.persona_model --n 10 --seeds 17 --generations 5 --population-size 4 --children-per-island 1 --validation-shadow-surveys 4 --test-shadow-surveys 4 --output-dir data/results/mega_persona_llm_evolution_run` |
 | 结果可视化 | `python scripts/visualize_mega_persona_results.py --input data/results/mega_persona_evolution_run` |
 
 ### 下一步建议
@@ -564,7 +578,8 @@ best = engine.run(max_generations=100)
 | `template_generator.py` | 规则模板 baseline，用于离线生成可比较的 MegaPersona population |
 | `evaluation.py` | 聚合法率、覆盖度、距离、多样性和近重复惩罚 |
 | `generator.py` | 固定版 HACHIMI-style 多 Agent 生成流水线 |
-| `evolution.py` | MegaPersona 专用 Open-Evolve，进化采样/轴变换/LLM prompt profile，并用冻结 validation shadow surveys 选优；test shadow surveys 只在最终 best 上运行；评分公式与 batch 实验统一为乘法门控乘积 |
+| `evolution.py` | MegaPersona genome、slot sampling、prompt profile、科学评估和持久化 evaluator 后端 |
+| `openevolve_adapter.py` | 将 MegaPersona genome 接入 `src.open_evolve.engine.OpenEvolve`；OpenEvolve 负责 island、metric elites、mutation 和 checkpoint，MegaPersona evaluator 负责 validation/test 科学评估 |
 | `validator.py` | 定义硬规则校验，避免人格全高、全低、字段冲突、表现与动机不一致等问题 |
 
 当前 Primary Axes：
@@ -602,8 +617,8 @@ best = engine.run(max_generations=100)
 | Phase 4 | 固定版多 Agent 生成器 | ✅ 完成初版 | 先手写 Prompt 与约束，生成 50-100 个 MegaPersona 做人工检查 |
 | Phase 5 | 评估器扩展 | ✅ 完成初版 | `Validity × Coverage × Diversity × NearDuplicatePenalty` |
 | Phase 6 | Batch 实验 Runner | ✅ 完成初版 | 多 seed 运行，导出 JSON/Markdown 汇总报告 |
-| Phase 7 | 接入 Open-Evolve | ✅ 完成初版 | 进化配额权重、轴变换和 LLM prompt profile；固定评分尺子，用 validation shadow surveys 评估，每次评估持久化，可 resume |
-| Phase 8 | Manifest + 并行评估 | ✅ 完成初版 | `manifest.json` 记录实验环境；`--max-workers` 并行评估候选 |
+| Phase 7 | 接入 OpenEvolve | ✅ 完成替换版 | 主入口 `scripts/run_mega_persona_evolution.py` 已直接接入 `src.open_evolve.engine.OpenEvolve`；进化配额权重、轴变换和 LLM prompt profile；固定评分尺子，用 validation shadow surveys 评估，每次评估持久化，可 resume |
+| Phase 8 | Manifest + 并行评估 | ✅ 完成初版 | `manifest.json` 记录实验环境；`--shadow-max-workers` 并行 shadow survey 模拟 |
 | Phase 9 | 可视化 | ✅ 完成初版 | 进化曲线、slot/persona/behavior 空间散点、best genome、指标图 |
 | Phase 10 | 统计报告 | ⏳ 下一步 | baseline 对照、ablation 表、多 run 显著性 |
 | Phase 11 | LLM Shadow Simulator | ⏳ 下一步 | 用 LLM 生成 shadow survey 回答，提高行为模拟真实性 |

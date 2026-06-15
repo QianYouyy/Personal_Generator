@@ -30,6 +30,15 @@ from src.mega_persona.generator import (
     MegaPersonaGenerator,
     parse_json_object,
 )
+from src.mega_persona.openevolve_adapter import (
+    MegaGenomeMutator,
+    MegaOpenEvolveEvaluator,
+    MegaPersonaOpenEvolveRunner,
+    genome_from_code,
+    genome_hash,
+    genome_to_code,
+    open_evolve_fitness_from_payload,
+)
 from src.mega_persona.schema import MegaPersona
 from src.mega_persona.shadow_survey import (
     SCIENTIFIC_SCALE_REGISTRY,
@@ -71,9 +80,12 @@ __all__ = [
     "MegaPersonaExperimentRun",
     "MegaPersonaExperimentRunner",
     "MegaPersonaExperimentSummary",
+    "MegaGenomeMutator",
+    "MegaOpenEvolveEvaluator",
     "MegaEvolutionCandidate",
     "MegaEvolutionConfig",
     "MegaPersonaEvolver",
+    "MegaPersonaOpenEvolveRunner",
     "MegaPersonaGenerationResult",
     "LLMShadowSimulator",
     "MegaPersonaGenerator",
@@ -101,7 +113,11 @@ __all__ = [
     "default_genome",
     "evaluate_mega_personas",
     "generate_html_report",
+    "genome_from_code",
+    "genome_hash",
+    "genome_to_code",
     "mutate_genome",
+    "open_evolve_fitness_from_payload",
     "prompt_addendum_from_genome",
     "parse_json_object",
     "personas_to_axis_matrix",

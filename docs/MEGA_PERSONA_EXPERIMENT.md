@@ -209,7 +209,7 @@ python scripts/run_mega_persona_evolution.py \
   --seeds 17,23,31 \
   --generations 20 \
   --population-size 8 \
-  --max-workers 4 \
+  --children-per-island 1 \
   --validation-shadow-surveys 4 \
   --test-shadow-surveys 4 \
   --output-dir data/results/mega_persona_evolution_run
@@ -223,7 +223,7 @@ python scripts/run_mega_persona_evolution.py \
   --seeds 17,23,31 \
   --generations 20 \
   --population-size 8 \
-  --max-workers 4 \
+  --children-per-island 1 \
   --validation-shadow-surveys 4 \
   --test-shadow-surveys 4 \
   --output-dir data/results/mega_persona_evolution_run \
@@ -240,7 +240,7 @@ python scripts/run_mega_persona_evolution.py \
   --seeds 17 \
   --generations 5 \
   --population-size 4 \
-  --max-workers 1 \
+  --children-per-island 1 \
   --validation-shadow-surveys 4 \
   --test-shadow-surveys 4 \
   --output-dir data/results/mega_persona_llm_evolution_run
@@ -251,26 +251,28 @@ Persistence layout:
 ```text
 data/results/mega_persona_evolution_run/
   manifest.json
-  checkpoint.json
   final_summary.json
   final_summary.md
-  final_test_report.json
-  shadow_surveys/
-    train.json
-    validation.json
-    test.json
-    hashes.json
-  candidates/
-    candidate_*.json
-  generations/
-    generation_0000.json
-    generation_0001.json
-    ...
-  evaluations/
-    eval_000001_candidate_x/
-      result.json
-    eval_000002_candidate_y/
-      result.json
+  open_evolve/
+    checkpoint.json
+    checkpoint_gen_*.json
+    elite_codes_gen_*/
+  mega_eval/
+    checkpoint.json
+    final_summary.json
+    final_test_report.json
+    shadow_surveys/
+      train.json
+      validation.json
+      test.json
+      hashes.json
+    candidates/
+      candidate_*.json
+    evaluations/
+      eval_000001_candidate_x/
+        result.json
+      eval_000002_candidate_y/
+        result.json
   figures/
     fitness_over_generations.png
     best_slot_axes.png
@@ -290,8 +292,9 @@ continue after process death, machine sleep, or network interruption.
 
 `manifest.json` stores the command, config, frozen survey hashes, Python
 version, git commit, branch, dirty flag, and `git status --short` output.
-Mock-mode evolution can safely use `--max-workers > 1`; LLM mode should usually
-start with `--max-workers 1` to avoid rate limits.
+OpenEvolve evaluates children inside each island. LLM mode should usually start
+with `--children-per-island 1` and use `--shadow-max-workers` for parallelizing
+shadow survey simulation inside each candidate.
 
 Visualize an evolution run, batch `summary.json`, or single generation JSON:
 
