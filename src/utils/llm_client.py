@@ -1,7 +1,7 @@
 """LLM 客户端 — 统一 API 调用 + 通信记录.
 
 支持两种创建方式:
-  1. 从配置文件创建: LLMClient.from_config("llm.qgenerator_model")
+  1. 从配置文件创建: LLMClient.from_config("llm.persona_model")
   2. 直接指定 model: LLMClient(model="gpt-5.4")
 
 API 记录由 OutputManager 统一管理:
@@ -122,7 +122,7 @@ class LLMClient:
         """从配置文件创建 LLMClient.
 
         Args:
-            model_key: 配置中的 model 键名，如 "llm.qgenerator_model"
+            model_key: 配置中的 model 键名，如 "llm.persona_model"
             api_key: 可选，覆盖配置
             base_url: 可选，覆盖配置
         """

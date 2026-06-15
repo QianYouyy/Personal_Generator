@@ -68,6 +68,10 @@ data/generated_personas/*.json
 data/results/
 # 但保留目录结构和示例数据
 data/**/*.log
+!data/questionnaires/.gitkeep
+!data/generated_personas/.gitkeep
+!data/results/
+!data/results/.gitkeep
 
 # ============================================
 # 日志

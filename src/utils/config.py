@@ -29,7 +29,7 @@ class Config:
             self._config_data = yaml.safe_load(f) or {}
 
     def get(self, key: str, default: Any = None) -> Any:
-        """通过点号路径获取配置值，如 'llm.qgenerator_model'."""
+        """通过点号路径获取配置值，如 'llm.persona_model'."""
         keys = key.split(".")
         value = self._config_data
         for k in keys:

@@ -7,28 +7,31 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 
-from src.open_evolve.code_templates import SEED_CODES
-from src.open_evolve.mutator import Mutator
 from src.open_evolve.engine import OpenEvolve, Island, Candidate
 
 
-class MockLLM:
-    """Mock LLM — 变异时只返回原始代码稍作修改."""
+SEED_CODES = {
+    "seed1": "seed-code-1",
+    "seed2": "seed-code-2",
+    "seed3": "seed-code-3",
+}
+
+
+class MockMutator:
+    """Mock mutator that appends deterministic markers."""
 
     def __init__(self):
         self.call_count = 0
 
-    def generate(self, prompt, system_prompt=None, **kwargs):
+    def mutate(self, parent_code: str, prompt=None, generation: int = 0, stagnation: int = 0):
         self.call_count += 1
-        # 从 prompt 中提取原始代码，稍作修改后返回
-        import re
-        match = re.search(r'【父代代码】\s*```python\s*(.*?)```', prompt, re.DOTALL)
-        if match:
-            code = match.group(1).strip()
-            # 简单修改：在代码末尾添加一个注释
-            code += f"\n\n# Mutated at call {self.call_count}\n"
-            return f"```python\n{code}\n```"
-        return "class SeedPersonaGenerator:\n    pass"
+        return f"{parent_code}\n# mutation={self.call_count} generation={generation} stagnation={stagnation}"
+
+    def get_state(self):
+        return {"call_count": self.call_count}
+
+    def set_state(self, state):
+        self.call_count = state.get("call_count", self.call_count)
 
 
 class MockEvaluator:
@@ -99,12 +102,17 @@ def test_engine():
     print("测试进化引擎（3 轮，3 个岛屿）")
     print("=" * 60)
 
-    llm = MockLLM()
-    mutator = Mutator(llm)
+    mutator = MockMutator()
     evaluator = MockEvaluator()
 
     # 使用 3 个岛屿和 3 份 Mock 问卷快速测试
-    engine = OpenEvolve(mutator, evaluator, questionnaires=[])
+    engine = OpenEvolve(
+        mutator,
+        evaluator,
+        questionnaires=[],
+        seed_codes=SEED_CODES,
+        initial_seed_distribution={"seed1": 2, "seed2": 2, "seed3": 2},
+    )
 
     # 覆盖配置为 3 个岛屿
     engine.num_islands = 3
@@ -130,7 +138,7 @@ def test_engine():
 
     print(f"\n  总代数: {engine.generation}")
     print(f"  总评估次数: {evaluator.eval_count}")
-    print(f"  LLM 调用次数: {llm.call_count}")
+    print(f"  变异次数: {mutator.call_count}")
 
     best = engine.get_global_best()
     if best:
@@ -144,11 +152,16 @@ def test_extinction():
     print("测试灭绝机制")
     print("=" * 60)
 
-    llm = MockLLM()
-    mutator = Mutator(llm)
+    mutator = MockMutator()
     evaluator = MockEvaluator()
 
-    engine = OpenEvolve(mutator, evaluator, questionnaires=[])
+    engine = OpenEvolve(
+        mutator,
+        evaluator,
+        questionnaires=[],
+        seed_codes=SEED_CODES,
+        initial_seed_distribution={"seed1": 2, "seed2": 2, "seed3": 2},
+    )
     engine.num_islands = 3
     engine.islands = [Island(i) for i in range(3)]
     engine.extinction_interval = 2  # 每 2 轮触发灭绝

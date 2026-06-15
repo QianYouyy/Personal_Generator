@@ -1,19 +1,38 @@
-"""Open-Evolve 进化引擎 — 替代 AlphaEvolve."""
+"""OpenEvolve island engine used by MegaPersona."""
 
 import copy
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 from pathlib import Path
 import json
 
-from src.open_evolve.mutator import Mutator
-from src.open_evolve.evaluator import PersonaCodeEvaluator
-from src.open_evolve.code_templates import SEED_CODES
 from src.utils.config import get_config
 from src.utils.logger import logger
+
+
+class MutatorProtocol(Protocol):
+    def mutate(
+        self,
+        parent_code: str,
+        prompt: str | None = None,
+        generation: int = 0,
+        stagnation: int = 0,
+    ) -> str:
+        ...
+
+    def get_state(self) -> dict[str, Any]:
+        ...
+
+    def set_state(self, state: dict[str, Any]) -> None:
+        ...
+
+
+class EvaluatorProtocol(Protocol):
+    def evaluate(self, code_str: str) -> dict[str, float]:
+        ...
 
 
 @dataclass
@@ -144,8 +163,8 @@ class OpenEvolve:
     def from_checkpoint(
         cls,
         checkpoint_path: str,
-        mutator: Mutator,
-        evaluator: PersonaCodeEvaluator,
+        mutator: MutatorProtocol,
+        evaluator: EvaluatorProtocol,
         questionnaires: List,
     ) -> "OpenEvolve":
         """从 checkpoint 恢复进化状态.
@@ -286,8 +305,8 @@ class OpenEvolve:
 
     def __init__(
         self,
-        mutator: Mutator,
-        evaluator: PersonaCodeEvaluator,
+        mutator: MutatorProtocol,
+        evaluator: EvaluatorProtocol,
         questionnaires: List,
         seed_codes: Optional[Dict[str, str]] = None,
         initial_seed_distribution: Optional[Dict[str, int]] = None,
@@ -298,7 +317,7 @@ class OpenEvolve:
         self.mutator = mutator
         self.evaluator = evaluator
         self.questionnaires = questionnaires
-        self.seed_codes = seed_codes or SEED_CODES
+        self.seed_codes = seed_codes or {}
 
         cfg = get_config()
         self.num_islands = num_islands or cfg.get("open_evolve.num_islands", 10)
@@ -310,7 +329,7 @@ class OpenEvolve:
         self.extinction_mode = cfg.get("open_evolve.extinction_mode", "adaptive")
 
         distribution = initial_seed_distribution or cfg.get("open_evolve.initial_seed_distribution", {
-            "seed1": 4, "seed2": 3, "seed3": 3,
+            "seed": self.num_islands,
         })
 
         self.islands = [Island(i) for i in range(self.num_islands)]
@@ -336,6 +355,9 @@ class OpenEvolve:
 
     def _initialize_islands(self, distribution: Dict[str, int]):
         """初始种子轮询分配."""
+        if not self.seed_codes:
+            raise ValueError("OpenEvolve requires at least one seed code")
+
         seed_list = []
         for seed_name, count in distribution.items():
             fallback_code = next(iter(self.seed_codes.values()))
@@ -946,8 +968,9 @@ class OpenEvolve:
         return islands_state
 
     def _update_background_status(self):
-        """更新后台状态文件（供 run_background.py 轮询使用）."""
+        """Best-effort status file update for legacy output-manager runs."""
         try:
+            from datetime import datetime
             from src.utils.output_manager import output_manager
             if output_manager.base_dir is None:
                 return

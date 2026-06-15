@@ -7,8 +7,6 @@ data/results/{run_name}_{timestamp}/
   ├── api_logs/
   │   └── api_calls.jsonl            # API 通信记录
   ├── outputs/
-  │   ├── best_persona_generator.py  # 最优代码
-  │   ├── final_evaluation.json      # 最终评估结果
   │   └── checkpoint_gen_*.json      # 每轮 checkpoint
   └── visualizations/
       ├── persona_distribution.png
