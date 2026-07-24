@@ -30,10 +30,12 @@ from src.utils.llm_client import LLMClient  # noqa: E402
 
 
 DEFAULT_OPERATORS = (
-    "op01_axis_decoupling",
+    "op06_low_axis_fidelity",
+    "op04_within_bucket_contrast",
+    "op07_high_axis_cost",
     "op02_behavioral_evidence",
-    "op03_shadow_survey_alignment",
-    "op08_validation_conservatism",
+    "op09_low_high_axis_tradeoff",
+    "op14_recovery_latency",
 )
 DEFAULT_MUTATION_MODES = (
     "parent_replay",

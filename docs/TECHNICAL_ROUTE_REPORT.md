@@ -9,7 +9,7 @@
 
 本项目提出的路线是：
 
-> 用 HACHIMI-style 的结构化大人格生成保证单个人格质量，用 DeepMind-style 的空间覆盖和 Open-Evolve 保证群体多样性，再用 CEPS/PISA-style shadow survey 做行为层验证。
+> 用 HACHIMI-style 的结构化大人格生成保证单个人格质量，用 DeepMind-style 的空间覆盖和 OpenEvolve 保证群体多样性，再用 CEPS/PISA-style shadow survey 做行为层验证。
 
 核心研究问题：
 
@@ -51,8 +51,8 @@ Sealed Test Report
 | 层级 | 作用 | 当前实现 |
 |---|---|---|
 | 生成层 | 生成结构化 MegaPersona | `src/mega_persona/schema.py`, `generator.py`, `template_generator.py` |
-| 评估层 | 计算合法率、覆盖度、行为对齐度 | `evaluation.py`, `shadow_survey.py`, `shadow_simulator.py` |
-| 进化层 | 优化采样、轴变换、prompt profile | `src.open_evolve.engine.OpenEvolve`, `openevolve_adapter.py`, `scripts/run_mega_persona_evolution.py` |
+| 评估层 | 计算合法率、内部一致性、覆盖度、行为对齐度 | `evaluation.py`, `consistency.py`, `shadow_survey.py`, `shadow_simulator.py` |
+| 进化层 | 优化 schema-aware genome、operator、采样策略、prompt profile | `src.open_evolve.engine.OpenEvolve`, `openevolve_adapter.py`, `scripts/run_mega_persona_evolution.py` |
 
 ---
 
@@ -77,7 +77,7 @@ Sealed Test Report
 
 ---
 
-## 4. Primary Axes 设计
+## 4. Primary Axes 与 Schema Binding 设计
 
 当前使用 3 个 Primary Axes：
 
@@ -92,6 +92,24 @@ Sealed Test Report
 - 跨组件：不是单一字段，而能影响动机、行为、压力反应和社交表现。
 - 可行为化：能通过问卷题项投影成 shadow behavior axes。
 - 可解释：适合在汇报和实验分析中解释生成差异。
+
+但是当前实现已经不再把这 3 个轴“写死”成唯一合法命名。项目内部新增了 `schema_binding`，显式保存：
+
+- `axis_names`
+- `axis_roles`
+- `quota_buckets`
+
+其中 `axis_roles` 负责把当前 schema 中的轴映射到三个核心角色：
+
+- `cognitive_core`
+- `motivation_core`
+- `regulation_core`
+
+这意味着：
+
+1. 研究者可以重命名 primary axes，而不必手改整套 evaluator。
+2. slot sampler、adaptive constraints、validator、shadow survey、simulator、visualization 会沿用同一套 axis binding。
+3. 进化搜索的对象不再只是“当前三轴上的数值偏移”，而是“带有 schema 绑定信息的生成器控制空间”。
 
 ---
 
@@ -203,14 +221,61 @@ behavior_axis = [cognitive, motivation, regulation]
 
 ## 9. 进化优化设计
 
-Open-Evolve 当前不直接变异任意 Python 代码，而是变异一个受限 JSON genome：
+当前进化主流程已经真正接入 OpenEvolve 引擎，但它优化的不是任意 Python 源码，而是一个 **schema-aware genome**。这样做的目的不是弱化进化，而是让实验保持可控、可复现、可持久化。
+
+### 9.1 为什么不是直接改整份代码
+
+如果让 LLM 每一代直接改整份生成器源码，会带来几个问题：
+
+- 很容易改崩主流程
+- 很难比较代际差异到底来自哪里
+- 很难稳定做 checkpoint / resume
+- 很容易把“代码质量变化”和“人格质量变化”混在一起
+
+因此当前策略是：
+
+```text
+固定主流程
+  + 进化可控 genome
+  + LLM mutator 产生 child genome
+```
+
+### 9.2 当前 genome 结构
 
 | Genome 字段 | 作用 |
 |---|---|
+| `schema_binding` | 定义当前 schema 下的 axis names / roles / quota buckets |
 | `quota_weights` | 调整不同 quota bucket 的采样权重 |
 | `axis_bias` | 对 primary axes 做整体偏移 |
 | `axis_stretch` | 对 primary axes 做拉伸/压缩 |
 | `prompt_profile` | LLM mode 下控制生成风格和机制表达 |
+| `last_evolution_operator` | 记录当前子代由哪个 operator 驱动 |
+
+### 9.3 当前 OpenEvolve 真实做了什么
+
+当前真实链路是：
+
+```text
+parent genome
+  -> OpenEvolve 选择 parent / island / elites
+  -> LLM mutator 读取 parent genome + operator + generation context
+  -> 输出 child genome JSON
+  -> 结构修复 / 归一化 / fallback
+  -> MegaPersona generator 执行 child genome
+  -> simulator 评估 child persona population
+  -> scientific fitness
+  -> OpenEvolve 更新 elites
+```
+
+也就是说，当前系统里有三个功能明确分开的模型阶段：
+
+- `mutator_model`：负责进化变异
+- `persona_model`：负责人格生成
+- `simulator_model`：负责行为模拟
+
+这三者可以使用不同模型，也可以切换到 DeepSeek 这类 OpenAI-compatible provider。
+
+### 9.4 为什么要锁住评分规则与问卷拆分
 
 不让 genome 改评分公式、不让 genome 改 validation/test survey，这是为了防止“改尺子”或“改考卷”带来的伪提升。
 
@@ -230,6 +295,14 @@ fitness =
 - `behavior_coverage` 防止行为塌缩。
 - `shadow_alignment` 防止人格文本和行为表现脱节。
 - `generation_rate` 防止生成失败或 validator 大量拦截。
+
+在当前代码里，还会同步记录：
+
+- `internal_consistency.mean`
+- `internal_consistency_min.mean`
+- `axis_alignment.mean`
+
+它们用于监控“覆盖度提升”是否靠不现实的人格冲突换来的。
 
 ---
 
@@ -299,6 +372,8 @@ python scripts/visualize_mega_persona_results.py \
 | LLM multi-agent generator | 已完成初版 |
 | Scientific shadow survey metadata | 已完成初版 |
 | LLM Shadow Simulator | 已接入 |
+| Schema-aware genome v2 | 已完成 |
+| LLM mutator for OpenEvolve | 已接入 |
 | Train/validation/test frozen split | 已完成 |
 | Sealed final test | 已完成 |
 | Durable Open-Evolve | 已完成 |
@@ -317,7 +392,9 @@ python scripts/visualize_mega_persona_results.py \
 | P1 | Test-retest 稳定性 | 同一 persona 多次答题，评估行为噪声 |
 | P1 | Baseline vs Evolution 统计报告 | 多 seed 均值/方差、置信区间、显著性 |
 | P1 | Ablation | 去掉 validation alignment、去掉 coverage、去掉 prompt_profile 等 |
+| P1 | 新 schema 版本化实验 | 验证 schema_binding 重构后进化信号是否保持 |
 | P2 | Agent-specific prompt genome | 从 coarse prompt profile 进化到模块级 prompt fragment |
+| P2 | mutator prompt / repair 策略消融 | 分析 LLM mutation 质量瓶颈 |
 | P2 | 更细的 construct-level analysis | 按量表族分析哪些构念更稳定 |
 | P3 | 人工标注小样本校验 | 检查高分人格是否真的心理一致、非模板化 |
 

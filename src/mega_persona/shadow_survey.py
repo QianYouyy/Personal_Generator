@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any
 from typing import Literal
 
-from src.mega_persona.slots import AXIS_NAMES
+from src.mega_persona.slots import (
+    AXIS_NAMES,
+    LEGACY_AXIS_TO_ROLE,
+    axis_names_for_binding,
+    axis_roles_for_binding,
+    default_schema_binding,
+)
 
 
 LikertDirection = Literal[1, -1]
@@ -55,6 +61,7 @@ class ShadowSurvey:
     survey_id: str
     context: str
     items: tuple[ShadowSurveyItem, ...]
+    axis_names: tuple[str, ...] = AXIS_NAMES
     split: str = "unspecified"
     source_protocol: str = "HACHIMI-style CEPS/PISA shadow survey"
 
@@ -364,6 +371,7 @@ def build_initial_shadow_surveys(
     seed: int = 17,
     split: str = "train",
     survey_id_prefix: str | None = None,
+    schema_binding: dict[str, Any] | None = None,
 ) -> list[ShadowSurvey]:
     """Build deterministic initial shadow surveys from the local item bank."""
     if num_surveys <= 0:
@@ -371,14 +379,17 @@ def build_initial_shadow_surveys(
     if items_per_survey <= 0:
         raise ValueError("items_per_survey must be positive")
 
+    binding = schema_binding or default_schema_binding()
+    axis_names = axis_names_for_binding(binding)
+    axis_roles = axis_roles_for_binding(binding)
     surveys: list[ShadowSurvey] = []
-    bank = list(ITEM_BANK)
+    bank = [_remap_item_to_binding(item, axis_roles=axis_roles) for item in ITEM_BANK]
     for survey_idx in range(num_surveys):
         start = (survey_idx * 5 + seed) % len(bank)
         chosen = [bank[(start + offset) % len(bank)] for offset in range(items_per_survey)]
 
         # Ensure every survey touches the three primary axes.
-        missing_axes = set(AXIS_NAMES)
+        missing_axes = set(axis_names)
         for item in chosen:
             missing_axes -= set(item.axis_weights)
         for replacement_idx, axis in enumerate(sorted(missing_axes), start=1):
@@ -391,6 +402,7 @@ def build_initial_shadow_surveys(
                 survey_id=f"{prefix}_{survey_idx + 1:02d}",
                 context=SURVEY_CONTEXTS[survey_idx % len(SURVEY_CONTEXTS)],
                 items=tuple(chosen),
+                axis_names=axis_names,
                 split=split,
             )
         )
@@ -403,6 +415,7 @@ def build_shadow_survey_splits(
     test_surveys: int = 4,
     items_per_survey: int = 12,
     seed: int = 17,
+    schema_binding: dict[str, Any] | None = None,
 ) -> ShadowSurveySplit:
     """Build fixed train/validation/test shadow survey splits.
 
@@ -417,6 +430,7 @@ def build_shadow_survey_splits(
                 items_per_survey=items_per_survey,
                 seed=seed,
                 split="train",
+                schema_binding=schema_binding,
             )
         ),
         validation=tuple(
@@ -425,6 +439,7 @@ def build_shadow_survey_splits(
                 items_per_survey=items_per_survey,
                 seed=seed + 10000,
                 split="validation",
+                schema_binding=schema_binding,
             )
         ),
         test=tuple(
@@ -433,6 +448,7 @@ def build_shadow_survey_splits(
                 items_per_survey=items_per_survey,
                 seed=seed + 20000,
                 split="test",
+                schema_binding=schema_binding,
             )
         ),
     )
@@ -473,11 +489,13 @@ def shadow_survey_split_hashes(splits: ShadowSurveySplit) -> dict[str, str]:
 def score_shadow_survey(
     survey: ShadowSurvey,
     responses: dict[str, int],
+    axis_names: tuple[str, ...] | None = None,
 ) -> dict[str, float]:
     """Score Likert responses into construct scores and projected primary axes."""
+    axis_names = tuple(axis_names or survey.axis_names or AXIS_NAMES)
     construct_values: dict[str, list[float]] = {}
-    axis_weighted_sum = {axis: 0.0 for axis in AXIS_NAMES}
-    axis_weight_sum = {axis: 0.0 for axis in AXIS_NAMES}
+    axis_weighted_sum = {axis: 0.0 for axis in axis_names}
+    axis_weight_sum = {axis: 0.0 for axis in axis_names}
 
     for item in survey.items:
         if item.item_id not in responses:
@@ -492,7 +510,7 @@ def score_shadow_survey(
         f"construct.{construct}": sum(values) / len(values)
         for construct, values in construct_values.items()
     }
-    for axis in AXIS_NAMES:
+    for axis in axis_names:
         if axis_weight_sum[axis] == 0:
             scores[f"axis.{axis}"] = 0.5
         else:
@@ -505,6 +523,7 @@ def _survey_from_dict(data: dict[str, Any]) -> ShadowSurvey:
         survey_id=data["survey_id"],
         context=data["context"],
         items=tuple(_item_from_dict(item) for item in data.get("items", [])),
+        axis_names=tuple(data.get("axis_names", AXIS_NAMES)),
         split=data.get("split", "unspecified"),
         source_protocol=data.get(
             "source_protocol",
@@ -524,6 +543,29 @@ def _item_from_dict(data: dict[str, Any]) -> ShadowSurveyItem:
         scale_id=data.get("scale_id", ""),
         scale_name=data.get("scale_name", ""),
         source_note=data.get("source_note", "construct_proxy_not_verbatim"),
+    )
+
+
+def _remap_item_to_binding(
+    item: ShadowSurveyItem,
+    *,
+    axis_roles: dict[str, str],
+) -> ShadowSurveyItem:
+    axis_weights: dict[str, float] = {}
+    for legacy_axis, weight in item.axis_weights.items():
+        role = LEGACY_AXIS_TO_ROLE.get(legacy_axis)
+        mapped_axis = axis_roles.get(role, legacy_axis) if role else legacy_axis
+        axis_weights[mapped_axis] = axis_weights.get(mapped_axis, 0.0) + float(weight)
+    return ShadowSurveyItem(
+        item_id=item.item_id,
+        construct=item.construct,
+        text=item.text,
+        direction=item.direction,
+        axis_weights=axis_weights,
+        instrument=item.instrument,
+        scale_id=item.scale_id,
+        scale_name=item.scale_name,
+        source_note=item.source_note,
     )
 
 

@@ -1,114 +1,123 @@
 """Prompt templates for the MegaPersona multi-agent pipeline."""
 
+from src.mega_persona.schema import (
+    ASPIRATION_MAX_LENGTH,
+    DERIVED_REASONING_MAX_LENGTH,
+    FAMILY_CONTEXT_MAX_LENGTH,
+    IDENTITY_ANCHOR_MAX_LENGTH,
+    MENTAL_HEALTH_NARRATIVE_MAX_LENGTH,
+    MORAL_TENSION_MAX_LENGTH,
+    SOCIAL_NARRATIVE_MAX_LENGTH,
+)
 from src.mega_persona.schema import MegaPersona
 
 
 MEGA_PERSONA_JSON_SCHEMA = MegaPersona.model_json_schema()
 
 
-DEMOGRAPHICS_SECTION_CONTRACT = """\
+DEMOGRAPHICS_SECTION_CONTRACT = f"""\
 Schema contract for `demographics`:
-{
-  "demographics": {
+{{
+  "demographics": {{
     "age": integer from 10 to 30,
     "grade_or_stage": one of ["middle_school", "high_school", "vocational", "undergraduate", "graduate", "early_career"],
     "region_type": one of ["urban", "suburban", "rural", "migrant", "international"],
-    "family_context": string, 20-800 characters
-  }
-}"""
+    "family_context": string, 20-{FAMILY_CONTEXT_MAX_LENGTH} characters
+  }}
+}}"""
 
 
-COGNITION_SECTION_CONTRACT = """\
+COGNITION_SECTION_CONTRACT = f"""\
 Schema contract for cognition output:
-{
-  "cognitive_motivation_profile": {
-    "thinking_style": {
+{{
+  "cognitive_motivation_profile": {{
+    "thinking_style": {{
       "dominant_mode": one of ["analytical", "intuitive", "associative", "practical", "reflective", "exploratory"],
       "abstraction_level": number 0-1,
       "ambiguity_tolerance": number 0-1,
       "evidence_preference": one of ["data", "authority", "experience", "peer_consensus", "personal_values"],
       "typical_blind_spot": string, 10-300 characters
-    },
-    "motivation_system": {
+    }},
+    "motivation_system": {{
       "primary_drive": one of ["mastery", "achievement", "belonging", "autonomy", "security", "recognition", "curiosity", "avoidance"],
       "secondary_drive": string, 3-120 characters,
       "intrinsic_motivation": number 0-1,
       "external_pressure_sensitivity": number 0-1,
       "failure_sensitivity": number 0-1,
       "reward_preference": one of ["praise", "progress", "grades", "independence", "social_status", "usefulness"]
-    },
-    "learning_orientation": {
+    }},
+    "learning_orientation": {{
       "goal_orientation": one of ["mastery", "performance", "avoidance", "mixed"],
       "preferred_learning_mode": one of ["reading", "discussion", "practice", "visual", "project_based", "imitation", "trial_and_error"],
       "attention_pattern": one of ["sustained", "bursty", "easily_shifted", "hyperfocused"],
       "curiosity_scope": one of ["narrow_deep", "broad_shallow", "situational", "low"],
       "help_seeking_style": one of ["proactive", "reluctant", "peer_first", "adult_first", "avoids_help"]
-    },
-    "self_regulation": {
+    }},
+    "self_regulation": {{
       "planning_style": one of ["structured", "reactive", "deadline_driven", "ritual_based", "chaotic"],
       "persistence": number 0-1,
       "emotional_regulation": number 0-1,
       "metacognition": number 0-1,
       "habit_stability": number 0-1
-    },
-    "challenge_response": {
+    }},
+    "challenge_response": {{
       "under_difficulty": one of ["doubles_down", "seeks_help", "freezes", "reframes", "distracts", "rebels"],
       "under_criticism": one of ["defensive", "curious", "ashamed", "motivated", "dismissive"],
       "under_success": one of ["confident", "complacent", "anxious_to_maintain", "generous", "exploratory"]
-    },
-    "decision_pattern": {
+    }},
+    "decision_pattern": {{
       "risk_appetite": number 0-1,
       "time_horizon": one of ["short", "medium", "long"],
       "tradeoff_style": one of ["safe_choice", "optimize_score", "protect_identity", "seek_growth", "maintain_relationships"],
       "typical_rationale": string, 20-500 characters
-    },
+    }},
     "narrative": string, 250-1800 characters
-  },
-  "derived_academic_tendency": {
+  }},
+  "derived_academic_tendency": {{
     "likely_performance_band": one of ["poor", "low", "mid", "high"],
-    "reasoning": string, 40-800 characters
-  }
-}"""
+    "reasoning": string, 40-{DERIVED_REASONING_MAX_LENGTH} characters
+  }}
+}}"""
 
 
-VALUES_SECTION_CONTRACT = """\
+VALUES_SECTION_CONTRACT = f"""\
 Schema contract for `values_identity`:
-{
-  "values_identity": {
+{{
+  "values_identity": {{
     "core_values": list of 2-6 strings,
-    "identity_anchor": string, 20-400 characters,
-    "moral_tension": string, 20-500 characters,
-    "aspiration": string, 20-500 characters
-  }
-}"""
+    "identity_anchor": string, 20-{IDENTITY_ANCHOR_MAX_LENGTH} characters,
+    "moral_tension": string, 20-{MORAL_TENSION_MAX_LENGTH} characters,
+    "aspiration": string, 20-{ASPIRATION_MAX_LENGTH} characters
+  }}
+}}"""
 
 
-SOCIAL_SECTION_CONTRACT = """\
+SOCIAL_SECTION_CONTRACT = f"""\
 Schema contract for `social_creative_profile`:
-{
-  "social_creative_profile": {
+{{
+  "social_creative_profile": {{
     "social_energy": number 0-1,
     "collaboration_style": one of ["leader", "supporter", "observer", "challenger", "mediator", "solo"],
     "expressiveness": number 0-1,
     "creative_mode": one of ["original", "remixing", "practical", "aesthetic", "strategic", "low_expression"],
     "peer_influence_sensitivity": number 0-1,
-    "narrative": string, 120-1200 characters
-  }
-}"""
+    "narrative": string, 120-{SOCIAL_NARRATIVE_MAX_LENGTH} characters
+  }}
+}}"""
 
 
-MENTAL_HEALTH_SECTION_CONTRACT = """\
+MENTAL_HEALTH_SECTION_CONTRACT = f"""\
 Schema contract for `mental_health_context`:
-{
-  "mental_health_context": {
+{{
+  "mental_health_context": {{
     "stress_load": number 0-1,
     "resilience": number 0-1,
     "coping_style": one of ["problem_solving", "emotional_support", "avoidance", "humor", "control", "withdrawal"],
     "protective_factors": list of 1-5 strings,
     "risk_factors": list of 1-5 strings,
-    "narrative": string, 120-1200 characters
-  }
-}"""
+    "narrative": string, 120-{MENTAL_HEALTH_NARRATIVE_MAX_LENGTH} characters
+  }}
+}}"""
 
 
 COGNITION_MOTIVATION_AGENT_SYSTEM_PROMPT = """You are the Cognition & Motivation Agent in a multi-agent persona pipeline.
@@ -169,6 +178,8 @@ Design requirements:
 5. If the person has high likely performance, ground it in motivation, habits, resources, or strategy.
 6. Do not write a flawless person. Avoid all-high or all-low trait patterns.
 7. The narrative must explain how they think, why they act, and what happens when they are blocked.
+8. Respect all field length limits exactly. If needed, compress phrasing rather than exceeding the schema budget.
+9. Keep `derived_academic_tendency.reasoning` under {DERIVED_REASONING_MAX_LENGTH} characters.
 
 Return valid JSON only, with exactly these two top-level keys."""
 
@@ -199,6 +210,7 @@ Design requirements:
 2. Give a plausible family context with resources, limits, and daily texture.
 3. Avoid making region, family, or stage a deterministic explanation for all traits.
 4. Keep the output valid for the MegaPersona schema.
+5. Keep `family_context` under {FAMILY_CONTEXT_MAX_LENGTH} characters. Prefer concise, information-dense writing.
 
 Return valid JSON only, with exactly this top-level key."""
 
@@ -239,6 +251,7 @@ Design requirements:
 2. Include a real moral tension, not a decorative contradiction.
 3. Avoid making the person flawless or one-note.
 4. Keep the output valid for the MegaPersona schema.
+5. Keep `identity_anchor` under {IDENTITY_ANCHOR_MAX_LENGTH} characters, `moral_tension` under {MORAL_TENSION_MAX_LENGTH}, and `aspiration` under {ASPIRATION_MAX_LENGTH}.
 
 Return valid JSON only, with exactly this top-level key."""
 
@@ -279,6 +292,7 @@ Design requirements:
 2. Make creativity concrete: original, remixing, practical, aesthetic, strategic, or low-expression.
 3. Explain peer influence without reducing the person to conformity.
 4. Keep the output valid for the MegaPersona schema.
+5. Keep `social_creative_profile.narrative` under {SOCIAL_NARRATIVE_MAX_LENGTH} characters. Use one compact narrative, not a long essay.
 
 Return valid JSON only, with exactly this top-level key."""
 
@@ -320,8 +334,104 @@ Design requirements:
 3. Do not diagnose. Describe behaviorally useful context.
 4. If stress is high and resilience is high, name concrete protective factors.
 5. Keep the output valid for the MegaPersona schema.
+6. Keep `mental_health_context.narrative` under {MENTAL_HEALTH_NARRATIVE_MAX_LENGTH} characters.
 
 Return valid JSON only, with exactly this top-level key."""
+
+
+COMPACT_PERSONA_SYSTEM_PROMPT = """You are a compact MegaPersona generator.
+
+Generate one complete, schema-valid MegaPersona object in a single call. This
+is a first-class generation architecture for experiments that test whether a
+single integrated writer can produce stronger cross-field coherence than a
+decomposed multi-agent pipeline. Prioritize internal consistency, target-axis
+expression, behavior prediction evidence, and strict JSON validity.
+"""
+
+
+def compact_persona_prompt(
+    slot_context_json: str,
+    blueprint_json: str,
+    prompt_addendum: str = "",
+) -> str:
+    addendum_block = prompt_addendum.strip() or "No evolved addendum."
+    return f"""Create ONE complete MegaPersona JSON object.
+
+Target slot:
+```json
+{slot_context_json}
+```
+
+Genome v3 generation blueprint:
+```json
+{blueprint_json}
+```
+
+Evolved policy addendum:
+{addendum_block}
+
+Required top-level keys:
+- persona_id
+- demographics
+- cognitive_motivation_profile
+- derived_academic_tendency
+- values_identity
+- social_creative_profile
+- mental_health_context
+
+Section contracts:
+{DEMOGRAPHICS_SECTION_CONTRACT}
+
+{COGNITION_SECTION_CONTRACT}
+
+{VALUES_SECTION_CONTRACT}
+
+{SOCIAL_SECTION_CONTRACT}
+
+{MENTAL_HEALTH_SECTION_CONTRACT}
+
+Design requirements:
+1. `persona_id` must equal the target slot id.
+2. Express each target axis through concrete mechanisms, not labels or copied numbers.
+3. Keep one strongest-weakest axis tension visible across cognition, values, social behavior, and mental health.
+4. Include behavior-predictive evidence for ambiguity, peer pressure, feedback, and deadline contexts.
+5. Do not create an all-high or all-low person; include at least one boundary or cost.
+6. Respect every field length limit exactly. Compress prose instead of exceeding schema limits.
+7. Return valid JSON only. No markdown, no commentary, no extra top-level keys."""
+
+
+def stage_repair_prompt(
+    *,
+    stage_name: str,
+    raw_stage_json: str,
+    required_keys_json: str,
+    context_json: str,
+) -> str:
+    return f"""Repair the output for stage `{stage_name}`.
+
+The stage output is missing required top-level keys or has the wrong shape.
+Return exactly one JSON object containing all required keys and no commentary.
+
+Required top-level keys:
+```json
+{required_keys_json}
+```
+
+Relevant context:
+```json
+{context_json}
+```
+
+Original stage output:
+```json
+{raw_stage_json}
+```
+
+Repair requirements:
+1. Preserve the original content as much as possible.
+2. Add only the missing required section(s), using the context and schema contracts.
+3. Keep all field values inside schema ranges and length limits.
+4. Return valid JSON only."""
 
 
 def revision_prompt(candidate_json: str, issues_json: str) -> str:
@@ -341,6 +451,7 @@ Repair requirements:
 1. Preserve the same persona_id and overall target profile.
 2. Fix only what is needed to satisfy the issues.
 3. Avoid all-high and all-low numeric trait patterns.
-4. Return one complete MegaPersona JSON object.
+4. Respect every field length limit exactly; compress instead of deleting core meaning.
+5. Return one complete MegaPersona JSON object.
 
 Return valid JSON only."""

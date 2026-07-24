@@ -9,8 +9,19 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.mega_persona.slots import AXIS_NAMES, AXIS_ROLE_MAP, LEGACY_AXIS_TO_ROLE
+
 
 Score01 = float
+
+
+FAMILY_CONTEXT_MAX_LENGTH = 1000
+IDENTITY_ANCHOR_MAX_LENGTH = 480
+MORAL_TENSION_MAX_LENGTH = 600
+ASPIRATION_MAX_LENGTH = 600
+SOCIAL_NARRATIVE_MAX_LENGTH = 1500
+MENTAL_HEALTH_NARRATIVE_MAX_LENGTH = 1500
+DERIVED_REASONING_MAX_LENGTH = 900
 
 
 class StrictModel(BaseModel):
@@ -30,7 +41,7 @@ class Demographics(StrictModel):
         "early_career",
     ]
     region_type: Literal["urban", "suburban", "rural", "migrant", "international"]
-    family_context: str = Field(min_length=20, max_length=800)
+    family_context: str = Field(min_length=20, max_length=FAMILY_CONTEXT_MAX_LENGTH)
 
 
 class ThinkingStyle(StrictModel):
@@ -159,9 +170,9 @@ class CognitiveMotivationProfile(StrictModel):
 
 class ValuesIdentity(StrictModel):
     core_values: list[str] = Field(min_length=2, max_length=6)
-    identity_anchor: str = Field(min_length=20, max_length=400)
-    moral_tension: str = Field(min_length=20, max_length=500)
-    aspiration: str = Field(min_length=20, max_length=500)
+    identity_anchor: str = Field(min_length=20, max_length=IDENTITY_ANCHOR_MAX_LENGTH)
+    moral_tension: str = Field(min_length=20, max_length=MORAL_TENSION_MAX_LENGTH)
+    aspiration: str = Field(min_length=20, max_length=ASPIRATION_MAX_LENGTH)
 
 
 class SocialCreativeProfile(StrictModel):
@@ -177,7 +188,7 @@ class SocialCreativeProfile(StrictModel):
         "low_expression",
     ]
     peer_influence_sensitivity: Score01 = Field(ge=0.0, le=1.0)
-    narrative: str = Field(min_length=120, max_length=1200)
+    narrative: str = Field(min_length=120, max_length=SOCIAL_NARRATIVE_MAX_LENGTH)
 
 
 class MentalHealthContext(StrictModel):
@@ -193,12 +204,12 @@ class MentalHealthContext(StrictModel):
     ]
     protective_factors: list[str] = Field(min_length=1, max_length=5)
     risk_factors: list[str] = Field(min_length=1, max_length=5)
-    narrative: str = Field(min_length=120, max_length=1200)
+    narrative: str = Field(min_length=120, max_length=MENTAL_HEALTH_NARRATIVE_MAX_LENGTH)
 
 
 class DerivedAcademicTendency(StrictModel):
     likely_performance_band: Literal["poor", "low", "mid", "high"]
-    reasoning: str = Field(min_length=40, max_length=800)
+    reasoning: str = Field(min_length=40, max_length=DERIVED_REASONING_MAX_LENGTH)
 
 
 class MegaPersona(StrictModel):
@@ -210,20 +221,24 @@ class MegaPersona(StrictModel):
     mental_health_context: MentalHealthContext
     derived_academic_tendency: DerivedAcademicTendency
 
-    def primary_axes(self) -> dict[str, float]:
-        """Return the primary continuous axes used for coverage."""
+    def primary_axes(
+        self,
+        axis_names: tuple[str, ...] = AXIS_NAMES,
+        axis_roles: dict[str, str] | None = None,
+    ) -> dict[str, float]:
+        """Return primary continuous axes, optionally projected onto a schema binding."""
         cognitive = self.cognitive_motivation_profile
         motivation = cognitive.motivation_system
         regulation = cognitive.self_regulation
         health = self.mental_health_context
-        return {
-            "cognitive_abstraction": cognitive.thinking_style.abstraction_level,
-            "motivation_autonomy": (
+        canonical = {
+            "cognitive_core": cognitive.thinking_style.abstraction_level,
+            "motivation_core": (
                 motivation.intrinsic_motivation
                 + (1.0 - motivation.external_pressure_sensitivity)
             )
             / 2.0,
-            "self_regulation_resilience": (
+            "regulation_core": (
                 regulation.persistence
                 + regulation.emotional_regulation
                 + regulation.metacognition
@@ -232,3 +247,22 @@ class MegaPersona(StrictModel):
             )
             / 5.0,
         }
+        roles = dict(AXIS_ROLE_MAP)
+        if axis_roles:
+            roles.update(axis_roles)
+
+        projected: dict[str, float] = {}
+        for axis_name in axis_names:
+            role = LEGACY_AXIS_TO_ROLE.get(axis_name)
+            if role is not None:
+                projected[axis_name] = canonical[role]
+                continue
+            matched_role = next(
+                (role_name for role_name, mapped_axis in roles.items() if mapped_axis == axis_name),
+                None,
+            )
+            if matched_role in canonical:
+                projected[axis_name] = canonical[matched_role]
+            else:
+                projected[axis_name] = 0.5
+        return projected

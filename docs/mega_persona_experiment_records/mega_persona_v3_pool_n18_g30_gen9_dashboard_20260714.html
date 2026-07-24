@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MegaPersona n18 g30 Checkpoint Dashboard</title>
+<style>
+:root { color-scheme: light; --bg:#f7f8fb; --text:#111827; --muted:#6b7280; --line:#e5e7eb; --card:#ffffff; --accent:#2563eb; }
+* { box-sizing:border-box; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; background:var(--bg); color:var(--text); }
+main { max-width:1180px; margin:0 auto; padding:28px 22px 46px; }
+h1 { margin:0 0 8px; font-size:28px; font-weight:760; letter-spacing:0; }
+h2 { margin:28px 0 12px; font-size:18px; }
+p { color:var(--muted); margin:6px 0 0; line-height:1.5; }
+.note { color:#374151; background:#f9fafb; border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+.grid-cards { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:18px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; box-shadow:0 1px 2px rgba(15,23,42,.04); }
+.card-label { color:var(--muted); font-size:13px; }
+.card-value { font-size:25px; font-weight:760; margin-top:6px; }
+.card-delta { font-size:13px; margin-top:4px; }
+.pos { color:#15803d; } .neg { color:#b91c1c; }
+.panel { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-top:12px; overflow:auto; }
+.chart { width:100%; height:auto; display:block; }
+.axis text, .chart text { fill:#4b5563; font-size:12px; }
+.axis-label { fill:#6b7280; font-size:12px; }
+.grid { stroke:#e5e7eb; stroke-width:1; }
+.legend text { font-size:12px; fill:#374151; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th,td { border-bottom:1px solid var(--line); padding:9px 8px; text-align:right; white-space:nowrap; }
+th:first-child,td:first-child { text-align:left; }
+th { color:#4b5563; font-weight:680; background:#fafafa; }
+.badge { display:inline-block; padding:4px 8px; border:1px solid var(--line); border-radius:999px; color:#374151; background:#fff; font-size:12px; margin-right:6px; }
+.meta { margin-top:14px; }
+.bar-label { fill:#111827; font-size:11px; font-weight:650; }
+@media (max-width:760px) { .grid-cards { grid-template-columns:1fr; } main { padding:20px 14px 36px; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>MegaPersona v3 Pool n18/g30 中途结果可视化</h1>
+  <p>数据来源：<code>data/results/mega_persona_v3_pool_single_call_deepseek_n18_g30_survey4_seed17_23_20260713</code></p>
+  <div class="meta">
+    <span class="badge">checkpoint generation: 10</span>
+    <span class="badge">completed history: gen1-gen9</span>
+    <span class="badge">islands: 8</span>
+    <span class="badge">children/island: 1</span>
+  </div>
+  <div class="grid-cards">
+      <div class="card metric-card">
+        <div class="card-label">综合 fitness / Global best</div>
+        <div class="card-value">0.3871</div>
+        <div class="card-delta pos">0.0112 vs gen1</div>
+      </div>
+      <div class="card metric-card">
+        <div class="card-label">行为覆盖率 / Coverage</div>
+        <div class="card-value">0.5425</div>
+        <div class="card-delta pos">0.0415 vs gen1</div>
+      </div>
+      <div class="card metric-card">
+        <div class="card-label">旧行为对齐分 / Legacy alignment</div>
+        <div class="card-value">0.8485</div>
+        <div class="card-delta pos">0.0235 vs gen1</div>
+      </div>
+      <div class="card metric-card">
+        <div class="card-label">旧一致性分 / Legacy consistency</div>
+        <div class="card-value">0.9484</div>
+        <div class="card-delta pos">0.0167 vs gen1</div>
+      </div>
+      <div class="card metric-card">
+        <div class="card-label">行为多样性 / Diversity</div>
+        <div class="card-value">0.3759</div>
+        <div class="card-delta pos">0.0124 vs gen1</div>
+      </div>
+      <div class="card metric-card">
+        <div class="card-label">schema 合法性 / Schema</div>
+        <div class="card-value">0.5574</div>
+        <div class="card-delta neg">-0.0104 vs gen1</div>
+      </div></div>
+
+  <h2>指标中文意义</h2>
+  <div class="panel">
+    <p class="note">这个 checkpoint 是严格误差指标加入之前跑出来的，所以这里只能展示 legacy 指标和可从 legacy 指标反推的过渡误差。后续继续跑或重新评估后，新的 candidate/evaluation 会直接写入 shadow behavior MAE、axis target MAE、consistency issue rate 和 strict consistency error。</p>
+    <table>
+      <thead><tr><th>指标</th><th>中文意义</th><th>方向</th><th>当前解释方式</th></tr></thead>
+      <tbody>
+        <tr><td>综合 fitness</td><td>历史主优化分数，由 schema、coverage、alignment、consistency 等共同决定</td><td>越高越好</td><td>用于和过去 20 代实验保持可比</td></tr>
+        <tr><td>行为覆盖率</td><td>生成群体在 shadow survey 行为空间里的覆盖程度</td><td>越高越好</td><td>本次从 0.5010 到 0.5425，有可见提升</td></tr>
+        <tr><td>旧行为对齐分</td><td>历史的 1-MAE 式行为对齐分，初始值通常偏高</td><td>越高越好</td><td>仅作兼容指标，不建议作为论文主结论</td></tr>
+        <tr><td>shadow behavior MAE</td><td>persona 声明轴与 shadow survey 行为轴的平均绝对误差</td><td>越低越好</td><td>旧 checkpoint 可用 1 - legacy alignment 近似反推</td></tr>
+        <tr><td>旧一致性分</td><td>历史内部一致性分，容易因为惩罚温和而初始偏高</td><td>越高越好</td><td>仅作 sanity check</td></tr>
+        <tr><td>axis target MAE</td><td>生成 persona 的轴表达与目标 slot 轴之间的误差</td><td>越低越好</td><td>旧 checkpoint 无法可靠反推，需要新评估写入</td></tr>
+        <tr><td>consistency issue rate</td><td>每个人格平均触发的一致性问题数量</td><td>越低越好</td><td>旧 checkpoint 无法可靠反推，需要新评估写入</td></tr>
+        <tr><td>strict consistency error</td><td>axis target MAE 与一致性问题率组合出的严格一致性误差</td><td>越低越好</td><td>后续论文解释优先看这个，不替代历史 fitness</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>过渡严格指标</h2>
+  <div class="panel">
+    <table>
+      <thead><tr><th>指标</th><th>Gen1</th><th>当前 best</th><th>变化</th><th>解释</th></tr></thead>
+      <tbody>
+        <tr><td>shadow behavior MAE proxy</td><td>0.1751</td><td>0.1515</td><td class="pos">-0.0235</td><td>由 1 - legacy alignment 反推，越低越好</td></tr>
+        <tr><td>legacy consistency error proxy</td><td>0.0683</td><td>0.0516</td><td class="pos">-0.0167</td><td>由 1 - legacy consistency 反向读数，只能作过渡参考</td></tr>
+        <tr><td>axis target MAE</td><td>n/a</td><td>n/a</td><td>n/a</td><td>旧 checkpoint 未记录，需要继续跑新代码后产生</td></tr>
+        <tr><td>consistency issue rate</td><td>n/a</td><td>n/a</td><td>n/a</td><td>旧 checkpoint 未记录，需要继续跑新代码后产生</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Best Fitness Trajectory</h2>
+  <div class="panel"><svg viewBox="0 0 960 320" class="chart"><line x1="49" y1="282.0" x2="810" y2="282.0" class="grid" /><text x="44" y="286.0" text-anchor="end">0.363</text><line x1="49" y1="216.0" x2="810" y2="216.0" class="grid" /><text x="44" y="220.0" text-anchor="end">0.509</text><line x1="49" y1="150.0" x2="810" y2="150.0" class="grid" /><text x="44" y="154.0" text-anchor="end">0.656</text><line x1="49" y1="84.0" x2="810" y2="84.0" class="grid" /><text x="44" y="88.0" text-anchor="end">0.802</text><line x1="49" y1="18.0" x2="810" y2="18.0" class="grid" /><text x="44" y="22.0" text-anchor="end">0.948</text><text x="54.0" y="308" text-anchor="middle">1</text><text x="148.5" y="308" text-anchor="middle">2</text><text x="243.0" y="308" text-anchor="middle">3</text><text x="337.5" y="308" text-anchor="middle">4</text><text x="432.0" y="308" text-anchor="middle">5</text><text x="526.5" y="308" text-anchor="middle">6</text><text x="621.0" y="308" text-anchor="middle">7</text><text x="715.5" y="308" text-anchor="middle">8</text><text x="810.0" y="308" text-anchor="middle">9</text><polyline points="54.0,276.2 148.5,276.2 243.0,275.2 337.5,275.2 432.0,275.2 526.5,273.6 621.0,273.6 715.5,273.6 810.0,271.1" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" /><polyline points="54.0,219.8 148.5,219.8 243.0,218.4 337.5,218.4 432.0,218.4 526.5,210.1 621.0,210.1 715.5,210.1 810.0,201.1" fill="none" stroke="#16a34a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" /><polyline points="54.0,73.7 148.5,73.7 243.0,75.0 337.5,75.0 432.0,75.0 526.5,74.9 621.0,74.9 715.5,74.9 810.0,63.1" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" /><polyline points="54.0,25.5 148.5,25.5 243.0,27.3 337.5,27.3 432.0,27.3 526.5,20.2 621.0,20.2 715.5,20.2 810.0,18.0" fill="none" stroke="#9333ea" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" /><polyline points="54.0,281.8 148.5,281.8 243.0,282.0 337.5,282.0 432.0,282.0 526.5,276.7 621.0,276.7 715.5,276.7 810.0,276.2" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" /><polyline points="54.0,189.6 148.5,189.6 243.0,187.1 337.5,187.1 432.0,187.1 526.5,190.5 621.0,190.5 715.5,190.5 810.0,194.3" fill="none" stroke="#0891b2" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" /><g class="legend"><rect x="832" y="16" width="12" height="12" fill="#2563eb" rx="2"/><text x="852" y="26">Global best</text><rect x="832" y="40" width="12" height="12" fill="#16a34a" rx="2"/><text x="852" y="50">Coverage</text><rect x="832" y="64" width="12" height="12" fill="#dc2626" rx="2"/><text x="852" y="74">Alignment</text><rect x="832" y="88" width="12" height="12" fill="#9333ea" rx="2"/><text x="852" y="98">Consistency</text><rect x="832" y="112" width="12" height="12" fill="#f59e0b" rx="2"/><text x="852" y="122">Diversity</text><rect x="832" y="136" width="12" height="12" fill="#0891b2" rx="2"/><text x="852" y="146">Schema</text></g></svg></div>
+
+  <h2>Global Best</h2>
+  <div class="panel">
+    <svg viewBox="0 0 940 280" class="chart line-chart" role="img" aria-label="Global best over generation">
+      <g class="axis"><line x1="49" y1="242.0" x2="922" y2="242.0" class="grid" /><text x="44" y="246.0" text-anchor="end">0.376</text><line x1="49" y1="186.0" x2="922" y2="186.0" class="grid" /><text x="44" y="190.0" text-anchor="end">0.379</text><line x1="49" y1="130.0" x2="922" y2="130.0" class="grid" /><text x="44" y="134.0" text-anchor="end">0.381</text><line x1="49" y1="74.0" x2="922" y2="74.0" class="grid" /><text x="44" y="78.0" text-anchor="end">0.384</text><line x1="49" y1="18.0" x2="922" y2="18.0" class="grid" /><text x="44" y="22.0" text-anchor="end">0.387</text><line x1="54.0" y1="242" x2="54.0" y2="247" /><text x="54.0" y="270" text-anchor="middle">1</text><line x1="162.5" y1="242" x2="162.5" y2="247" /><text x="162.5" y="270" text-anchor="middle">2</text><line x1="271.0" y1="242" x2="271.0" y2="247" /><text x="271.0" y="270" text-anchor="middle">3</text><line x1="379.5" y1="242" x2="379.5" y2="247" /><text x="379.5" y="270" text-anchor="middle">4</text><line x1="488.0" y1="242" x2="488.0" y2="247" /><text x="488.0" y="270" text-anchor="middle">5</text><line x1="596.5" y1="242" x2="596.5" y2="247" /><text x="596.5" y="270" text-anchor="middle">6</text><line x1="705.0" y1="242" x2="705.0" y2="247" /><text x="705.0" y="270" text-anchor="middle">7</text><line x1="813.5" y1="242" x2="813.5" y2="247" /><text x="813.5" y="270" text-anchor="middle">8</text><line x1="922.0" y1="242" x2="922.0" y2="247" /><text x="922.0" y="270" text-anchor="middle">9</text></g>
+      <polyline points="54.0,242.0 162.5,242.0 271.0,197.6 379.5,197.6 488.0,197.6 596.5,125.5 705.0,125.5 813.5,125.5 922.0,18.0" fill="none" stroke="#2563eb" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" />
+      <g fill="#2563eb"><circle cx="54.0" cy="242.0" r="4"><title>gen 1: 0.375862</title></circle><circle cx="162.5" cy="242.0" r="4"><title>gen 2: 0.375862</title></circle><circle cx="271.0" cy="197.6" r="4"><title>gen 3: 0.378087</title></circle><circle cx="379.5" cy="197.6" r="4"><title>gen 4: 0.378087</title></circle><circle cx="488.0" cy="197.6" r="4"><title>gen 5: 0.378087</title></circle><circle cx="596.5" cy="125.5" r="4"><title>gen 6: 0.381698</title></circle><circle cx="705.0" cy="125.5" r="4"><title>gen 7: 0.381698</title></circle><circle cx="813.5" cy="125.5" r="4"><title>gen 8: 0.381698</title></circle><circle cx="922.0" cy="18.0" r="4"><title>gen 9: 0.387083</title></circle></g>
+      <text x="470.0" y="278" text-anchor="middle" class="axis-label">Generation</text>
+    </svg></div>
+
+  <h2>Island Snapshot</h2>
+  <div class="panel"><svg viewBox="0 0 940 260" class="chart bars" fill="#2563eb"><rect x="45.0" y="20.9" width="100.6" height="205.1" rx="4"><title>Island 0: 0.381698</title></rect><text x="95.3" y="250" text-anchor="middle">0</text><text x="95.3" y="14.9" text-anchor="middle" class="bar-label">0.382</text><rect x="155.6" y="22.8" width="100.6" height="203.2" rx="4"><title>Island 1: 0.378087</title></rect><text x="205.9" y="250" text-anchor="middle">1</text><text x="205.9" y="16.8" text-anchor="middle" class="bar-label">0.378</text><rect x="266.2" y="22.8" width="100.6" height="203.2" rx="4"><title>Island 2: 0.378087</title></rect><text x="316.6" y="250" text-anchor="middle">2</text><text x="316.6" y="16.8" text-anchor="middle" class="bar-label">0.378</text><rect x="376.9" y="22.8" width="100.6" height="203.2" rx="4"><title>Island 3: 0.378087</title></rect><text x="427.2" y="250" text-anchor="middle">3</text><text x="427.2" y="16.8" text-anchor="middle" class="bar-label">0.378</text><rect x="487.5" y="20.9" width="100.6" height="205.1" rx="4"><title>Island 4: 0.381698</title></rect><text x="537.8" y="250" text-anchor="middle">4</text><text x="537.8" y="14.9" text-anchor="middle" class="bar-label">0.382</text><rect x="598.1" y="20.9" width="100.6" height="205.1" rx="4"><title>Island 5: 0.381698</title></rect><text x="648.4" y="250" text-anchor="middle">5</text><text x="648.4" y="14.9" text-anchor="middle" class="bar-label">0.382</text><rect x="708.8" y="20.9" width="100.6" height="205.1" rx="4"><title>Island 6: 0.381698</title></rect><text x="759.1" y="250" text-anchor="middle">6</text><text x="759.1" y="14.9" text-anchor="middle" class="bar-label">0.382</text><rect x="819.4" y="18.0" width="100.6" height="208.0" rx="4"><title>Island 7: 0.387083</title></rect><text x="869.7" y="250" text-anchor="middle">7</text><text x="869.7" y="12.0" text-anchor="middle" class="bar-label">0.387</text><text x="470.0" y="259" text-anchor="middle" class="axis-label">Island</text></svg></div>
+
+  <h2>Generation Table</h2>
+  <div class="panel"><table><thead><tr><th>Gen</th><th>Eval</th><th>Improve</th><th>Global</th><th>Coverage</th><th>Alignment</th><th>Consistency</th><th>Diversity</th><th>Schema</th></tr></thead><tbody><tr><td>1</td><td>8</td><td>7</td><td>0.3759</td><td>0.5010</td><td>0.8249</td><td>0.9317</td><td>0.3635</td><td>0.5678</td></tr><tr><td>2</td><td>8</td><td>5</td><td>0.3759</td><td>0.5010</td><td>0.8249</td><td>0.9317</td><td>0.3635</td><td>0.5678</td></tr><tr><td>3</td><td>8</td><td>6</td><td>0.3781</td><td>0.5040</td><td>0.8221</td><td>0.9277</td><td>0.3630</td><td>0.5735</td></tr><tr><td>4</td><td>8</td><td>4</td><td>0.3781</td><td>0.5040</td><td>0.8221</td><td>0.9277</td><td>0.3630</td><td>0.5735</td></tr><tr><td>5</td><td>8</td><td>3</td><td>0.3781</td><td>0.5040</td><td>0.8221</td><td>0.9277</td><td>0.3630</td><td>0.5735</td></tr><tr><td>6</td><td>8</td><td>4</td><td>0.3817</td><td>0.5225</td><td>0.8223</td><td>0.9435</td><td>0.3747</td><td>0.5658</td></tr><tr><td>7</td><td>8</td><td>1</td><td>0.3817</td><td>0.5225</td><td>0.8223</td><td>0.9435</td><td>0.3747</td><td>0.5658</td></tr><tr><td>8</td><td>8</td><td>6</td><td>0.3817</td><td>0.5225</td><td>0.8223</td><td>0.9435</td><td>0.3747</td><td>0.5658</td></tr><tr><td>9</td><td>8</td><td>4</td><td>0.3871</td><td>0.5425</td><td>0.8485</td><td>0.9484</td><td>0.3759</td><td>0.5574</td></tr></tbody></table></div>
+
+  <h2>Island Table</h2>
+  <div class="panel"><table><thead><tr><th>Island</th><th>Global</th><th>Coverage</th><th>Alignment</th><th>Consistency</th><th>Diversity</th><th>Schema</th></tr></thead><tbody><tr><td>0</td><td>0.3817</td><td>0.5225</td><td>0.8358</td><td>0.9435</td><td>0.3764</td><td>0.5735</td></tr><tr><td>1</td><td>0.3781</td><td>0.5160</td><td>0.8391</td><td>0.9348</td><td>0.3764</td><td>0.5735</td></tr><tr><td>2</td><td>0.3781</td><td>0.5040</td><td>0.8415</td><td>0.9362</td><td>0.3764</td><td>0.5735</td></tr><tr><td>3</td><td>0.3781</td><td>0.5085</td><td>0.8354</td><td>0.9371</td><td>0.3764</td><td>0.5735</td></tr><tr><td>4</td><td>0.3817</td><td>0.5225</td><td>0.8363</td><td>0.9435</td><td>0.3764</td><td>0.5816</td></tr><tr><td>5</td><td>0.3817</td><td>0.5225</td><td>0.8398</td><td>0.9435</td><td>0.3764</td><td>0.5758</td></tr><tr><td>6</td><td>0.3817</td><td>0.5225</td><td>0.8358</td><td>0.9443</td><td>0.3764</td><td>0.5797</td></tr><tr><td>7</td><td>0.3871</td><td>0.5455</td><td>0.8485</td><td>0.9484</td><td>0.3836</td><td>0.5678</td></tr></tbody></table></div>
+</main>
+</body>
+</html>

@@ -137,6 +137,22 @@ class Logger:
         print(console_msg)
         self._write_to_file(file_msg)
 
+    def metric_delta(self, name: str, baseline: float, current: float, unit: str = ""):
+        """打印当前指标及其相对 baseline 的变化."""
+        delta = current - baseline
+        if abs(baseline) < 1e-12:
+            pct_text = "n/a"
+        else:
+            pct_text = f"{delta / abs(baseline) * 100:+.2f}%"
+        detail = (
+            f"base={baseline:+.6f} now={current:+.6f} "
+            f"delta={delta:+.6f} delta_pct={pct_text}"
+        )
+        console_msg = f"{self._prefix('METR', Colors.GREEN)} {name:20s}: {detail} {unit}"
+        file_msg = f"{self._plain_prefix('METR')} {name:20s}: {detail} {unit}"
+        print(console_msg)
+        self._write_to_file(file_msg)
+
     def step(self, step_name: str, step_num: int, total_steps: int):
         """打印步骤标题."""
         console_msg = f"\n{Colors.BOLD}{Colors.YELLOW}[{step_num}/{total_steps}] {step_name}{Colors.END}"

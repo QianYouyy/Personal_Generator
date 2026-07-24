@@ -8,6 +8,10 @@ from typing import Any, Literal
 import numpy as np
 
 from src.evaluator.metrics import DiversityMetrics
+from src.mega_persona.consistency import (
+    PopulationConsistencyEvaluation,
+    evaluate_population_consistency,
+)
 from src.mega_persona.evaluation import MegaPersonaEvaluation, evaluate_mega_personas
 from src.mega_persona.generator import MegaPersonaGenerator
 from src.mega_persona.schema import MegaPersona
@@ -19,7 +23,15 @@ from src.mega_persona.shadow_simulator import (
     shadow_behavior_axis_matrix,
 )
 from src.mega_persona.shadow_survey import ShadowSurvey, build_initial_shadow_surveys
-from src.mega_persona.slots import AXIS_NAMES, MegaPersonaSlot, SlotSampler
+from src.mega_persona.slots import (
+    AXIS_NAMES,
+    MegaPersonaSlot,
+    SlotSampler,
+    axis_names_for_binding,
+    axis_roles_for_binding,
+    default_schema_binding,
+    quota_buckets_for_binding,
+)
 from src.mega_persona.template_generator import RuleBasedMegaPersonaBuilder
 
 
@@ -35,6 +47,8 @@ class MegaPersonaExperimentConfig:
     items_per_shadow_survey: int = 12
     coverage_radius: float = 0.28
     duplicate_threshold: float = 0.82
+    persona_max_workers: int = 1
+    shadow_max_workers: int = 1
 
 
 @dataclass
@@ -45,6 +59,7 @@ class MegaPersonaExperimentRun:
     slots: list[MegaPersonaSlot]
     personas: list[MegaPersona]
     schema_evaluation: MegaPersonaEvaluation
+    consistency_evaluation: PopulationConsistencyEvaluation
     shadow_behavior: ShadowBehaviorReport
     slot_diversity_metrics: dict[str, float]
     behavior_diversity_metrics: dict[str, float]
@@ -61,6 +76,7 @@ class MegaPersonaExperimentRun:
             "experiment_score": self.experiment_score,
             "slot_diversity_metrics": self.slot_diversity_metrics,
             "schema_evaluation": self.schema_evaluation.to_dict(),
+            "internal_consistency": self.consistency_evaluation.to_dict(),
             "shadow_behavior": self.shadow_behavior.to_dict(),
             "behavior_diversity_metrics": self.behavior_diversity_metrics,
             "slots": [asdict(slot) for slot in self.slots],
@@ -98,6 +114,15 @@ class MegaPersonaExperimentSummary:
             "validity_rate": [run.schema_evaluation.validity_rate for run in self.runs],
             "near_duplicate_rate": [
                 run.schema_evaluation.near_duplicate_rate for run in self.runs
+            ],
+            "internal_consistency": [
+                run.consistency_evaluation.mean_score for run in self.runs
+            ],
+            "internal_consistency_min": [
+                run.consistency_evaluation.min_score for run in self.runs
+            ],
+            "axis_alignment": [
+                run.consistency_evaluation.axis_alignment_mean for run in self.runs
             ],
             "shadow_alignment": [
                 run.shadow_behavior.overall_alignment for run in self.runs
@@ -137,6 +162,9 @@ class MegaPersonaExperimentSummary:
             "schema_fitness",
             "validity_rate",
             "near_duplicate_rate",
+            "internal_consistency",
+            "internal_consistency_min",
+            "axis_alignment",
             "shadow_alignment",
             "behavior_coverage",
             "slot_coverage",
@@ -151,8 +179,8 @@ class MegaPersonaExperimentSummary:
                 "",
                 "## Runs",
                 "",
-                "| Seed | Score | Valid | Schema Fit | Shadow Align | Behavior Cov | Slot Cov |",
-                "|---:|---:|---:|---:|---:|---:|---:|",
+                "| Seed | Score | Valid | Schema Fit | Consistency | Shadow Align | Behavior Cov | Slot Cov |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for run in self.runs:
@@ -160,6 +188,7 @@ class MegaPersonaExperimentSummary:
                 f"| {run.seed} | {run.experiment_score:.4f} | "
                 f"{run.schema_evaluation.valid_count}/{run.schema_evaluation.sample_size} | "
                 f"{run.schema_evaluation.fitness:.4f} | "
+                f"{run.consistency_evaluation.mean_score:.4f} | "
                 f"{run.shadow_behavior.overall_alignment:.4f} | "
                 f"{run.behavior_diversity_metrics.get('coverage', 0.0):.4f} | "
                 f"{run.slot_diversity_metrics.get('coverage', 0.0):.4f} |"
@@ -191,11 +220,18 @@ class MegaPersonaExperimentRunner:
         )
 
     def run_seed(self, seed: int) -> MegaPersonaExperimentRun:
-        slots = SlotSampler().sample(n=self.config.n, seed=seed)
+        schema_binding = default_schema_binding()
+        axis_names = axis_names_for_binding(schema_binding)
+        axis_roles = axis_roles_for_binding(schema_binding)
+        slots = SlotSampler(
+            quota_buckets=quota_buckets_for_binding(schema_binding),
+            axis_names=axis_names,
+        ).sample(n=self.config.n, seed=seed)
         shadow_surveys = build_initial_shadow_surveys(
             num_surveys=self.config.num_shadow_surveys,
             items_per_survey=self.config.items_per_shadow_survey,
             seed=seed,
+            schema_binding=schema_binding,
         )
         personas = self._generate_personas(slots)
 
@@ -203,21 +239,36 @@ class MegaPersonaExperimentRunner:
             personas,
             coverage_radius=self.config.coverage_radius,
             duplicate_threshold=self.config.duplicate_threshold,
+            axis_names=axis_names,
+            axis_roles=axis_roles,
+        )
+        consistency_evaluation = evaluate_population_consistency(
+            personas,
+            slots,
+            axis_names=axis_names,
+            axis_roles=axis_roles,
         )
         shadow_simulations = LLMShadowSimulator(
             self.simulator_llm_client,
+            max_workers=self.config.shadow_max_workers,
         ).simulate_population(personas, shadow_surveys)
-        shadow_behavior = aggregate_shadow_behavior(personas, shadow_simulations)
+        shadow_behavior = aggregate_shadow_behavior(
+            personas,
+            shadow_simulations,
+            axis_names=axis_names,
+            axis_roles=axis_roles,
+        )
         slot_diversity = _diversity_for_matrix(
-            np.array([slot.axis_vector() for slot in slots], dtype=float),
+            np.array([slot.axis_vector(axis_names) for slot in slots], dtype=float),
             self.config.coverage_radius,
         )
         behavior_diversity = _diversity_for_matrix(
-            shadow_behavior_axis_matrix(personas, shadow_simulations),
+            shadow_behavior_axis_matrix(personas, shadow_simulations, axis_names=axis_names),
             self.config.coverage_radius,
         )
         experiment_score = _experiment_score(
             schema_fitness=schema_evaluation.fitness,
+            internal_consistency=consistency_evaluation.mean_score,
             behavior_coverage=behavior_diversity.get("coverage", 0.0),
             shadow_alignment=shadow_behavior.overall_alignment,
             generation_rate=len(personas) / len(slots) if slots else 0.0,
@@ -230,6 +281,7 @@ class MegaPersonaExperimentRunner:
             slots=slots,
             personas=personas,
             schema_evaluation=schema_evaluation,
+            consistency_evaluation=consistency_evaluation,
             shadow_behavior=shadow_behavior,
             slot_diversity_metrics=slot_diversity,
             behavior_diversity_metrics=behavior_diversity,
@@ -242,7 +294,10 @@ class MegaPersonaExperimentRunner:
             return RuleBasedMegaPersonaBuilder().build_population(slots)
 
         generator = MegaPersonaGenerator(self.llm_client)
-        results = generator.generate_from_slots(slots)
+        results = generator.generate_from_slots(
+            slots,
+            max_workers=self.config.persona_max_workers,
+        )
         return [result.persona for result in results if result.persona is not None]
 
 
@@ -282,6 +337,7 @@ def compute_experiment_score(
     behavior_coverage: float,
     shadow_alignment: float,
     generation_rate: float,
+    internal_consistency: float = 1.0,
 ) -> float:
     """Multiplicative gated score used by both batch experiments and evolution.
 
@@ -292,7 +348,14 @@ def compute_experiment_score(
     """
     behavior_gate = 0.5 + 0.5 * float(np.clip(behavior_coverage, 0.0, 1.0))
     alignment_gate = 0.5 + 0.5 * float(np.clip(shadow_alignment, 0.0, 1.0))
-    return float(schema_fitness * behavior_gate * alignment_gate * generation_rate)
+    consistency_gate = 0.5 + 0.5 * float(np.clip(internal_consistency, 0.0, 1.0))
+    return float(
+        schema_fitness
+        * consistency_gate
+        * behavior_gate
+        * alignment_gate
+        * generation_rate
+    )
 
 
 # retained for backward-compatibility within this module

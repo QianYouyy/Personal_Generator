@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 from src.mega_persona.schema import MegaPersona
-from src.mega_persona.slots import AXIS_NAMES
+from src.mega_persona.slots import AXIS_NAMES, axis_names_for_binding, schema_binding_for_genome
 
 _TEMPLATE_PATH = Path(__file__).parent / "html_template.html"
 
@@ -151,11 +151,15 @@ def _build_fitness_history(evo_dir: Path) -> list[dict[str, Any]]:
 
 
 def _build_scatter_data(best_result: dict[str, Any] | None) -> dict[str, Any]:
+    axis_names = _infer_axis_names(
+        genome=(best_result or {}).get("candidate", {}).get("genome"),
+        slots=((best_result or {}).get("per_seed", [{}])[0].get("slots", []) if best_result and best_result.get("per_seed") else []),
+    )
     empty = {
         "slot_axes": [],
         "persona_axes": [],
         "behavior_axes": [],
-        "axis_names": list(AXIS_NAMES),
+        "axis_names": list(axis_names),
     }
     if not best_result:
         return empty
@@ -164,9 +168,9 @@ def _build_scatter_data(best_result: dict[str, Any] | None) -> dict[str, Any]:
         return empty
     first = per_seed[0]
 
-    slot_axes = _extract_slot_axes(first.get("slots", []))
-    persona_axes = _extract_persona_axes(first.get("personas", []))
-    behavior_axes = _extract_behavior_axes(first)
+    slot_axes = _extract_slot_axes(first.get("slots", []), axis_names=axis_names)
+    persona_axes = _extract_persona_axes(first.get("personas", []), axis_names=axis_names)
+    behavior_axes = _extract_behavior_axes(first, axis_names=axis_names)
 
     # Truncate if too large
     if len(persona_axes) > MAX_SCATTER_POINTS:
@@ -178,7 +182,7 @@ def _build_scatter_data(best_result: dict[str, Any] | None) -> dict[str, Any]:
         "slot_axes": slot_axes,
         "persona_axes": persona_axes,
         "behavior_axes": behavior_axes,
-        "axis_names": list(AXIS_NAMES),
+        "axis_names": list(axis_names),
     }
 
 
@@ -218,13 +222,15 @@ def _extract_experiment_data(summary_path: Path) -> dict[str, Any]:
     summary = _read_json(summary_path)
     runs = summary.get("runs", [])
     first = runs[0] if runs else {}
+    axis_names = _infer_axis_names(genome=first.get("genome"), slots=first.get("slots", []))
 
-    slot_axes = _extract_slot_axes(first.get("slots", []))
+    slot_axes = _extract_slot_axes(first.get("slots", []), axis_names=axis_names)
     persona_data = first.get("personas", [])
-    persona_axes = _extract_persona_axes(persona_data)
+    persona_axes = _extract_persona_axes(persona_data, axis_names=axis_names)
     behavior_axes = _extract_behavior_axes_from_sims(
         persona_data,
         first.get("shadow_simulations", []),
+        axis_names=axis_names,
     )
 
     per_seed: list[dict[str, Any]] = []
@@ -251,7 +257,7 @@ def _extract_experiment_data(summary_path: Path) -> dict[str, Any]:
             "slot_axes": slot_axes,
             "persona_axes": persona_axes,
             "behavior_axes": behavior_axes,
-            "axis_names": list(AXIS_NAMES),
+            "axis_names": list(axis_names),
         },
         "genome": {},
         "metrics": summary.get("aggregate", {}),
@@ -285,12 +291,13 @@ def _extract_generation_data(json_path: Path) -> dict[str, Any]:
         fitness_history = []
         best = payload
 
+    axis_names = _infer_axis_names(genome=best.get("genome"), slots=payload.get("slots", []))
     slots = payload.get("slots", [])
     personas = payload.get("personas", [])
     sims = payload.get("shadow_simulations", [])
-    slot_axes = _extract_slot_axes(slots)
-    persona_axes = _extract_persona_axes(personas)
-    behavior_axes = _extract_behavior_axes_from_sims(personas, sims)
+    slot_axes = _extract_slot_axes(slots, axis_names=axis_names)
+    persona_axes = _extract_persona_axes(personas, axis_names=axis_names)
+    behavior_axes = _extract_behavior_axes_from_sims(personas, sims, axis_names=axis_names)
 
     return {
         "title": json_path.stem,
@@ -300,7 +307,7 @@ def _extract_generation_data(json_path: Path) -> dict[str, Any]:
             "slot_axes": slot_axes,
             "persona_axes": persona_axes,
             "behavior_axes": behavior_axes,
-            "axis_names": list(AXIS_NAMES),
+            "axis_names": list(axis_names),
         },
         "genome": best.get("genome", {}),
         "metrics": payload.get("evaluation", payload.get("metrics", {})),
@@ -318,11 +325,14 @@ def _extract_generation_data(json_path: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _extract_slot_axes(slots: list[dict[str, Any]]) -> list[list[float]]:
+def _extract_slot_axes(
+    slots: list[dict[str, Any]],
+    axis_names: tuple[str, ...] = AXIS_NAMES,
+) -> list[list[float]]:
     rows: list[list[float]] = []
     for slot in slots:
         target = slot.get("target_axes", {})
-        rows.append([float(target.get(axis, 0.5)) for axis in AXIS_NAMES])
+        rows.append([float(target.get(axis, 0.5)) for axis in axis_names])
     if not rows:
         return []
     # Truncate
@@ -331,15 +341,18 @@ def _extract_slot_axes(slots: list[dict[str, Any]]) -> list[list[float]]:
     return rows
 
 
-def _extract_persona_axes(personas: list[dict[str, Any]]) -> list[list[float]]:
+def _extract_persona_axes(
+    personas: list[dict[str, Any]],
+    axis_names: tuple[str, ...] = AXIS_NAMES,
+) -> list[list[float]]:
     rows: list[list[float]] = []
     for data in personas:
         if not data:
             continue
         try:
             persona = MegaPersona.model_validate(data)
-            axes = persona.primary_axes()
-            rows.append([float(axes[axis]) for axis in AXIS_NAMES])
+            axes = persona.primary_axes(axis_names=axis_names)
+            rows.append([float(axes[axis]) for axis in axis_names])
         except Exception:
             continue
     if len(rows) > MAX_SCATTER_POINTS:
@@ -347,7 +360,10 @@ def _extract_persona_axes(personas: list[dict[str, Any]]) -> list[list[float]]:
     return rows
 
 
-def _extract_behavior_axes(seed_entry: dict[str, Any]) -> list[list[float]]:
+def _extract_behavior_axes(
+    seed_entry: dict[str, Any],
+    axis_names: tuple[str, ...] = AXIS_NAMES,
+) -> list[list[float]]:
     """Extract behavior axes from a per-seed evolution result."""
     persona_ids = {
         p.get("persona_id", "")
@@ -361,13 +377,14 @@ def _extract_behavior_axes(seed_entry: dict[str, Any]) -> list[list[float]]:
         "train_shadow_simulations", []
     )
     return _extract_behavior_axes_from_sims(
-        seed_entry.get("personas", []), sims
+        seed_entry.get("personas", []), sims, axis_names=axis_names
     )
 
 
 def _extract_behavior_axes_from_sims(
     personas: list[dict[str, Any]],
     simulations: list[dict[str, Any]],
+    axis_names: tuple[str, ...] = AXIS_NAMES,
 ) -> list[list[float]]:
     """Average per-persona axis_scores from simulation results."""
     grouped: dict[str, list[dict[str, float]]] = {}
@@ -384,15 +401,29 @@ def _extract_behavior_axes_from_sims(
         pid = persona.get("persona_id", "") if persona else ""
         axis_scores_list = grouped.get(pid, [])
         if not axis_scores_list:
-            rows.append([0.5 for _ in AXIS_NAMES])
+            rows.append([0.5 for _ in axis_names])
             continue
         rows.append([
             float(np.mean([scores.get(axis, 0.5) for scores in axis_scores_list]))
-            for axis in AXIS_NAMES
+            for axis in axis_names
         ])
     if len(rows) > MAX_SCATTER_POINTS:
         rows = rows[:MAX_SCATTER_POINTS]
     return rows
+
+
+def _infer_axis_names(
+    *,
+    genome: dict[str, Any] | None = None,
+    slots: list[dict[str, Any]] | None = None,
+) -> tuple[str, ...]:
+    if isinstance(genome, dict):
+        return axis_names_for_binding(schema_binding_for_genome(genome))
+    if slots:
+        target_axes = slots[0].get("target_axes", {})
+        if isinstance(target_axes, dict) and target_axes:
+            return tuple(target_axes.keys())
+    return AXIS_NAMES
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ def evaluate_mega_personas(
     coverage_radius: float = 0.28,
     duplicate_threshold: float = 0.82,
     axis_names: tuple[str, ...] = AXIS_NAMES,
+    axis_roles: dict[str, str] | None = None,
 ) -> MegaPersonaEvaluation:
     """Evaluate a generated MegaPersona population.
 
@@ -57,7 +58,7 @@ def evaluate_mega_personas(
     valid_count = len(valid_personas)
     validity_rate = valid_count / sample_size if sample_size else 0.0
     near_duplicate_rate = _near_duplicate_rate(valid_personas, duplicate_threshold)
-    axis_matrix = personas_to_axis_matrix(valid_personas, axis_names)
+    axis_matrix = personas_to_axis_matrix(valid_personas, axis_names, axis_roles=axis_roles)
 
     if len(axis_matrix) == 0:
         diversity_metrics = {
@@ -92,6 +93,7 @@ def evaluate_mega_personas(
 def personas_to_axis_matrix(
     personas: list[dict[str, Any] | MegaPersona],
     axis_names: tuple[str, ...] = AXIS_NAMES,
+    axis_roles: dict[str, str] | None = None,
 ) -> np.ndarray:
     rows = []
     for persona_data in personas:
@@ -100,7 +102,7 @@ def personas_to_axis_matrix(
             if isinstance(persona_data, MegaPersona)
             else MegaPersona.model_validate(persona_data)
         )
-        axes = persona.primary_axes()
+        axes = persona.primary_axes(axis_names=axis_names, axis_roles=axis_roles)
         rows.append([axes[name] for name in axis_names])
     if not rows:
         return np.empty((0, len(axis_names)))

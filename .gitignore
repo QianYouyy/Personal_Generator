@@ -61,17 +61,9 @@ venv.bak/
 # ============================================
 # 数据 & 输出（体积大或包含敏感信息）
 # ============================================
-# 生成的问卷、人格、结果等可以通过脚本重新生成
-data/questionnaires/*.json
-data/generated_personas/*.json
-# 忽略整个 results 目录（包含日志、API记录、checkpoints、可视化等）
-data/results/
-# 但保留目录结构和示例数据
-data/**/*.log
-!data/questionnaires/.gitkeep
-!data/generated_personas/.gitkeep
-!data/results/
-!data/results/.gitkeep
+# 整个 data 目录忽略，仅保留 .gitkeep 占位
+data/
+!data/**/.gitkeep
 
 # ============================================
 # 日志

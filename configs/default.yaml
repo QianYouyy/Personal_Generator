@@ -3,11 +3,30 @@
 llm:
   api_base: null
   api_key: null
+  timeout_seconds: 180
 
   # MegaPersona generation and evaluation models.
   mutator_model: "gpt-5.4-mini"
   persona_model: "gpt-4o-mini"
   simulator_model: "gpt-4o-mini"
+
+  providers:
+    openai:
+      api_base: null
+      api_key_env: "OPENAI_API_KEY"
+      timeout_seconds: 180
+      # Stage-specific models: mutator / persona generator / shadow simulator
+      mutator_model: "gpt-5.4-mini"
+      persona_model: "gpt-4o-mini"
+      simulator_model: "gpt-4o-mini"
+    deepseek:
+      api_base: "https://api.deepseek.com"
+      api_key_env: "DEEPSEEK_API_KEY"
+      timeout_seconds: 180
+      # Stage-specific models used when --llm-provider deepseek is enabled
+      mutator_model: "deepseek-v4-pro"
+      persona_model: "deepseek-v4-flash"
+      simulator_model: "deepseek-v4-flash"
 
 evaluator:
   num_random_points: 10000
@@ -30,6 +49,10 @@ open_evolve:
     seed: 6
 
 mega_persona:
+  # Generation architecture. Use five_agent and single_call as experimental
+  # conditions rather than treating one as inherently formal.
+  persona_pipeline: "five_agent"
+  shadow_simulator_backend: "llm"
   default_n: 25
   default_seeds:
     - 17

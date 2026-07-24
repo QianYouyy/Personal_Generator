@@ -13,6 +13,27 @@ from src.utils.config import get_config
 from src.utils.logger import logger
 
 
+def _candidate_global_score(candidate: Optional["Candidate"]) -> float:
+    if candidate is None:
+        return 0.0
+    fitness = candidate.fitness or {}
+    return float(
+        fitness.get(
+            "global_best",
+            fitness.get("mega_fitness", fitness.get("coverage", 0.0)),
+        )
+    )
+
+
+DEFAULT_PARENT_OBJECTIVE_ROLES = [
+    "global_best",
+    "coverage_elite",
+    "diversity_elite",
+    "strict_consistency_elite",
+    "shadow_mae_elite",
+]
+
+
 class MutatorProtocol(Protocol):
     def mutate(
         self,
@@ -20,6 +41,7 @@ class MutatorProtocol(Protocol):
         prompt: str | None = None,
         generation: int = 0,
         stagnation: int = 0,
+        operator_id: str | None = None,
     ) -> str:
         ...
 
@@ -58,13 +80,22 @@ class Candidate:
 class Island:
     """单个进化岛屿.
 
-    维护 6 个精英位（对应 6 个指标）。
+    维护多个精英位（对应不同优化目标）。
     若候选在任一指标上打破历史纪录，即成为该指标的新精英。
     """
 
     METRIC_NAMES = [
-        "coverage", "convex_hull", "avg_dist",
-        "min_dist", "dispersion", "kl_divergence",
+        "global_best",
+        "research_score_v2",
+        "coverage_elite",
+        "alignment_elite",
+        "shadow_mae_elite",
+        "consistency_elite",
+        "axis_target_elite",
+        "issue_rate_elite",
+        "strict_consistency_elite",
+        "diversity_elite",
+        "schema_elite",
     ]
 
     def __init__(self, island_id: int):
@@ -95,8 +126,8 @@ class Island:
         return len(improved_metrics) > 0, improved_metrics
 
     def get_best_candidate(self) -> Optional[Candidate]:
-        """获取该岛屿当前最优候选（按覆盖率的精英）."""
-        return self.elites.get("coverage") or next(iter(self.elites.values()), None)
+        """获取该岛屿当前综合最优候选."""
+        return self.elites.get("global_best") or next(iter(self.elites.values()), None)
 
     def get_all_elites(self) -> List[Candidate]:
         """获取所有精英（去重）."""
@@ -118,7 +149,7 @@ class Island:
             "improvements": self.total_improvements,
             "last_improvement": self.last_improvement_gen,
             "gens_since_improvement": self.generation - self.last_improvement_gen,
-            "best_coverage": best.fitness.get("coverage", 0) if best else 0,
+            "best_global": best.fitness.get("global_best", 0) if best else 0,
         }
 
     def reset(self, best_elites: Dict[str, Candidate], current_gen: int = 0):
@@ -192,6 +223,9 @@ class OpenEvolve:
         instance.mutator = mutator
         instance.evaluator = evaluator
         instance.questionnaires = questionnaires
+        instance.parent_selection = "operator_preferred"
+        instance.parent_objective_roles = list(DEFAULT_PARENT_OBJECTIVE_ROLES)
+        instance._parent_rotation_cursor = 0
         
         # 恢复变异算子状态（如果 checkpoint 中有）
         if "mutator_state" in checkpoint and hasattr(instance.mutator, 'set_state'):
@@ -226,12 +260,26 @@ class OpenEvolve:
             instance.num_islands = run_config["num_islands"]
             instance.max_generations = run_config.get("max_generations")
             instance.children_per_island = run_config.get("children_per_island", 3)
-            logger.info(f"运行配置已恢复: {instance.num_islands} 岛屿, children={instance.children_per_island}")
+            instance.max_workers = max(1, int(run_config.get("max_workers", 1)))
+            instance.mutation_max_workers = max(1, int(run_config.get("mutation_max_workers", 6)))
+            instance.parent_selection = run_config.get("parent_selection", "operator_preferred")
+            instance.parent_objective_roles = list(
+                run_config.get("parent_objective_roles", DEFAULT_PARENT_OBJECTIVE_ROLES)
+            )
+            instance._parent_rotation_cursor = int(run_config.get("parent_rotation_cursor", 0))
+            logger.info(
+                f"运行配置已恢复: {instance.num_islands} 岛屿, "
+                f"children={instance.children_per_island}, "
+                f"mutation_workers={instance.mutation_max_workers}, "
+                f"max_workers={instance.max_workers}"
+            )
         else:
             cfg = get_config()
             instance.num_islands = cfg.get("open_evolve.num_islands", 10)
             instance.max_generations = None
             instance.children_per_island = 3
+            instance.max_workers = max(1, int(cfg.get("open_evolve.max_workers", 1)))
+            instance.mutation_max_workers = 6
         
         # 恢复基本状态
         instance.generation = checkpoint["generation"]
@@ -311,6 +359,7 @@ class OpenEvolve:
         seed_codes: Optional[Dict[str, str]] = None,
         initial_seed_distribution: Optional[Dict[str, int]] = None,
         num_islands: Optional[int] = None,
+        max_workers: Optional[int] = None,
         checkpoint_path: Optional[str | Path] = None,
         initialize: bool = True,
     ):
@@ -321,11 +370,13 @@ class OpenEvolve:
 
         cfg = get_config()
         self.num_islands = num_islands or cfg.get("open_evolve.num_islands", 10)
+        self.max_workers = max(1, int(max_workers or cfg.get("open_evolve.max_workers", 1)))
+        self.mutation_max_workers = 6
         self.extinction_interval = cfg.get("open_evolve.extinction_interval", 100)
         self.extinction_hours = cfg.get("open_evolve.extinction_interval_hours", 8)
-        # 动态灭绝阈值：根据总轮数自适应（至少2轮）
+        # Kept for checkpoint compatibility; stagnation-triggered extinction is disabled.
         self.extinction_stagnation_threshold = max(2, self.extinction_interval // 10)
-        # 灭绝模式: "interval" | "stagnation" | "adaptive"
+        # 灭绝模式保留配置字段；当前只启用固定间隔和时间触发。
         self.extinction_mode = cfg.get("open_evolve.extinction_mode", "adaptive")
 
         distribution = initial_seed_distribution or cfg.get("open_evolve.initial_seed_distribution", {
@@ -334,6 +385,15 @@ class OpenEvolve:
 
         self.islands = [Island(i) for i in range(self.num_islands)]
         self.seed_baselines: Dict[str, List[Dict]] = {}
+
+        # Parent-selection strategy. "operator_preferred" keeps the historical
+        # behavior (operator preferred_parent_metric -> uniform elite fallback).
+        # "objective_rotation" round-robins each child's parent across the
+        # objective elite roles below so global/coverage/diversity/strict/
+        # shadow-MAE elites all participate in mutation.
+        self.parent_selection = "operator_preferred"
+        self.parent_objective_roles = list(DEFAULT_PARENT_OBJECTIVE_ROLES)
+        self._parent_rotation_cursor = 0
 
         self.generation = 0
         self.start_time = time.time()
@@ -385,7 +445,12 @@ class OpenEvolve:
                 self.seed_baselines[seed_name] = []
             self.seed_baselines[seed_name].append(fitness)
             
-            logger.success(f"  [Island {i}] 初始化完成 | Coverage: {fitness.get('coverage', 0):.3f} | AvgDist: {fitness.get('avg_dist', 0):.3f}")
+            logger.success(
+                f"  [Island {i}] 初始化完成 | "
+                f"Global: {fitness.get('global_best', 0):.3f} | "
+                f"Coverage: {fitness.get('coverage_elite', 0):.3f} | "
+                f"Alignment: {fitness.get('alignment_elite', 0):.3f}"
+            )
         
         # 打印seed baseline汇总
         logger.section("Seed Baseline 汇总")
@@ -397,7 +462,14 @@ class OpenEvolve:
             for k, v in avg_fitness.items():
                 logger.metric(k, v)
 
-    def _mutate_single(self, parent_code: str, island_id: int, child_idx: int, children_per_island: int) -> Optional[str]:
+    def _mutate_single(
+        self,
+        parent_code: str,
+        island_id: int,
+        child_idx: int,
+        children_per_island: int,
+        operator_id: Optional[str] = None,
+    ) -> Optional[str]:
         """变异单个候选解（用于线程池并行）."""
         max_retries = 3
         
@@ -410,11 +482,19 @@ class OpenEvolve:
         for attempt in range(max_retries):
             try:
                 logger.debug(f"[Island {island_id}] 候选 {child_idx+1}/{children_per_island} 变异... (attempt {attempt + 1}/{max_retries})")
-                child_code = self.mutator.mutate(
-                    parent_code,
-                    generation=self.generation,
-                    stagnation=stagnation,
-                )
+                try:
+                    child_code = self.mutator.mutate(
+                        parent_code,
+                        generation=self.generation,
+                        stagnation=stagnation,
+                        operator_id=operator_id,
+                    )
+                except TypeError:
+                    child_code = self.mutator.mutate(
+                        parent_code,
+                        generation=self.generation,
+                        stagnation=stagnation,
+                    )
                 return child_code
             except Exception as e:
                 logger.warn(f"[Island {island_id}] 候选 {child_idx+1} 变异失败 (attempt {attempt + 1}): {e}")
@@ -441,23 +521,22 @@ class OpenEvolve:
             return None
 
     def evolve_once(self) -> dict:
-        """单轮进化 — 大群体 + 并行评估版本.
-        
-        每轮每个岛屿产生多个候选解（默认3个），同一岛屿的候选解并行评估。
-        这样每轮总评估数 = 岛屿数 × 每岛候选数 = 10 × 3 = 30个。
-        并行后每轮时间 ≈ 岛屿数 × max(候选评估时间) = 10 × T（而非 30 × T）
-        """
+        """Run one evolution generation with global candidate evaluation parallelism."""
         self.generation += 1
         gen_start = time.time()
         
         # 每岛候选数（大群体进化参数）
         children_per_island = getattr(self, 'children_per_island', 3)
-        # 每岛并行线程数（默认等于候选数，即全部并行）
-        max_workers_per_island = children_per_island
+        self.children_per_island = children_per_island
+        max_workers = max(1, int(getattr(self, "max_workers", 1)))
+        mutation_max_workers = max(1, int(getattr(self, "mutation_max_workers", 6)))
 
         logger.section(f"Generation {self.generation}/{self.max_generations if hasattr(self, 'max_generations') else '?'}")
         logger.info(f"大群体进化: {len(self.islands)} 岛屿 × {children_per_island} 候选 = {len(self.islands) * children_per_island} 评估/轮")
-        logger.info(f"并行策略: 每岛 {max_workers_per_island} 线程并行评估")
+        logger.info(
+            f"并行策略: mutation最多 {mutation_max_workers} 个线程，"
+            f"全局最多 {max_workers} 个候选同时评估"
+        )
 
         round_stats = {
             "generation": self.generation,
@@ -466,7 +545,11 @@ class OpenEvolve:
             "time": time.time(),
         }
 
-        # 每轮处理所有岛屿（岛屿间仍串行，避免竞争）
+        mutation_jobs = []
+
+        # Parent/operator selection remains serial so stateful policies such as
+        # MCTS keep deterministic ordering. The expensive LLM mutator calls are
+        # then dispatched concurrently.
         total_islands = len(self.islands)
         for idx, island in enumerate(self.islands):
             island.generation = self.generation
@@ -480,56 +563,129 @@ class OpenEvolve:
                 logger.warn(f"[Island {island.id}] 无精英，跳过")
                 continue
             
-            # 2. 串行变异（LLM 调用有速率限制，串行更安全）
-            island_children = []
-            parent_codes = []
+            # 2. 准备变异任务
             for child_idx in range(children_per_island):
-                parent = random.choice(elites)
-                child_code = self._mutate_single(parent.code, island.id, child_idx, children_per_island)
-                if child_code is not None:
-                    island_children.append(child_code)
-                    parent_codes.append(parent.seed_name)
-            
-            if not island_children:
-                logger.warn(f"[Island {island.id}] 无成功变异，跳过")
-                continue
-            
-            # 3. 并行评估所有候选解
-            logger.info(f"[Island {island.id}] 并行评估 {len(island_children)} 个候选解...")
-            island_eval_start = time.time()
-            
-            with ThreadPoolExecutor(max_workers=max_workers_per_island) as executor:
-                futures = {}
-                for child_idx, (child_code, seed_name) in enumerate(zip(island_children, parent_codes)):
-                    future = executor.submit(
-                        self._evaluate_single,
-                        child_code, island.id, child_idx, len(island_children), seed_name
+                operator_id = self._choose_operator_id(island.id, child_idx)
+                parent = self._select_parent_for_operator(island, elites, operator_id)
+                mutation_jobs.append(
+                    {
+                        "island": island,
+                        "parent_code": parent.code,
+                        "child_idx": child_idx,
+                        "total_children": children_per_island,
+                        "seed_name": parent.seed_name,
+                        "operator_id": operator_id,
+                        "parent_fitness": dict(parent.fitness),
+                    }
+                )
+
+        evaluation_jobs = []
+        if not mutation_jobs:
+            logger.warn("本轮无可变异候选，跳过评估")
+        else:
+            logger.info(
+                f"并行变异 {len(mutation_jobs)} 个候选解，"
+                f"max_workers={min(mutation_max_workers, len(mutation_jobs))}"
+            )
+            mutation_start = time.time()
+
+            if mutation_max_workers <= 1:
+                for job_index, job in enumerate(mutation_jobs):
+                    child_code = self._mutate_single(
+                        job["parent_code"],
+                        job["island"].id,
+                        job["child_idx"],
+                        job["total_children"],
+                        operator_id=job.get("operator_id"),
                     )
-                    futures[future] = child_idx
-                
-                for future in as_completed(futures):
-                    child_idx = futures[future]
-                    try:
-                        child = future.result()
-                        if child is None:
-                            continue
-                        
-                        round_stats["evaluations"] += 1
-                        
-                        # 4. 更新精英
-                        improved, metrics = island.update_elite(child)
-                        if improved:
-                            round_stats["improvements"] += 1
-                            logger.success(f"[Island {island.id}] 候选 {child_idx+1} 🏆 打破 {len(metrics)} 项纪录: {metrics}")
-                            for m in metrics:
-                                logger.metric(m, child.fitness.get(m, 0))
-                        else:
-                            logger.debug(f"[Island {island.id}] 候选 {child_idx+1} 未打破纪录")
-                    except Exception as e:
-                        logger.error(f"[Island {island.id}] 候选 {child_idx+1} 评估线程异常: {e}")
-            
-            island_eval_time = time.time() - island_eval_start
-            logger.info(f"[Island {island.id}] 并行评估完成: {island_eval_time:.1f}s")
+                    if child_code is not None:
+                        job = dict(job)
+                        job["child_code"] = child_code
+                        evaluation_jobs.append(job)
+                    logger.progress(job_index + 1, len(mutation_jobs), "candidate mutation")
+            else:
+                mutated_jobs: list[Optional[dict]] = [None] * len(mutation_jobs)
+                with ThreadPoolExecutor(max_workers=min(mutation_max_workers, len(mutation_jobs))) as executor:
+                    futures = {
+                        executor.submit(
+                            self._mutate_single,
+                            job["parent_code"],
+                            job["island"].id,
+                            job["child_idx"],
+                            job["total_children"],
+                            operator_id=job.get("operator_id"),
+                        ): (job_index, job)
+                        for job_index, job in enumerate(mutation_jobs)
+                    }
+
+                    completed = 0
+                    for future in as_completed(futures):
+                        job_index, job = futures[future]
+                        try:
+                            child_code = future.result()
+                            if child_code is not None:
+                                job = dict(job)
+                                job["child_code"] = child_code
+                                mutated_jobs[job_index] = job
+                        except Exception as e:
+                            logger.error(
+                                f"[Island {job['island'].id}] 候选 {job['child_idx']+1} "
+                                f"变异线程异常: {e}"
+                            )
+                        completed += 1
+                        logger.progress(completed, len(mutation_jobs), "candidate mutation")
+
+                evaluation_jobs = [job for job in mutated_jobs if job is not None]
+
+            logger.info(f"并行变异完成: {time.time() - mutation_start:.1f}s")
+
+        if not evaluation_jobs:
+            logger.warn("本轮无成功变异候选，跳过评估")
+        else:
+            logger.info(
+                f"全局并行评估 {len(evaluation_jobs)} 个候选解，"
+                f"max_workers={min(max_workers, len(evaluation_jobs))}"
+            )
+            eval_start = time.time()
+
+            if max_workers <= 1:
+                for job_index, job in enumerate(evaluation_jobs):
+                    self._record_evaluated_job(job, job_index, len(evaluation_jobs), round_stats)
+            else:
+                with ThreadPoolExecutor(max_workers=min(max_workers, len(evaluation_jobs))) as executor:
+                    futures = {
+                        executor.submit(
+                            self._evaluate_single,
+                            job["child_code"],
+                            job["island"].id,
+                            job["child_idx"],
+                            children_per_island,
+                            job["seed_name"],
+                        ): (job_index, job)
+                        for job_index, job in enumerate(evaluation_jobs)
+                    }
+
+                    completed = 0
+                    for future in as_completed(futures):
+                        job_index, job = futures[future]
+                        island = job["island"]
+                        child_idx = job["child_idx"]
+                        try:
+                            child = future.result()
+                            self._update_island_with_child(
+                                island,
+                                child_idx,
+                                child,
+                                round_stats,
+                                operator_id=job.get("operator_id"),
+                                parent_fitness=job.get("parent_fitness"),
+                            )
+                        except Exception as e:
+                            logger.error(f"[Island {island.id}] 候选 {child_idx+1} 评估线程异常: {e}")
+                        completed += 1
+                        logger.progress(completed, len(evaluation_jobs), "candidate eval")
+
+            logger.info(f"全局并行评估完成: {time.time() - eval_start:.1f}s")
 
         # 检查灭绝
         self._check_extinction()
@@ -539,8 +695,7 @@ class OpenEvolve:
         if best:
             round_stats["best_fitness"] = best.fitness
             logger.success(f"本轮最优 (Island {best.island_id}):")
-            for k, v in best.fitness.items():
-                logger.metric(k, v)
+            self._log_fitness_with_baseline(best)
         
         # 记录每轮统计：平均、中位数、最优、最差（用于可视化）
         all_fitness_values = {}
@@ -568,7 +723,7 @@ class OpenEvolve:
             logger.info(f"  Island {stats['id']}: evals={stats['evaluations']}, "
                        f"improvements={stats['improvements']}, "
                        f"last_improve={stats['last_improvement']}, "
-                       f"coverage={stats['best_coverage']:.3f}")
+                       f"global={stats['best_global']:.3f}")
 
         gen_time = time.time() - gen_start
         logger.info(f"本轮耗时: {gen_time:.1f}s | 评估: {round_stats['evaluations']} | 改进: {round_stats['improvements']}")
@@ -576,20 +731,237 @@ class OpenEvolve:
         self.history.append(round_stats)
         return round_stats
 
+    def _record_evaluated_job(self, job: dict, job_index: int, total_jobs: int, round_stats: dict) -> None:
+        island = job["island"]
+        child_idx = job["child_idx"]
+        child = self._evaluate_single(
+            job["child_code"],
+            island.id,
+            child_idx,
+            job.get("total_children", getattr(self, "children_per_island", 1)),
+            job["seed_name"],
+        )
+        self._update_island_with_child(
+            island,
+            child_idx,
+            child,
+            round_stats,
+            operator_id=job.get("operator_id"),
+            parent_fitness=job.get("parent_fitness"),
+        )
+        logger.progress(job_index + 1, total_jobs, "candidate eval")
+
+    def _choose_operator_id(self, island_id: int, child_idx: int) -> Optional[str]:
+        chooser = getattr(self.mutator, "choose_operator", None)
+        if chooser is None:
+            return None
+        island = self.islands[island_id] if island_id < len(self.islands) else None
+        stagnation = self.generation - island.last_improvement_gen if island else 0
+        try:
+            operator = chooser(
+                generation=self.generation,
+                stagnation=stagnation,
+                island_id=island_id,
+                child_idx=child_idx,
+            )
+        except TypeError:
+            operator = chooser(self.generation, stagnation)
+        if isinstance(operator, dict) and isinstance(operator.get("id"), str):
+            return operator["id"]
+        if isinstance(operator, str):
+            return operator
+        return None
+
+    def _select_parent_for_operator(
+        self,
+        island: Island,
+        elites: List[Candidate],
+        operator_id: Optional[str],
+    ) -> Candidate:
+        if self._global_stagnation() >= 4:
+            plateau_parent = self._select_plateau_parent(island)
+            if plateau_parent is not None:
+                return plateau_parent
+
+        if self.parent_selection == "objective_rotation":
+            roles = self.parent_objective_roles or ["global_best"]
+            role = roles[self._parent_rotation_cursor % len(roles)]
+            self._parent_rotation_cursor += 1
+            parent = island.elites.get(role) or island.elites.get("global_best")
+            if parent is not None:
+                logger.debug(
+                    f"[Island {island.id}] objective_rotation parent role={role}"
+                )
+                return parent
+
+        metric_getter = getattr(self.mutator, "preferred_parent_metric", None)
+        metric = None
+        if metric_getter is not None:
+            try:
+                metric = metric_getter(operator_id)
+            except Exception:
+                metric = None
+        if isinstance(metric, str):
+            candidate = island.elites.get(metric)
+            if candidate is not None:
+                return candidate
+        return random.choice(elites)
+
+    def _global_stagnation(self) -> int:
+        best = self.get_global_best()
+        if best is None:
+            return 0
+        return max(0, int(self.generation) - int(best.generation))
+
+    def _select_plateau_parent(self, island: Island) -> Optional[Candidate]:
+        """During global plateaus, force search away from only global_best.
+
+        Coverage/diversity elites are tried first so strict-consistency search
+        does not keep narrowing the behavior space after the global score stalls.
+        """
+        priority_metrics = [
+            "coverage_elite",
+            "diversity_elite",
+            "strict_consistency_elite",
+            "shadow_mae_elite",
+            "axis_target_elite",
+            "issue_rate_elite",
+            "research_score_v2",
+        ]
+        candidates: list[Candidate] = []
+        seen_codes: set[str] = set()
+        for metric in priority_metrics:
+            candidate = island.elites.get(metric)
+            if candidate is None or candidate.code in seen_codes:
+                continue
+            seen_codes.add(candidate.code)
+            candidates.append(candidate)
+        if not candidates:
+            return None
+        return random.choice(candidates)
+
+    def _update_island_with_child(
+        self,
+        island: Island,
+        child_idx: int,
+        child: Optional[Candidate],
+        round_stats: dict,
+        operator_id: Optional[str] = None,
+        parent_fitness: Optional[dict[str, float]] = None,
+    ) -> None:
+        if child is None:
+            return
+
+        round_stats["evaluations"] += 1
+        improved, metrics = island.update_elite(child)
+        self._record_mutation_result(
+            operator_id=operator_id,
+            parent_fitness=parent_fitness,
+            child=child,
+            improved=improved,
+            improved_metrics=metrics,
+            child_idx=child_idx,
+        )
+        if improved:
+            round_stats["improvements"] += 1
+            logger.success(f"[Island {island.id}] 候选 {child_idx+1} 🏆 打破 {len(metrics)} 项纪录: {metrics}")
+            for metric in metrics:
+                self._log_metric_with_baseline(metric, child.fitness.get(metric, 0), child)
+        else:
+            logger.debug(f"[Island {island.id}] 候选 {child_idx+1} 未打破纪录")
+
+    def _record_mutation_result(
+        self,
+        *,
+        operator_id: Optional[str],
+        parent_fitness: Optional[dict[str, float]],
+        child: Candidate,
+        improved: bool,
+        improved_metrics: list[str],
+        child_idx: int,
+    ) -> None:
+        recorder = getattr(self.mutator, "record_result", None)
+        if recorder is None:
+            return
+        if bool((child.fitness or {}).get("phenotype_cache_hit")):
+            logger.debug(
+                f"[Island {child.island_id}] 候选 {child_idx+1} 为 phenotype cache hit，"
+                "跳过 MCTS 结果回传"
+            )
+            return
+        try:
+            recorder(
+                operator_id=operator_id,
+                parent_fitness=parent_fitness,
+                child_fitness=child.fitness,
+                generation=self.generation,
+                island_id=child.island_id,
+                child_idx=child_idx,
+                improved=improved,
+                improved_metrics=improved_metrics,
+            )
+        except Exception as exc:
+            logger.warn(f"变异结果回传失败，跳过策略更新: {exc}")
+
+    def _baseline_for_candidate(self, candidate: Optional[Candidate]) -> dict[str, float]:
+        """Return the averaged seed baseline for a candidate."""
+        if candidate is None:
+            return {}
+        if candidate.seed_name in self.seed_baselines:
+            return self._average_fitness_list(self.seed_baselines[candidate.seed_name])
+        all_baselines = [
+            fitness
+            for fitness_list in self.seed_baselines.values()
+            for fitness in fitness_list
+            if isinstance(fitness, dict)
+        ]
+        return self._average_fitness_list(all_baselines)
+
+    @staticmethod
+    def _average_fitness_list(fitness_list: list[dict]) -> dict[str, float]:
+        if not fitness_list:
+            return {}
+        keys = set()
+        for fitness in fitness_list:
+            keys.update(fitness.keys())
+        averaged = {}
+        for key in keys:
+            values = [
+                float(fitness.get(key, 0.0))
+                for fitness in fitness_list
+                if isinstance(fitness, dict)
+            ]
+            averaged[key] = sum(values) / len(values) if values else 0.0
+        return averaged
+
+    def _log_metric_with_baseline(
+        self,
+        metric: str,
+        current: float,
+        candidate: Optional[Candidate],
+    ) -> None:
+        baseline = self._baseline_for_candidate(candidate).get(metric)
+        if baseline is None:
+            logger.metric(metric, current)
+            return
+        logger.metric_delta(metric, float(baseline), float(current))
+
+    def _log_fitness_with_baseline(self, candidate: Candidate) -> None:
+        for metric, current in candidate.fitness.items():
+            self._log_metric_with_baseline(metric, current, candidate)
+
     def _check_extinction(self):
         """检查是否触发周期性灭绝.
         
-        三种触发方式：
+        两种触发方式：
         1. 固定间隔触发（每 _effective_interval 轮）
-        2. 停滞触发：岛屿超过 _effective_stagnation 轮无改进
-        3. 时间触发（长时间运行）
+        2. 时间触发（长时间运行）
         
-        优先级：固定间隔 > 时间 > 停滞检测
+        优先级：固定间隔 > 时间
         避免连续两轮触发（保护期1轮）
         """
         # 使用实际生效的参数
         effective_interval = getattr(self, '_effective_interval', self.extinction_interval)
-        effective_stagnation = getattr(self, '_effective_stagnation', self.extinction_stagnation_threshold)
         
         # 检查保护期（避免连续触发）
         last_extinction = getattr(self, '_last_extinction_gen', 0)
@@ -609,42 +981,10 @@ class OpenEvolve:
             self._trigger_extinction(reason=f"达到 {self.extinction_hours} 小时")
             return
 
-        # 方式3：动态停滞触发（根据总轮数自适应）
-        stagnated = []
-        for island in self.islands:
-            gens_since = self.generation - island.last_improvement_gen
-            if gens_since >= effective_stagnation:
-                stagnated.append((island.id, gens_since))
-        
-        if stagnated:
-            self._last_extinction_gen = self.generation
-            logger.info(f"检测到 {len(stagnated)} 个岛屿停滞（阈值: {effective_stagnation} 轮）: {stagnated}")
-            self._trigger_extinction(reason=f"停滞检测", only_stagnated=stagnated)
-
     def _get_best_island(self) -> Island:
-        """多指标综合选最优岛屿（用于灭绝时选择最优种子）.
-        
-        评分权重：
-        - coverage: 30%（覆盖度，核心指标）
-        - convex_hull: 15%（凸包体积，空间覆盖）
-        - avg_dist: 20%（平均距离，分散度）
-        - min_dist: 15%（最小距离，避免聚集）
-        - dispersion: 10%（离散度）
-        - kl_divergence: 10%（KL散度，已取负值，越大越好）
-        """
+        """选择综合表现最强的岛屿，用于灭绝时复制 elite archive."""
         def score(island):
-            best = island.get_best_candidate()
-            if not best:
-                return 0
-            f = best.fitness
-            return (
-                f.get("coverage", 0) * 0.4 +
-                f.get("convex_hull", 0) * 0.15 +
-                f.get("avg_dist", 0) * 0.15 +
-                f.get("min_dist", 0) * 0.1 +
-                f.get("dispersion", 0) * 0.1 +
-                f.get("kl_divergence", -1e9) * 0.1
-            )
+            return _candidate_global_score(island.get_best_candidate())
         return max(self.islands, key=score)
 
     def _trigger_extinction(self, reason: str = "", only_stagnated: list = None):
@@ -652,11 +992,10 @@ class OpenEvolve:
         
         策略：
         - 固定间隔：重置后50%的岛屿（保留一半多样性）
-        - 停滞检测：只重置真正停滞的岛屿
         
         Args:
             reason: 触发原因
-            only_stagnated: 仅重置指定的停滞岛屿 [(id, gens_since), ...]
+            only_stagnated: legacy argument kept for checkpoint/code compatibility.
         """
         logger.section(f"🔥 周期性灭绝触发! ({reason})")
         self._extinction_log.append(self.generation)
@@ -670,66 +1009,42 @@ class OpenEvolve:
 
         logger.info(f"最优岛屿: Island {best_island.id} (综合评分)")
         logger.info("最优适应度:")
-        for k, v in best_seed.fitness.items():
-            logger.metric(k, v)
+        self._log_fitness_with_baseline(best_seed)
         
         # 获取最优岛屿的完整 elites（用于混合替换）
         best_elites = best_island.elites
 
         reset_count = 0
         
-        if only_stagnated:
-            # 停滞检测：只重置停滞的岛屿
-            for island in self.islands:
-                if island.id == best_island.id:
-                    continue
-                stagnated_ids = [sid for sid, _ in only_stagnated]
-                if island.id not in stagnated_ids:
-                    continue
-                gens_since = next(gs for sid, gs in only_stagnated if sid == island.id)
-                logger.warn(f"[Island {island.id}] 已 {gens_since} 轮无改进，重置...")
-                island.reset(best_elites, current_gen=self.generation)
-                reset_count += 1
-        else:
-            # 固定间隔：重置后50%的岛屿（保留最优+随机保留一半）
-            non_best_islands = [i for i in self.islands if i.id != best_island.id]
-            
-            # 按适应度排序，重置较差的50%
-            non_best_islands.sort(key=lambda i: (
-                i.elites.get("coverage", Candidate("")).fitness.get("coverage", 0)
-            ))
-            
-            # 重置后50%
-            num_to_reset = max(1, len(non_best_islands) // 2)
-            islands_to_reset = non_best_islands[:num_to_reset]
-            islands_to_keep = non_best_islands[num_to_reset:]
-            
-            logger.info(f"岛屿状态:")
-            logger.info(f"  最优保留: Island {best_island.id}")
-            logger.info(f"  保留: {[i.id for i in islands_to_keep]}")
-            logger.info(f"  重置: {[i.id for i in islands_to_reset]}")
-            
-            for island in islands_to_reset:
-                logger.warn(f"[Island {island.id}] 固定间隔重置...")
-                island.reset(best_elites, current_gen=self.generation)
-                reset_count += 1
+        # 固定间隔/时间触发：重置后50%的岛屿（保留最优+随机保留一半）
+        non_best_islands = [i for i in self.islands if i.id != best_island.id]
+        
+        # 按综合适应度排序，重置较差的50%
+        non_best_islands.sort(key=lambda i: _candidate_global_score(i.get_best_candidate()))
+        
+        # 重置后50%
+        num_to_reset = max(1, len(non_best_islands) // 2)
+        islands_to_reset = non_best_islands[:num_to_reset]
+        islands_to_keep = non_best_islands[num_to_reset:]
+        
+        logger.info(f"岛屿状态:")
+        logger.info(f"  最优保留: Island {best_island.id}")
+        logger.info(f"  保留: {[i.id for i in islands_to_keep]}")
+        logger.info(f"  重置: {[i.id for i in islands_to_reset]}")
+        
+        for island in islands_to_reset:
+            logger.warn(f"[Island {island.id}] 固定间隔重置...")
+            island.reset(best_elites, current_gen=self.generation)
+            reset_count += 1
 
         logger.success(f"重置了 {reset_count} 个岛屿，保留了 {self.num_islands - reset_count} 个岛屿")
 
     def get_global_best(self) -> Optional[Candidate]:
-        """获取全局最优候选（多指标综合评分）.
+        """获取全局综合最优候选.
         
         用于：
         1. 记录历史最优（供可视化使用）
         2. 最终评估时选择最优代码
-        
-        评分权重（与 _get_best_island 一致）：
-        - coverage: 40%（覆盖度，核心指标）
-        - convex_hull: 15%（凸包体积，空间覆盖）
-        - avg_dist: 15%（平均距离，分散度）
-        - min_dist: 10%（最小距离，避免聚集）
-        - dispersion: 10%（离散度）
-        - kl_divergence: 10%（KL散度，越接近均匀分布越好）
         """
         all_elites = []
         for island in self.islands:
@@ -738,18 +1053,7 @@ class OpenEvolve:
         if not all_elites:
             return None
 
-        def score(candidate):
-            f = candidate.fitness
-            return (
-                f.get("coverage", 0) * 0.30 +
-                f.get("convex_hull", 0) * 0.15 +
-                f.get("avg_dist", 0) * 0.20 +
-                f.get("min_dist", 0) * 0.15 +
-                f.get("dispersion", 0) * 0.10 +
-                f.get("kl_divergence", 0) * 0.10
-            )
-
-        return max(all_elites, key=score)
+        return max(all_elites, key=_candidate_global_score)
 
     def _print_extinction_logic(self, max_generations: int = None):
         """打印灭绝逻辑配置."""
@@ -759,27 +1063,21 @@ class OpenEvolve:
         if max_generations is not None:
             # 自适应阈值
             adaptive_interval = max(2, max_generations // 2)
-            adaptive_stagnation = max(2, max_generations // 3)
-            
             logger.info(f"实验总轮数: {max_generations}")
             logger.info(f"灭绝模式: {self.extinction_mode}")
             logger.info("")
             logger.info("【自适应参数】")
             logger.info(f"  固定间隔灭绝: 每 {adaptive_interval} 轮")
-            logger.info(f"  停滞检测阈值: {adaptive_stagnation} 轮无改进")
             logger.info("")
             logger.info("【原始配置】")
             logger.info(f"  extinction_interval: {self.extinction_interval}")
-            logger.info(f"  stagnation_threshold: {self.extinction_stagnation_threshold}")
             logger.info("")
             
             # 实际生效的参数
             self._effective_interval = min(self.extinction_interval, adaptive_interval)
-            self._effective_stagnation = min(self.extinction_stagnation_threshold, adaptive_stagnation)
             
             logger.info("【实际生效参数】")
             logger.info(f"  有效间隔: {self._effective_interval} 轮")
-            logger.info(f"  有效停滞阈值: {self._effective_stagnation} 轮")
             logger.info("")
             
             # 预测触发轮数
@@ -792,18 +1090,24 @@ class OpenEvolve:
         else:
             logger.info("未设置最大轮数，使用原始配置:")
             logger.info(f"  固定间隔: {self.extinction_interval} 轮")
-            logger.info(f"  停滞阈值: {self.extinction_stagnation_threshold} 轮")
             self._effective_interval = self.extinction_interval
-            self._effective_stagnation = self.extinction_stagnation_threshold
         
         logger.info("")
         logger.info("【灭绝策略】")
         logger.info("  1. 固定间隔: 每N轮重置所有非最优岛屿")
-        logger.info("  2. 停滞检测: 超过阈值无改进的岛屿被重置")
-        logger.info("  3. 最优保留: 最优岛屿不会被重置")
-        logger.info("  4. 多指标选优: coverage(40%) + convex_hull(15%) + avg_dist(15%) + min_dist(10%) + dispersion(10%) + (1-KL)(10%)")
+        logger.info("  2. 最优保留: 最优岛屿不会被重置")
+        logger.info(
+            "  3. Elite archive: global_best / research_score_v2 / coverage_elite / "
+            "shadow_mae_elite / strict_consistency_elite / diversity_elite / schema_elite"
+        )
 
-    def run(self, max_generations: int = None, max_hours: float = None, children_per_island: int = 3):
+    def run(
+        self,
+        max_generations: int = None,
+        max_hours: float = None,
+        children_per_island: int = 3,
+        max_workers: int | None = None,
+    ):
         """主进化循环.
         
         Args:
@@ -813,9 +1117,15 @@ class OpenEvolve:
         """
         self.max_generations = max_generations
         self.children_per_island = children_per_island
+        if max_workers is not None:
+            self.max_workers = max(1, int(max_workers))
         
         logger.section("Open-Evolve 进化引擎启动")
-        logger.info(f"配置: 岛屿={self.num_islands}, 最大轮数={max_generations}")
+        logger.info(
+            f"配置: 岛屿={self.num_islands}, 最大轮数={max_generations}, "
+            f"mutation并发={getattr(self, 'mutation_max_workers', 6)}, "
+            f"candidate并发={self.max_workers}"
+        )
         logger.info(f"大群体进化: 每岛 {children_per_island} 候选 × {self.num_islands} 岛屿 = {children_per_island * self.num_islands} 评估/轮")
         num_personas = getattr(self.evaluator, "num_personas", "?")
         logger.info(f"人格数: {num_personas} 人/问卷 | 问卷数: {len(self.questionnaires)} 份")
@@ -846,8 +1156,7 @@ class OpenEvolve:
             logger.section("进化完成!")
             logger.success(f"最优代码: 岛屿 {best.island_id}, 种子 {best.seed_name}, 代数 {best.generation}")
             logger.info("最终适应度:")
-            for k, v in best.fitness.items():
-                logger.metric(k, v)
+            self._log_fitness_with_baseline(best)
 
         return best
 
@@ -908,6 +1217,13 @@ class OpenEvolve:
             "num_islands": self.num_islands,
             "max_generations": getattr(self, 'max_generations', None),
             "children_per_island": getattr(self, 'children_per_island', 3),
+            "max_workers": getattr(self, "max_workers", 1),
+            "mutation_max_workers": getattr(self, "mutation_max_workers", 6),
+            "parent_selection": getattr(self, "parent_selection", "operator_preferred"),
+            "parent_objective_roles": list(
+                getattr(self, "parent_objective_roles", DEFAULT_PARENT_OBJECTIVE_ROLES)
+            ),
+            "parent_rotation_cursor": int(getattr(self, "_parent_rotation_cursor", 0)),
         }
         
         # 保存变异算子状态

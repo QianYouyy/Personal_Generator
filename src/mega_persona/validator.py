@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from src.mega_persona.schema import MegaPersona
+from src.mega_persona.slots import AXIS_NAMES
 
 
 @dataclass
@@ -26,7 +27,12 @@ class ValidationReport:
         return sum(1 for issue in self.issues if issue.severity == "error")
 
 
-def validate_mega_persona(data: dict[str, Any] | MegaPersona) -> ValidationReport:
+def validate_mega_persona(
+    data: dict[str, Any] | MegaPersona,
+    *,
+    axis_names: tuple[str, ...] = AXIS_NAMES,
+    axis_roles: dict[str, str] | None = None,
+) -> ValidationReport:
     """Validate schema plus cross-field psychological consistency rules."""
     issues: list[ValidationIssue] = []
     try:
@@ -51,7 +57,7 @@ def validate_mega_persona(data: dict[str, Any] | MegaPersona) -> ValidationRepor
     _check_trait_extremes(persona, issues)
     _check_high_performance_grounding(persona, issues)
     _check_low_performance_non_deficit(persona, issues)
-    _check_primary_axis_alignment(persona, issues)
+    _check_primary_axis_alignment(persona, issues, axis_names=axis_names, axis_roles=axis_roles)
 
     return ValidationReport(
         is_valid=not any(issue.severity == "error" for issue in issues),
@@ -170,8 +176,14 @@ def _check_low_performance_non_deficit(persona: MegaPersona, issues: list[Valida
         )
 
 
-def _check_primary_axis_alignment(persona: MegaPersona, issues: list[ValidationIssue]) -> None:
-    axes = persona.primary_axes()
+def _check_primary_axis_alignment(
+    persona: MegaPersona,
+    issues: list[ValidationIssue],
+    *,
+    axis_names: tuple[str, ...] = AXIS_NAMES,
+    axis_roles: dict[str, str] | None = None,
+) -> None:
+    axes = persona.primary_axes(axis_names=axis_names, axis_roles=axis_roles)
     for name, value in axes.items():
         if not 0.0 <= value <= 1.0:
             _issue(issues, "R9", "error", f"Primary axis {name} is outside [0, 1].")

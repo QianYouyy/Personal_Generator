@@ -9,14 +9,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.test_mega_persona_schema import sample_persona
 from src.mega_persona import (
     AXIS_NAMES,
+    ConcordiaNativeShadowSimulator,
     LLMShadowSimulator,
     MegaPersona,
     RuleBasedMegaPersonaBuilder,
     SlotSampler,
+    StudentRealisticShadowSimulator,
+    StudentRealisticV2ShadowSimulator,
     aggregate_shadow_behavior,
     build_initial_shadow_surveys,
     build_shadow_survey_splits,
     evaluate_mega_personas,
+    evaluate_persona_consistency,
     personas_to_axis_matrix,
     score_shadow_survey,
 )
@@ -173,6 +177,33 @@ def test_population_evaluation():
     assert report.fitness > 0.0
 
 
+def test_persona_consistency_penalizes_cross_field_conflict():
+    coherent = MegaPersona.model_validate(sample_persona())
+    coherent_report = evaluate_persona_consistency(coherent)
+
+    conflicted_data = deepcopy(sample_persona())
+    profile = conflicted_data["cognitive_motivation_profile"]
+    profile["motivation_system"]["primary_drive"] = "mastery"
+    profile["motivation_system"]["intrinsic_motivation"] = 0.12
+    profile["self_regulation"]["planning_style"] = "structured"
+    profile["self_regulation"]["persistence"] = 0.12
+    profile["self_regulation"]["emotional_regulation"] = 0.10
+    profile["self_regulation"]["metacognition"] = 0.14
+    profile["self_regulation"]["habit_stability"] = 0.11
+    profile["learning_orientation"]["attention_pattern"] = "sustained"
+    profile["challenge_response"]["under_difficulty"] = "reframes"
+    conflicted_data["mental_health_context"]["resilience"] = 0.12
+    conflicted_data["mental_health_context"]["coping_style"] = "problem_solving"
+    conflicted_data["derived_academic_tendency"]["likely_performance_band"] = "high"
+
+    conflicted = MegaPersona.model_validate(conflicted_data)
+    conflicted_report = evaluate_persona_consistency(conflicted)
+
+    assert coherent_report.score > conflicted_report.score
+    assert conflicted_report.score < 0.95
+    assert {issue.rule_id for issue in conflicted_report.issues} & {"C1", "C5", "C15"}
+
+
 def test_shadow_behavior_simulation():
     slots = SlotSampler().sample(5, seed=23)
     personas = [
@@ -257,6 +288,69 @@ def test_shadow_simulator_retries_transient_failure():
     assert set(simulation.responses) == set(survey.item_ids())
 
 
+def test_concordia_native_shadow_simulator():
+    persona = MegaPersona.model_validate(sample_persona())
+    survey = build_initial_shadow_surveys(num_surveys=1, items_per_survey=6)[0]
+    llm = _MockLLMClient()
+    simulation = ConcordiaNativeShadowSimulator(llm).simulate_persona(persona, survey)
+
+    assert set(simulation.responses) == set(survey.item_ids())
+    assert all(1 <= value <= 5 for value in simulation.responses.values())
+    assert all(axis in simulation.axis_scores for axis in AXIS_NAMES)
+    prompt = llm.calls[-1]["prompt"]
+    assert "CONCORDIA AGENT" in prompt
+    assert "[identity]" in prompt
+    assert "[memory]" in prompt
+    assert "[behavior_calibration]" in prompt
+    assert "CALIBRATION RULES" in prompt
+    assert "Penalize idealized self-presentation" in prompt
+    assert "Motivation-autonomy rule" in prompt
+    assert "external pressure sensitivity" in prompt
+
+
+def test_student_realistic_shadow_simulator():
+    persona = MegaPersona.model_validate(sample_persona())
+    survey = build_initial_shadow_surveys(num_surveys=1, items_per_survey=6)[0]
+    llm = _MockLLMClient()
+    simulation = StudentRealisticShadowSimulator(llm).simulate_persona(persona, survey)
+
+    assert set(simulation.responses) == set(survey.item_ids())
+    assert all(1 <= value <= 5 for value in simulation.responses.values())
+    assert all(axis in simulation.axis_scores for axis in AXIS_NAMES)
+    assert simulation.metadata["simulator_backend"] == "student-realistic"
+    assert "student_state" in simulation.metadata
+    assert "context_appraisal" in simulation.metadata
+    prompt = llm.calls[-1]["prompt"]
+    assert "REALISTIC STUDENT SIMULATION" in prompt
+    assert "LATENT STUDENT STATE" in prompt
+    assert "ITEM MECHANISM HINTS" in prompt
+
+
+def test_student_realistic_v2_shadow_simulator_is_blind_and_traceable():
+    persona = MegaPersona.model_validate(sample_persona())
+    survey = build_initial_shadow_surveys(num_surveys=1, items_per_survey=6)[0]
+    llm = _MockLLMClient()
+    simulation = StudentRealisticV2ShadowSimulator(llm).simulate_persona(persona, survey)
+
+    assert set(simulation.responses) == set(survey.item_ids())
+    assert all(1 <= value <= 5 for value in simulation.responses.values())
+    assert all(axis in simulation.axis_scores for axis in AXIS_NAMES)
+    assert simulation.metadata["simulator_backend"] == "student-realistic-v2"
+    assert "trait_vector" in simulation.metadata
+    assert "student_state" in simulation.metadata
+    assert "context_appraisal" in simulation.metadata
+    assert "response_style" in simulation.metadata
+    assert "item_mechanisms" in simulation.metadata
+
+    prompt = llm.calls[-1]["prompt"]
+    assert "REALISTIC STUDENT SIMULATION V2" in prompt
+    assert "RESPONSE STYLE" in prompt
+    assert "ITEM MECHANISM INTERPRETATION" in prompt
+    assert "primary axes" not in prompt
+    assert "axis_weights" not in prompt
+    assert "reverse-scored" not in prompt
+
+
 def test_rule_based_baseline_builder():
     slots = SlotSampler().sample(6, seed=31)
     personas = RuleBasedMegaPersonaBuilder().build_population(slots)
@@ -282,6 +376,9 @@ def main():
     test_shadow_behavior_simulation()
     test_shadow_simulator_malformed_json_fallback()
     test_shadow_simulator_retries_transient_failure()
+    test_concordia_native_shadow_simulator()
+    test_student_realistic_shadow_simulator()
+    test_student_realistic_v2_shadow_simulator_is_blind_and_traceable()
     test_rule_based_baseline_builder()
     print("MegaPersona experiment tests passed.")
 

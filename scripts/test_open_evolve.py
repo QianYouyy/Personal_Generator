@@ -2,6 +2,7 @@
 
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -44,13 +45,29 @@ class MockEvaluator:
         self.eval_count += 1
         np.random.seed(hash(code_str) % 2**31)
         return {
-            "coverage": np.random.uniform(0.3, 1.0),
-            "convex_hull": np.random.uniform(0.0, 1.0),
-            "avg_dist": np.random.uniform(0.2, 0.8),
-            "min_dist": np.random.uniform(0.0, 0.2),
-            "dispersion": np.random.uniform(0.1, 0.5),
-            "kl_divergence": np.random.uniform(0.5, 3.0),
+            "global_best": np.random.uniform(0.3, 1.0),
+            "research_score_v2": np.random.uniform(0.3, 1.0),
+            "coverage_elite": np.random.uniform(0.0, 1.0),
+            "alignment_elite": np.random.uniform(0.2, 0.8),
+            "shadow_mae_elite": np.random.uniform(0.2, 0.8),
+            "consistency_elite": np.random.uniform(0.0, 1.0),
+            "axis_target_elite": np.random.uniform(0.0, 1.0),
+            "issue_rate_elite": np.random.uniform(0.0, 1.0),
+            "strict_consistency_elite": np.random.uniform(0.0, 1.0),
+            "diversity_elite": np.random.uniform(0.1, 0.5),
+            "schema_elite": np.random.uniform(0.5, 1.0),
         }
+
+
+class RecordingMutator(MockMutator):
+    """Mock mutator that records MCTS-style result callbacks."""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def record_result(self, **kwargs):
+        self.records.append(kwargs)
 
 
 def test_island():
@@ -62,37 +79,41 @@ def test_island():
 
     # 添加初始精英
     c1 = Candidate(code="code1", fitness={
-        "coverage": 0.5, "convex_hull": 0.3,
-        "avg_dist": 0.4, "min_dist": 0.1,
-        "dispersion": 0.2, "kl_divergence": 1.0,
+        "global_best": 0.5, "research_score_v2": 0.45, "coverage_elite": 0.3,
+        "alignment_elite": 0.4, "shadow_mae_elite": 0.4, "consistency_elite": 0.1,
+        "axis_target_elite": 0.3, "issue_rate_elite": 0.8, "strict_consistency_elite": 0.5,
+        "diversity_elite": 0.2, "schema_elite": 0.6,
     }, generation=0)
     improved, metrics = island.update_elite(c1)
     print(f"  初始精英: improved={improved}, metrics={metrics}")
 
     # 添加更优候选
     c2 = Candidate(code="code2", fitness={
-        "coverage": 0.8, "convex_hull": 0.3,
-        "avg_dist": 0.4, "min_dist": 0.1,
-        "dispersion": 0.2, "kl_divergence": 1.0,
+        "global_best": 0.8, "research_score_v2": 0.45, "coverage_elite": 0.3,
+        "alignment_elite": 0.4, "shadow_mae_elite": 0.4, "consistency_elite": 0.1,
+        "axis_target_elite": 0.3, "issue_rate_elite": 0.8, "strict_consistency_elite": 0.5,
+        "diversity_elite": 0.2, "schema_elite": 0.6,
     }, generation=1)
     improved, metrics = island.update_elite(c2)
     print(f"  更优候选: improved={improved}, metrics={metrics}")
 
     # 添加部分改善候选
     c3 = Candidate(code="code3", fitness={
-        "coverage": 0.6, "convex_hull": 0.5,
-        "avg_dist": 0.4, "min_dist": 0.1,
-        "dispersion": 0.2, "kl_divergence": 1.0,
+        "global_best": 0.6, "research_score_v2": 0.46, "coverage_elite": 0.5,
+        "alignment_elite": 0.4, "shadow_mae_elite": 0.45, "consistency_elite": 0.1,
+        "axis_target_elite": 0.35, "issue_rate_elite": 0.8, "strict_consistency_elite": 0.55,
+        "diversity_elite": 0.2, "schema_elite": 0.6,
     }, generation=2)
     improved, metrics = island.update_elite(c3)
     print(f"  部分改善: improved={improved}, metrics={metrics}")
 
     print(f"  当前精英数: {len(island.elites)}")
-    assert len(island.elites) == 6, "应有 6 个精英"
+    assert len(island.elites) == len(Island.METRIC_NAMES), "应有完整精英槽位"
 
-    # 检查覆盖率精英是否为 code2
-    assert island.elites["coverage"].code == "code2", "coverage 精英应为 code2"
-    assert island.elites["convex_hull"].code == "code3", "convex_hull 精英应为 code3"
+    # 检查综合与覆盖精英可由不同 candidate 占据
+    assert island.elites["global_best"].code == "code2", "global_best 精英应为 code2"
+    assert island.elites["coverage_elite"].code == "code3", "coverage_elite 精英应为 code3"
+    assert island.elites["strict_consistency_elite"].code == "code3", "strict_consistency_elite 精英应为 code3"
 
     print("\n✅ 岛屿系统测试通过")
 
@@ -183,10 +204,134 @@ def test_extinction():
     print("\n✅ 灭绝机制测试通过")
 
 
+def test_objective_rotation_parent_selection():
+    print("=" * 60)
+    print("测试 objective_rotation 父代选择")
+    print("=" * 60)
+
+    engine = OpenEvolve(
+        mutator=MockMutator(),
+        evaluator=MockEvaluator(),
+        questionnaires=[],
+        seed_codes=SEED_CODES,
+        num_islands=1,
+        initialize=False,
+    )
+    island = engine.islands[0]
+    base = {
+        "global_best": 0.5, "research_score_v2": 0.5, "coverage_elite": 0.3,
+        "alignment_elite": 0.4, "shadow_mae_elite": 0.4, "consistency_elite": 0.5,
+        "axis_target_elite": 0.4, "issue_rate_elite": 0.5,
+        "strict_consistency_elite": 0.4, "diversity_elite": 0.3, "schema_elite": 0.6,
+    }
+    c_global = Candidate(code="c_global", fitness={**base, "global_best": 0.9}, generation=0)
+    c_cov = Candidate(code="c_cov", fitness={**base, "coverage_elite": 0.9}, generation=0)
+    island.update_elite(c_global)
+    island.update_elite(c_cov)
+    elites = island.get_all_elites()
+
+    assert engine.parent_selection == "operator_preferred"  # default unchanged
+    default_parent = engine._select_parent_for_operator(island, elites, None)
+    assert default_parent.code in {"c_global", "c_cov"}
+    assert engine._parent_rotation_cursor == 0  # rotation never engages by default
+
+    engine.parent_selection = "objective_rotation"
+    picked = [engine._select_parent_for_operator(island, elites, None) for _ in range(5)]
+    assert picked[0].code == "c_global"  # role: global_best
+    assert picked[1].code == "c_cov"     # role: coverage_elite
+    # remaining roles fall back to the elites holding those slots (c_global)
+    assert all(parent.code == "c_global" for parent in picked[2:])
+    # cursor wraps around to global_best
+    assert engine._select_parent_for_operator(island, elites, None).code == "c_global"
+
+    with TemporaryDirectory() as tmp:
+        engine.checkpoint_path = Path(tmp)
+        engine._save_checkpoint()
+        restored = OpenEvolve.from_checkpoint(
+            str(Path(tmp) / "checkpoint.json"),
+            mutator=MockMutator(),
+            evaluator=MockEvaluator(),
+            questionnaires=[],
+        )
+        assert restored.parent_selection == "objective_rotation"
+        assert restored.parent_objective_roles == engine.parent_objective_roles
+        assert restored._parent_rotation_cursor == engine._parent_rotation_cursor
+        restored_island = restored.islands[0]
+        restored_elites = restored_island.get_all_elites()
+        # Cursor was advanced 6 times above, so the next role is coverage_elite.
+        assert restored._select_parent_for_operator(restored_island, restored_elites, None).code == "c_cov"
+
+    # plateau branch still takes precedence and does not consume the rotation cursor
+    engine.generation = 10  # best generation is 0 -> stagnation 10 >= 4
+    cursor_before = engine._parent_rotation_cursor
+    plateau_parent = engine._select_parent_for_operator(island, elites, None)
+    assert plateau_parent.code in {"c_global", "c_cov"}
+    assert engine._parent_rotation_cursor == cursor_before
+
+    print("✅ objective_rotation 父代选择测试通过")
+
+
+def test_phenotype_cache_hit_skips_mcts_record():
+    print("=" * 60)
+    print("测试 phenotype cache hit 不回传 MCTS")
+    print("=" * 60)
+
+    mutator = RecordingMutator()
+    engine = OpenEvolve(
+        mutator=mutator,
+        evaluator=MockEvaluator(),
+        questionnaires=[],
+        seed_codes=SEED_CODES,
+        num_islands=1,
+        initialize=False,
+    )
+
+    cached_child = Candidate(
+        code="cached",
+        fitness={
+            "global_best": 0.7,
+            "coverage_elite": 0.4,
+            "phenotype_cache_hit": True,
+        },
+        generation=1,
+        island_id=0,
+    )
+    engine._record_mutation_result(
+        operator_id="op21_v3_schema_precision",
+        parent_fitness={"global_best": 0.6},
+        child=cached_child,
+        improved=True,
+        improved_metrics=["global_best"],
+        child_idx=0,
+    )
+    assert mutator.records == []
+
+    fresh_child = Candidate(
+        code="fresh",
+        fitness={"global_best": 0.8, "coverage_elite": 0.4},
+        generation=1,
+        island_id=0,
+    )
+    engine._record_mutation_result(
+        operator_id="op21_v3_schema_precision",
+        parent_fitness={"global_best": 0.6},
+        child=fresh_child,
+        improved=True,
+        improved_metrics=["global_best"],
+        child_idx=1,
+    )
+    assert len(mutator.records) == 1
+    assert mutator.records[0]["operator_id"] == "op21_v3_schema_precision"
+
+    print("✅ phenotype cache hit 跳过 MCTS 回传测试通过")
+
+
 def main():
     test_island()
     test_engine()
     test_extinction()
+    test_objective_rotation_parent_selection()
+    test_phenotype_cache_hit_skips_mcts_record()
 
     print("\n" + "=" * 60)
     print("所有 Open-Evolve 测试通过!")

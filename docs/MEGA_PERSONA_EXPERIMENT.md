@@ -208,7 +208,7 @@ python scripts/run_mega_persona_evolution.py \
   --n 25 \
   --seeds 17,23,31 \
   --generations 20 \
-  --population-size 8 \
+  --num-islands 8 \
   --children-per-island 1 \
   --validation-shadow-surveys 4 \
   --test-shadow-surveys 4 \
@@ -222,7 +222,7 @@ python scripts/run_mega_persona_evolution.py \
   --n 25 \
   --seeds 17,23,31 \
   --generations 20 \
-  --population-size 8 \
+  --num-islands 8 \
   --children-per-island 1 \
   --validation-shadow-surveys 4 \
   --test-shadow-surveys 4 \
@@ -239,7 +239,7 @@ python scripts/run_mega_persona_evolution.py \
   --n 10 \
   --seeds 17 \
   --generations 5 \
-  --population-size 4 \
+  --num-islands 4 \
   --children-per-island 1 \
   --validation-shadow-surveys 4 \
   --test-shadow-surveys 4 \

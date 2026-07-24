@@ -28,6 +28,8 @@ class MockMegaPersonaLLM:
                 "kwargs": kwargs,
             }
         )
+        if "Create ONE complete MegaPersona JSON object" in prompt:
+            return json.dumps(self.sample)
         if "Create ONLY the `demographics` section" in prompt:
             return self._payload("demographics")
         if "Create ONLY the `values_identity` section" in prompt:
@@ -45,6 +47,13 @@ class MockMegaPersonaLLM:
             )
         if "Repair this MegaPersona JSON" in prompt:
             return json.dumps(self.sample)
+        if "Repair the output for stage `cognition_motivation`" in prompt:
+            return json.dumps(
+                {
+                    "cognitive_motivation_profile": self.sample["cognitive_motivation_profile"],
+                    "derived_academic_tendency": self.sample["derived_academic_tendency"],
+                }
+            )
         if "Repair the malformed JSON object" in prompt:
             return self._payload("demographics")
         raise AssertionError(f"Unexpected prompt: {prompt[:120]}")
@@ -75,6 +84,55 @@ def test_generate_one_valid_persona():
         "mental_health",
     }
     assert len(llm.calls) == 5
+
+
+def test_compact_pipeline_generates_one_call_persona():
+    slots = SlotSampler().sample(1, seed=31)
+    llm = MockMegaPersonaLLM()
+    generator = MegaPersonaGenerator(llm, pipeline_mode="single_call")
+    result = generator.generate_one(slots[0])
+
+    assert result.is_valid
+    assert result.persona is not None
+    assert "compact_persona" in result.raw_outputs
+    assert len(llm.calls) == 1
+
+    alias_llm = MockMegaPersonaLLM()
+    alias_result = MegaPersonaGenerator(alias_llm, pipeline_mode="compact").generate_one(slots[0])
+    assert alias_result.is_valid
+    assert len(alias_llm.calls) == 1
+
+
+def test_missing_stage_key_is_repaired():
+    class MissingDerivedLLM(MockMegaPersonaLLM):
+        def __init__(self):
+            super().__init__()
+            self.sent_missing = False
+
+        def generate(self, prompt, system_prompt=None, **kwargs):
+            if (
+                "You are filling ONLY the `cognitive_motivation_profile`" in prompt
+                and not self.sent_missing
+            ):
+                self.sent_missing = True
+                self.calls.append(
+                    {"prompt": prompt, "system_prompt": system_prompt, "kwargs": kwargs}
+                )
+                return json.dumps(
+                    {
+                        "cognitive_motivation_profile": self.sample[
+                            "cognitive_motivation_profile"
+                        ],
+                    }
+                )
+            return super().generate(prompt, system_prompt=system_prompt, **kwargs)
+
+    slots = SlotSampler().sample(1, seed=32)
+    llm = MissingDerivedLLM()
+    result = MegaPersonaGenerator(llm).generate_one(slots[0])
+
+    assert result.is_valid
+    assert "cognition_motivation_stage_repair" in result.raw_outputs
 
 
 def test_malformed_agent_json_is_repaired():
@@ -154,13 +212,39 @@ def test_generate_batch_and_evaluate():
     assert report.validity_rate == 1.0
 
 
+def test_overlong_fields_are_trimmed_before_validation():
+    class OverlongNarrativeLLM(MockMegaPersonaLLM):
+        def __init__(self):
+            super().__init__()
+            self.sample = sample_persona()
+            self.sample["demographics"]["family_context"] = " ".join(
+                ["The household rhythm is supportive but crowded and uneven."] * 30
+            )
+            self.sample["social_creative_profile"]["narrative"] = " ".join(
+                ["She contributes by quietly improving group coordination and practical follow-through."] * 30
+            )
+
+    slots = SlotSampler().sample(1, seed=21)
+    llm = OverlongNarrativeLLM()
+    result = MegaPersonaGenerator(llm).generate_one(slots[0])
+
+    assert result.is_valid
+    assert result.persona is not None
+    assert len(result.persona.demographics.family_context) <= 1000
+    assert len(result.persona.social_creative_profile.narrative) <= 1500
+    assert "revision_1" not in result.raw_outputs
+
+
 def main():
     test_parse_json_object_from_fence()
     test_generate_one_valid_persona()
+    test_compact_pipeline_generates_one_call_persona()
+    test_missing_stage_key_is_repaired()
     test_malformed_agent_json_is_repaired()
     test_transient_agent_failure_is_retried()
     test_prompt_addendum_is_injected()
     test_generate_batch_and_evaluate()
+    test_overlong_fields_are_trimmed_before_validation()
     print("MegaPersona generator tests passed.")
 
 

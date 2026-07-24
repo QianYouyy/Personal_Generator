@@ -1,7 +1,7 @@
 """Rule-based MegaPersona builder used as an offline baseline."""
 
 from src.mega_persona.schema import MegaPersona
-from src.mega_persona.slots import MegaPersonaSlot
+from src.mega_persona.slots import MegaPersonaSlot, axis_roles_for_target_axes
 
 
 class RuleBasedMegaPersonaBuilder:
@@ -13,9 +13,10 @@ class RuleBasedMegaPersonaBuilder:
     def build(self, slot: MegaPersonaSlot, index: int = 1) -> MegaPersona:
         axes = slot.target_axes
         constraints = slot.constraints
-        abstraction = axes["cognitive_abstraction"]
-        autonomy = axes["motivation_autonomy"]
-        regulation = axes["self_regulation_resilience"]
+        roles = axis_roles_for_target_axes(axes)
+        abstraction = axes[roles["cognitive_core"]]
+        autonomy = axes[roles["motivation_core"]]
+        regulation = axes[roles["regulation_core"]]
         label = slot.quota_label
         theme = THEMES[(index - 1) % len(THEMES)]
 

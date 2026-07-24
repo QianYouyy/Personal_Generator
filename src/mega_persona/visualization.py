@@ -9,7 +9,7 @@ import tempfile
 import numpy as np
 
 from src.mega_persona.schema import MegaPersona
-from src.mega_persona.slots import AXIS_NAMES
+from src.mega_persona.slots import AXIS_NAMES, axis_names_for_binding, schema_binding_for_genome
 
 
 def visualize_result_path(input_path: Path, output_dir: Path | None = None) -> list[Path]:
@@ -45,8 +45,10 @@ def visualize_evolution_dir(evolution_dir: Path, output_dir: Path) -> list[Path]
     if generations:
         written.append(plot_fitness_curve(generations, output_dir / "fitness_over_generations.png"))
 
-    written.extend(_plot_seed_result(best_result["per_seed"][0], output_dir, prefix="best"))
-    written.append(plot_best_genome(final_summary["best"]["genome"], output_dir / "best_genome.png"))
+    best_genome = final_summary["best"]["genome"]
+    axis_names = _infer_axis_names(genome=best_genome, slots=best_result["per_seed"][0].get("slots", []))
+    written.extend(_plot_seed_result(best_result["per_seed"][0], output_dir, prefix="best", axis_names=axis_names))
+    written.append(plot_best_genome(best_genome, output_dir / "best_genome.png"))
     written.append(plot_metric_bars(final_summary["best"].get("metrics", {}), output_dir / "best_metrics.png"))
     return written
 
@@ -196,7 +198,12 @@ def plot_metric_bars(metrics: dict[str, Any], save_path: Path) -> Path:
     return save_path
 
 
-def _plot_seed_result(seed_result: dict[str, Any], output_dir: Path, prefix: str) -> list[Path]:
+def _plot_seed_result(
+    seed_result: dict[str, Any],
+    output_dir: Path,
+    prefix: str,
+    axis_names: tuple[str, ...] = AXIS_NAMES,
+) -> list[Path]:
     slots = seed_result.get("slots", [])
     personas = seed_result.get("personas", [])
     heldout = (
@@ -207,49 +214,54 @@ def _plot_seed_result(seed_result: dict[str, Any], output_dir: Path, prefix: str
     )
 
     slot_axes = np.array(
-        [[slot["target_axes"][axis] for axis in AXIS_NAMES] for slot in slots],
+        [[slot["target_axes"][axis] for axis in axis_names] for slot in slots],
         dtype=float,
-    ) if slots else np.empty((0, len(AXIS_NAMES)))
-    persona_axes = _persona_axis_matrix(personas)
-    behavior_axes = _behavior_axis_matrix(personas, heldout)
+    ) if slots else np.empty((0, len(axis_names)))
+    persona_axes = _persona_axis_matrix(personas, axis_names=axis_names)
+    behavior_axes = _behavior_axis_matrix(personas, heldout, axis_names=axis_names)
 
     return [
-        plot_axis_scatter(slot_axes, "Slot Target Axes", output_dir / f"{prefix}_slot_axes.png"),
-        plot_axis_scatter(persona_axes, "Persona Primary Axes", output_dir / f"{prefix}_persona_axes.png"),
-        plot_axis_scatter(behavior_axes, "Held-out Behavior Axes", output_dir / f"{prefix}_behavior_axes.png"),
+        plot_axis_scatter(slot_axes, "Slot Target Axes", output_dir / f"{prefix}_slot_axes.png", labels=axis_names),
+        plot_axis_scatter(persona_axes, "Persona Primary Axes", output_dir / f"{prefix}_persona_axes.png", labels=axis_names),
+        plot_axis_scatter(behavior_axes, "Held-out Behavior Axes", output_dir / f"{prefix}_behavior_axes.png", labels=axis_names),
     ]
 
 
 def _plot_run_payload(payload: dict[str, Any], output_dir: Path, prefix: str) -> list[Path]:
+    axis_names = _infer_axis_names(genome=payload.get("genome"), slots=payload.get("slots", []))
     slots = payload.get("slots", [])
     personas = [persona for persona in payload.get("personas", []) if persona]
     simulations = payload.get("shadow_simulations", [])
     slot_axes = np.array(
-        [[slot["target_axes"][axis] for axis in AXIS_NAMES] for slot in slots],
+        [[slot["target_axes"][axis] for axis in axis_names] for slot in slots],
         dtype=float,
-    ) if slots else np.empty((0, len(AXIS_NAMES)))
-    persona_axes = _persona_axis_matrix(personas)
-    behavior_axes = _behavior_axis_matrix(personas, simulations)
+    ) if slots else np.empty((0, len(axis_names)))
+    persona_axes = _persona_axis_matrix(personas, axis_names=axis_names)
+    behavior_axes = _behavior_axis_matrix(personas, simulations, axis_names=axis_names)
     return [
-        plot_axis_scatter(slot_axes, "Slot Target Axes", output_dir / f"{prefix}_slot_axes.png"),
-        plot_axis_scatter(persona_axes, "Persona Primary Axes", output_dir / f"{prefix}_persona_axes.png"),
-        plot_axis_scatter(behavior_axes, "Behavior Axes", output_dir / f"{prefix}_behavior_axes.png"),
+        plot_axis_scatter(slot_axes, "Slot Target Axes", output_dir / f"{prefix}_slot_axes.png", labels=axis_names),
+        plot_axis_scatter(persona_axes, "Persona Primary Axes", output_dir / f"{prefix}_persona_axes.png", labels=axis_names),
+        plot_axis_scatter(behavior_axes, "Behavior Axes", output_dir / f"{prefix}_behavior_axes.png", labels=axis_names),
     ]
 
 
-def _persona_axis_matrix(personas: list[dict[str, Any]]) -> np.ndarray:
+def _persona_axis_matrix(
+    personas: list[dict[str, Any]],
+    axis_names: tuple[str, ...] = AXIS_NAMES,
+) -> np.ndarray:
     rows = []
     for data in personas:
-        axes = MegaPersona.model_validate(data).primary_axes()
-        rows.append([axes[axis] for axis in AXIS_NAMES])
+        axes = MegaPersona.model_validate(data).primary_axes(axis_names=axis_names)
+        rows.append([axes[axis] for axis in axis_names])
     if not rows:
-        return np.empty((0, len(AXIS_NAMES)))
+        return np.empty((0, len(axis_names)))
     return np.array(rows, dtype=float)
 
 
 def _behavior_axis_matrix(
     personas: list[dict[str, Any]],
     simulations: list[dict[str, Any]],
+    axis_names: tuple[str, ...] = AXIS_NAMES,
 ) -> np.ndarray:
     persona_ids = [persona["persona_id"] for persona in personas]
     grouped: dict[str, list[dict[str, float]]] = {persona_id: [] for persona_id in persona_ids}
@@ -262,17 +274,31 @@ def _behavior_axis_matrix(
     for persona_id in persona_ids:
         axis_scores = grouped.get(persona_id) or []
         if not axis_scores:
-            rows.append([0.5 for _ in AXIS_NAMES])
+            rows.append([0.5 for _ in axis_names])
         else:
             rows.append(
                 [
                     float(np.mean([scores.get(axis, 0.5) for scores in axis_scores]))
-                    for axis in AXIS_NAMES
+                    for axis in axis_names
                 ]
             )
     if not rows:
-        return np.empty((0, len(AXIS_NAMES)))
+        return np.empty((0, len(axis_names)))
     return np.array(rows, dtype=float)
+
+
+def _infer_axis_names(
+    *,
+    genome: dict[str, Any] | None = None,
+    slots: list[dict[str, Any]] | None = None,
+) -> tuple[str, ...]:
+    if isinstance(genome, dict):
+        return axis_names_for_binding(schema_binding_for_genome(genome))
+    if slots:
+        target_axes = slots[0].get("target_axes", {})
+        if isinstance(target_axes, dict) and target_axes:
+            return tuple(target_axes.keys())
+    return AXIS_NAMES
 
 
 def _find_evaluation_result(evolution_dir: Path, candidate_id: str) -> dict[str, Any] | None:

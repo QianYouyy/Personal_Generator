@@ -1,12 +1,14 @@
-"""Fixed multi-agent MegaPersona generator — optimized pipeline.
+"""MegaPersona LLM generator — decomposed and integrated pipeline modes.
 
-Key improvements over the original sequential design:
+Key improvements over the original sequential 5-agent design:
 1. **Parallel agents 3-5**: Values, Social, and Mental Health run concurrently
    after Cognition finishes (they share no mutual dependencies).
 2. **Slim whiteboards**: each agent receives only the fields it needs, cutting
    ~30 % of input tokens per later-stage call.
 3. **Hard constraint injection**: concrete numeric targets and anti-collapse
    rules are injected directly into agent prompts, raising first-pass validity.
+4. **Single-call architecture**: experiments can use an integrated generator
+   when coherence/cost should be compared against staged decomposition.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,27 +16,55 @@ from dataclasses import dataclass, field
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 from src.mega_persona.prompts import (
     COGNITION_MOTIVATION_AGENT_SYSTEM_PROMPT,
+    COMPACT_PERSONA_SYSTEM_PROMPT,
     DEMOGRAPHICS_AGENT_SYSTEM_PROMPT,
     MENTAL_HEALTH_AGENT_SYSTEM_PROMPT,
     SOCIAL_CREATIVE_AGENT_SYSTEM_PROMPT,
     VALUES_IDENTITY_AGENT_SYSTEM_PROMPT,
+    compact_persona_prompt,
     cognition_motivation_agent_prompt,
     demographics_agent_prompt,
     mental_health_agent_prompt,
     revision_prompt,
     social_creative_agent_prompt,
+    stage_repair_prompt,
     values_identity_agent_prompt,
 )
-from src.mega_persona.schema import MegaPersona
-from src.mega_persona.slots import AXIS_NAMES, MegaPersonaSlot, SlotSampler
+from src.mega_persona.schema import (
+    ASPIRATION_MAX_LENGTH,
+    DERIVED_REASONING_MAX_LENGTH,
+    FAMILY_CONTEXT_MAX_LENGTH,
+    IDENTITY_ANCHOR_MAX_LENGTH,
+    MENTAL_HEALTH_NARRATIVE_MAX_LENGTH,
+    MORAL_TENSION_MAX_LENGTH,
+    SOCIAL_NARRATIVE_MAX_LENGTH,
+    MegaPersona,
+)
+from src.mega_persona.slots import (
+    AXIS_NAMES,
+    MegaPersonaSlot,
+    SlotSampler,
+    axis_roles_for_target_axes,
+)
 from src.mega_persona.validator import ValidationIssue, ValidationReport, validate_mega_persona
 
 
 logger = logging.getLogger(__name__)
+
+
+_TEXT_LENGTH_BUDGETS = {
+    ("demographics", "family_context"): FAMILY_CONTEXT_MAX_LENGTH,
+    ("values_identity", "identity_anchor"): IDENTITY_ANCHOR_MAX_LENGTH,
+    ("values_identity", "moral_tension"): MORAL_TENSION_MAX_LENGTH,
+    ("values_identity", "aspiration"): ASPIRATION_MAX_LENGTH,
+    ("social_creative_profile", "narrative"): SOCIAL_NARRATIVE_MAX_LENGTH,
+    ("mental_health_context", "narrative"): MENTAL_HEALTH_NARRATIVE_MAX_LENGTH,
+    ("derived_academic_tendency", "reasoning"): DERIVED_REASONING_MAX_LENGTH,
+}
 
 
 class AgentOutputError(ValueError):
@@ -55,12 +85,12 @@ class MegaPersonaGenerationResult:
 
 
 class MegaPersonaGenerator:
-    """Optimised multi-agent pipeline for structured MegaPersona generation.
+    """LLM pipeline for structured MegaPersona generation.
 
-    Agents 3-5 (Values, Social, Mental Health) run in parallel after the
-    Cognition agent completes. Each agent receives a slim whiteboard with
-    only the fields it needs, plus hard numeric constraints derived from
-    the target axes.
+    `five_agent` runs a staged generator where agents 3-5 (Values, Social,
+    Mental Health) run in parallel after cognition. `single_call` asks one
+    integrated writer to produce the complete persona in one pass. Both modes
+    share schema validation, revision, blueprint injection, and metrics.
     """
 
     def __init__(
@@ -70,12 +100,20 @@ class MegaPersonaGenerator:
         max_tokens: int = 3000,
         max_revisions: int = 1,
         prompt_addendum: str = "",
+        blueprint_builder: Callable[[MegaPersonaSlot], dict[str, Any]] | None = None,
+        pipeline_mode: str = "five_agent",
     ):
         self.llm = llm_client
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_revisions = max_revisions
         self.prompt_addendum = prompt_addendum.strip()
+        self.blueprint_builder = blueprint_builder
+        if pipeline_mode == "compact":
+            pipeline_mode = "single_call"
+        if pipeline_mode not in {"five_agent", "single_call"}:
+            raise ValueError("pipeline_mode must be 'five_agent' or 'single_call'")
+        self.pipeline_mode = pipeline_mode
 
     # ------------------------------------------------------------------
     # Public API
@@ -92,67 +130,112 @@ class MegaPersonaGenerator:
     def generate_from_slots(
         self,
         slots: list[MegaPersonaSlot],
+        max_workers: int = 1,
     ) -> list[MegaPersonaGenerationResult]:
+        max_workers = max(1, int(max_workers))
+        if max_workers > 1 and len(slots) > 1:
+            return self._generate_from_slots_parallel(slots, max_workers=max_workers)
+
         results: list[MegaPersonaGenerationResult] = []
         total = len(slots)
         for index, slot in enumerate(slots, start=1):
-            logger.info(
-                "MegaPersona generation %s/%s slot=%s quota=%s",
-                index,
-                total,
-                slot.slot_id,
-                slot.quota_label,
-            )
-            try:
-                result = self.generate_one(slot)
-            except Exception as exc:
-                logger.error(
-                    "MegaPersona generation %s/%s slot=%s failed (%s: %s)",
-                    index,
-                    total,
-                    slot.slot_id,
-                    type(exc).__name__,
-                    exc,
-                )
-                result = MegaPersonaGenerationResult(
-                    slot=slot,
-                    persona=None,
-                    validation_report=ValidationReport(
-                        is_valid=False,
-                        schema_valid=False,
-                        issues=[
-                            ValidationIssue(
-                                rule_id="PIPELINE",
-                                severity="error",
-                                message=f"{type(exc).__name__}: {exc}",
-                            )
-                        ],
-                    ),
-                    raw_outputs={"pipeline_error": f"{type(exc).__name__}: {exc}"},
-                    candidate_json={"persona_id": slot.slot_id},
-                )
-            logger.info(
-                "MegaPersona generation %s/%s slot=%s valid=%s issues=%s",
-                index,
-                total,
-                slot.slot_id,
-                result.is_valid,
-                len(result.validation_report.issues),
-            )
-            results.append(result)
+            results.append(self._generate_one_with_logging(slot, index, total))
         return results
+
+    def _generate_from_slots_parallel(
+        self,
+        slots: list[MegaPersonaSlot],
+        max_workers: int,
+    ) -> list[MegaPersonaGenerationResult]:
+        total = len(slots)
+        logger.info(
+            "MegaPersona generation parallel start slots=%s max_workers=%s",
+            total,
+            max_workers,
+        )
+        ordered: list[MegaPersonaGenerationResult | None] = [None] * total
+        with ThreadPoolExecutor(max_workers=min(max_workers, total)) as executor:
+            futures = {
+                executor.submit(self._generate_one_with_logging, slot, index, total): index
+                for index, slot in enumerate(slots, start=1)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                ordered[index - 1] = future.result()
+                logger.info("MegaPersona generation parallel done %s/%s", index, total)
+        return [result for result in ordered if result is not None]
+
+    def _generate_one_with_logging(
+        self,
+        slot: MegaPersonaSlot,
+        index: int,
+        total: int,
+    ) -> MegaPersonaGenerationResult:
+        logger.info(
+            "MegaPersona generation %s/%s slot=%s quota=%s",
+            index,
+            total,
+            slot.slot_id,
+            slot.quota_label,
+        )
+        try:
+            result = self.generate_one(slot)
+        except Exception as exc:
+            logger.error(
+                "MegaPersona generation %s/%s slot=%s failed (%s: %s)",
+                index,
+                total,
+                slot.slot_id,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            result = MegaPersonaGenerationResult(
+                slot=slot,
+                persona=None,
+                validation_report=ValidationReport(
+                    is_valid=False,
+                    schema_valid=False,
+                    issues=[
+                        ValidationIssue(
+                            rule_id="PIPELINE",
+                            severity="error",
+                            message=f"{type(exc).__name__}: {exc}",
+                        )
+                    ],
+                ),
+                raw_outputs={"pipeline_error": f"{type(exc).__name__}: {exc}"},
+                candidate_json={"persona_id": slot.slot_id},
+            )
+        logger.info(
+            "MegaPersona generation %s/%s slot=%s valid=%s issues=%s",
+            index,
+            total,
+            slot.slot_id,
+            result.is_valid,
+            len(result.validation_report.issues),
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Core pipeline (optimised)
     # ------------------------------------------------------------------
 
     def generate_one(self, slot: MegaPersonaSlot) -> MegaPersonaGenerationResult:
+        if self.pipeline_mode == "single_call":
+            return self._generate_one_compact(slot)
+
+        blueprint = self._build_blueprint(slot)
         whiteboard: dict[str, Any] = {
             "persona_id": slot.slot_id,
             "slot": slot.prompt_context(),
         }
+        if blueprint:
+            whiteboard["generation_blueprint"] = blueprint
         candidate: dict[str, Any] = {"persona_id": slot.slot_id}
         raw_outputs: dict[str, str] = {}
+        if blueprint:
+            raw_outputs["generation_blueprint"] = _json_dumps(blueprint)
         slot_json = _json_dumps(slot.prompt_context())
 
         # ---- Agent 1: Demographics (must run alone — no prior context) ----
@@ -164,6 +247,15 @@ class MegaPersonaGenerator:
         )
         logger.info("Slot=%s agent=demographics done", slot.slot_id)
         raw_outputs["demographics"] = raw_demo
+        demographics = self._ensure_stage_keys(
+            slot=slot,
+            stage_name="demographics",
+            stage_payload=demographics,
+            required_keys=("demographics",),
+            raw_text=raw_demo,
+            context=whiteboard,
+            raw_outputs=raw_outputs,
+        )
         self._merge_stage(candidate, demographics, ("demographics",))
         whiteboard.update(demographics)
 
@@ -175,13 +267,27 @@ class MegaPersonaGenerator:
             prompt=cognition_motivation_agent_prompt(
                 whiteboard_json=_json_dumps(whiteboard),
                 target_axes_json=_json_dumps(slot.target_axes),
-                prior_constraints="\n".join(slot.adaptive_constraints),
-                hard_constraints=hard_cc,
+                prior_constraints="\n".join(
+                    slot.adaptive_constraints + _blueprint_constraint_lines(blueprint, "cognition")
+                ),
+                hard_constraints=_join_constraint_blocks(
+                    hard_cc,
+                    _blueprint_hard_constraints(blueprint, "cognition"),
+                ),
             ),
             system_prompt=self._system_prompt(COGNITION_MOTIVATION_AGENT_SYSTEM_PROMPT),
         )
         logger.info("Slot=%s agent=cognition_motivation done", slot.slot_id)
         raw_outputs["cognition_motivation"] = raw_cog
+        cognition = self._ensure_stage_keys(
+            slot=slot,
+            stage_name="cognition_motivation",
+            stage_payload=cognition,
+            required_keys=("cognitive_motivation_profile", "derived_academic_tendency"),
+            raw_text=raw_cog,
+            context=whiteboard,
+            raw_outputs=raw_outputs,
+        )
         self._merge_stage(
             candidate,
             cognition,
@@ -200,6 +306,7 @@ class MegaPersonaGenerator:
             whiteboard=whiteboard,
             slot=slot,
             slot_json=slot_json,
+            blueprint=blueprint,
         )
 
         for stage_name, parsed, raw_text in results_3_5:
@@ -209,9 +316,48 @@ class MegaPersonaGenerator:
                 "social_creative": ("social_creative_profile",),
                 "mental_health": ("mental_health_context",),
             }
+            parsed = self._ensure_stage_keys(
+                slot=slot,
+                stage_name=stage_name,
+                stage_payload=parsed,
+                required_keys=key_map[stage_name],
+                raw_text=raw_text,
+                context=whiteboard,
+                raw_outputs=raw_outputs,
+            )
             self._merge_stage(candidate, parsed, key_map[stage_name])
 
-        return self._validate_or_revise(slot, candidate, raw_outputs)
+        return self._validate_or_revise(slot, candidate, raw_outputs, blueprint=blueprint)
+
+    def _generate_one_compact(self, slot: MegaPersonaSlot) -> MegaPersonaGenerationResult:
+        blueprint = self._build_blueprint(slot)
+        raw_outputs: dict[str, str] = {}
+        if blueprint:
+            raw_outputs["generation_blueprint"] = _json_dumps(blueprint)
+        logger.info("Slot=%s compact_persona start", slot.slot_id)
+        raw = _generate_with_retry(
+            llm=self.llm,
+            label="compact_persona",
+            prompt=compact_persona_prompt(
+                slot_context_json=_json_dumps(slot.prompt_context()),
+                blueprint_json=_json_dumps(blueprint),
+                prompt_addendum=self.prompt_addendum,
+            ),
+            system_prompt=self._system_prompt(COMPACT_PERSONA_SYSTEM_PROMPT),
+            temperature=self.temperature,
+            max_tokens=max(self.max_tokens, 4200),
+        )
+        logger.info("Slot=%s compact_persona done", slot.slot_id)
+        raw_outputs["compact_persona"] = raw
+        candidate = _parse_or_repair_json(
+            llm=self.llm,
+            raw=raw,
+            stage_name="compact_persona",
+            temperature=0.0,
+            max_tokens=max(self.max_tokens, 4200),
+        )
+        candidate.setdefault("persona_id", slot.slot_id)
+        return self._validate_or_revise(slot, candidate, raw_outputs, blueprint=blueprint)
 
     # ------------------------------------------------------------------
     # Validation & revision
@@ -222,9 +368,13 @@ class MegaPersonaGenerator:
         slot: MegaPersonaSlot,
         candidate: dict[str, Any],
         raw_outputs: dict[str, str],
+        blueprint: dict[str, Any] | None = None,
     ) -> MegaPersonaGenerationResult:
+        trimmed_fields = _apply_text_length_budgets(candidate)
+        _log_trimmed_fields(slot.slot_id, trimmed_fields, stage="pre-validate")
         report = validate_mega_persona(candidate)
-        if report.is_valid:
+        blueprint_issues = _blueprint_critic_issues(candidate, blueprint or {})
+        if report.is_valid and not blueprint_issues:
             logger.info("Slot=%s validation passed", slot.slot_id)
             return MegaPersonaGenerationResult(
                 slot=slot,
@@ -232,6 +382,12 @@ class MegaPersonaGenerator:
                 validation_report=report,
                 raw_outputs=raw_outputs,
                 candidate_json=candidate,
+            )
+        if report.is_valid and blueprint_issues:
+            report = ValidationReport(
+                is_valid=False,
+                schema_valid=True,
+                issues=blueprint_issues,
             )
 
         revised = candidate
@@ -270,6 +426,8 @@ class MegaPersonaGenerator:
                 temperature=0.0,
                 max_tokens=self.max_tokens,
             )
+            trimmed_fields = _apply_text_length_budgets(revised)
+            _log_trimmed_fields(slot.slot_id, trimmed_fields, stage=f"post-revision-{attempt + 1}")
             report = validate_mega_persona(revised)
             if report.is_valid:
                 logger.info("Slot=%s revision attempt=%s passed", slot.slot_id, attempt + 1)
@@ -328,6 +486,68 @@ class MegaPersonaGenerator:
             f"{self.prompt_addendum}"
         )
 
+    def _build_blueprint(self, slot: MegaPersonaSlot) -> dict[str, Any]:
+        if self.blueprint_builder is None:
+            return {}
+        try:
+            blueprint = self.blueprint_builder(slot)
+        except Exception as exc:
+            logger.warning("Slot=%s blueprint builder failed: %s", slot.slot_id, exc)
+            return {}
+        return blueprint if isinstance(blueprint, dict) else {}
+
+    def _ensure_stage_keys(
+        self,
+        *,
+        slot: MegaPersonaSlot,
+        stage_name: str,
+        stage_payload: dict[str, Any],
+        required_keys: tuple[str, ...],
+        raw_text: str,
+        context: dict[str, Any],
+        raw_outputs: dict[str, str],
+    ) -> dict[str, Any]:
+        missing = [key for key in required_keys if key not in stage_payload]
+        if not missing:
+            return stage_payload
+        logger.warning(
+            "Slot=%s agent=%s missing keys=%s; requesting stage repair",
+            slot.slot_id,
+            stage_name,
+            missing,
+        )
+        repair_raw = _generate_with_retry(
+            llm=self.llm,
+            label=f"{stage_name}_stage_repair",
+            prompt=stage_repair_prompt(
+                stage_name=stage_name,
+                raw_stage_json=raw_text,
+                required_keys_json=_json_dumps(list(required_keys)),
+                context_json=_json_dumps(
+                    {
+                        "persona_id": slot.slot_id,
+                        "slot": slot.prompt_context(),
+                        "whiteboard": context,
+                    }
+                ),
+            ),
+            system_prompt=(
+                "You repair one stage of a schema-constrained persona pipeline. "
+                "Return valid JSON only with the required top-level keys."
+            ),
+            temperature=0.1,
+            max_tokens=self.max_tokens,
+        )
+        raw_outputs[f"{stage_name}_stage_repair"] = repair_raw
+        repaired = _parse_or_repair_json(
+            llm=self.llm,
+            raw=repair_raw,
+            stage_name=f"{stage_name}_stage_repair",
+            temperature=0.0,
+            max_tokens=self.max_tokens,
+        )
+        return repaired
+
     @staticmethod
     def _merge_stage(
         candidate: dict[str, Any],
@@ -354,6 +574,7 @@ def _run_parallel_agents(
     whiteboard: dict[str, Any],
     slot: MegaPersonaSlot,
     slot_json: str,
+    blueprint: dict[str, Any] | None = None,
 ) -> list[tuple[str, dict[str, Any], str]]:
     """Run Values, Social, and Mental Health agents concurrently.
 
@@ -394,7 +615,10 @@ def _run_parallel_agents(
         "prompt": values_identity_agent_prompt(
             whiteboard_json=_json_dumps(wb_values),
             slot_context_json=slot_json,
-            hard_constraints=hc_values,
+            hard_constraints=_join_constraint_blocks(
+                hc_values,
+                _blueprint_hard_constraints(blueprint or {}, "values_identity"),
+            ),
         ),
     })
 
@@ -407,7 +631,10 @@ def _run_parallel_agents(
         "prompt": social_creative_agent_prompt(
             whiteboard_json=_json_dumps(wb_social),
             slot_context_json=slot_json,
-            hard_constraints=hc_social,
+            hard_constraints=_join_constraint_blocks(
+                hc_social,
+                _blueprint_hard_constraints(blueprint or {}, "social_creative"),
+            ),
         ),
     })
 
@@ -420,7 +647,10 @@ def _run_parallel_agents(
         "prompt": mental_health_agent_prompt(
             whiteboard_json=_json_dumps(wb_health),
             slot_context_json=slot_json,
-            hard_constraints=hc_health,
+            hard_constraints=_join_constraint_blocks(
+                hc_health,
+                _blueprint_hard_constraints(blueprint or {}, "mental_health"),
+            ),
         ),
     })
 
@@ -521,11 +751,12 @@ _NUMERIC_TRAIT_LABELS = [
 def _hard_constraints_for_cognition(slot: MegaPersonaSlot) -> str:
     """Numeric targets and anti-collapse rules for the cognition agent."""
     axes = slot.target_axes
+    roles = axis_roles_for_target_axes(axes)
     lines = [
         "HARD TARGETS (embed these in mechanisms, not as repeated numbers):",
-        f"  - cognitive_abstraction ≈ {axes['cognitive_abstraction']:.2f}",
-        f"  - motivation_autonomy ≈ {axes['motivation_autonomy']:.2f}",
-        f"  - self_regulation_resilience ≈ {axes['self_regulation_resilience']:.2f}",
+        f"  - {roles['cognitive_core']} ≈ {axes.get(roles['cognitive_core'], 0.5):.2f}",
+        f"  - {roles['motivation_core']} ≈ {axes.get(roles['motivation_core'], 0.5):.2f}",
+        f"  - {roles['regulation_core']} ≈ {axes.get(roles['regulation_core'], 0.5):.2f}",
         "",
         "ANTI-COLLAPSE RULES:",
         "  - At least 5 of these numeric traits MUST be in [0.25, 0.75]:",
@@ -554,10 +785,12 @@ def _hard_constraints_for_values(wb: dict[str, Any], slot: MegaPersonaSlot) -> s
     mot = _as_dict(cog.get("motivation_system", {}))
     primary = mot.get("primary_drive", "mastery")
     intrinsic = mot.get("intrinsic_motivation", 0.5)
-    autonomy = slot.target_axes.get("motivation_autonomy", 0.5)
+    roles = axis_roles_for_target_axes(slot.target_axes)
+    autonomy_key = roles["motivation_core"]
+    autonomy = slot.target_axes.get(autonomy_key, 0.5)
     lines = [
         "HARD ALIGNMENT:",
-        f"  - primary_drive={primary}, motivation_autonomy≈{autonomy:.2f}",
+        f"  - primary_drive={primary}, {autonomy_key}≈{autonomy:.2f}",
         "  - Core values must reflect the person's actual motivational structure.",
     ]
     if autonomy >= 0.65:
@@ -591,10 +824,12 @@ def _hard_constraints_for_social(wb: dict[str, Any], slot: MegaPersonaSlot) -> s
 def _hard_constraints_for_health(wb: dict[str, Any], slot: MegaPersonaSlot) -> str:
     """Stress-resilience consistency constraints."""
     band = slot.constraints.get("stress_band", "mid")
-    regulation = slot.target_axes.get("self_regulation_resilience", 0.5)
+    roles = axis_roles_for_target_axes(slot.target_axes)
+    regulation_key = roles["regulation_core"]
+    regulation = slot.target_axes.get(regulation_key, 0.5)
     lines = [
         f"HARD TARGET: stress_load should reflect stress_band='{band}', "
-        f"self_regulation_resilience≈{regulation:.2f}.",
+        f"{regulation_key}≈{regulation:.2f}.",
     ]
     if band in ("high", "mid_high") and regulation >= 0.6:
         lines.append(
@@ -611,6 +846,133 @@ def _hard_constraints_for_health(wb: dict[str, Any], slot: MegaPersonaSlot) -> s
     lines.append("  - Do not diagnose. Describe behaviorally useful context.")
     lines.append("  - coping_style must make sense given their self-regulation pattern.")
     return "\n".join(lines)
+
+
+# ======================================================================
+# Genome v3 blueprint injection and lightweight critic
+# ======================================================================
+
+def _blueprint_constraint_lines(blueprint: dict[str, Any], stage_name: str) -> list[str]:
+    if not blueprint:
+        return []
+    lines = []
+    core_tension = blueprint.get("core_tension")
+    if isinstance(core_tension, str) and core_tension.strip():
+        lines.append(f"Blueprint core tension: {core_tension.strip()}")
+    for binding in _blueprint_stage_bindings(blueprint, stage_name):
+        lines.append(f"Blueprint binding: {binding}")
+    return lines
+
+
+def _blueprint_hard_constraints(blueprint: dict[str, Any], stage_name: str) -> str:
+    if not blueprint:
+        return ""
+    lines = ["GENOME V3 BLUEPRINT CONSTRAINTS:"]
+    axis_plan = blueprint.get("axis_expression_plan")
+    if isinstance(axis_plan, dict):
+        for axis, plan in axis_plan.items():
+            if not isinstance(plan, dict):
+                continue
+            lines.append(
+                "  - "
+                f"{axis}: target={plan.get('target', 'n/a')} band={plan.get('band', 'mid')}; "
+                f"evidence={plan.get('evidence', '')}; boundary={plan.get('boundary', '')}"
+            )
+    behavior_profile = blueprint.get("behavior_prediction_profile")
+    if isinstance(behavior_profile, dict):
+        stage_keys = {
+            "cognition": ("ambiguous_task", "failure_feedback", "deadline"),
+            "values_identity": ("peer_pressure", "failure_feedback"),
+            "social_creative": ("peer_pressure", "ambiguous_task"),
+            "mental_health": ("failure_feedback", "deadline"),
+        }.get(stage_name, ())
+        for key in stage_keys:
+            value = behavior_profile.get(key)
+            if isinstance(value, str) and value.strip():
+                lines.append(f"  - Behavior prediction anchor `{key}`: {value.strip()}")
+    for binding in _blueprint_stage_bindings(blueprint, stage_name):
+        lines.append(f"  - Cross-agent binding: {binding}")
+    lines.append(
+        "  - The final text must echo these blueprint constraints through concrete behavior, "
+        "not by naming the blueprint."
+    )
+    return "\n".join(lines)
+
+
+def _blueprint_stage_bindings(blueprint: dict[str, Any], stage_name: str) -> list[str]:
+    bindings = blueprint.get("cross_agent_binding")
+    if not isinstance(bindings, list):
+        return []
+    stage_aliases = {
+        "cognition": ("cognition", "cognitive", "motivation", "regulation"),
+        "values_identity": ("values", "identity"),
+        "social_creative": ("social", "creative", "peer"),
+        "mental_health": ("health", "stress", "recovery"),
+    }.get(stage_name, (stage_name,))
+    selected = []
+    for item in bindings:
+        if not isinstance(item, str):
+            continue
+        lowered = item.lower()
+        if any(alias in lowered for alias in stage_aliases):
+            selected.append(item)
+    return selected[:4]
+
+
+def _blueprint_critic_issues(
+    candidate: dict[str, Any],
+    blueprint: dict[str, Any],
+) -> list[ValidationIssue]:
+    if not blueprint:
+        return []
+    text = _candidate_text_blob(candidate)
+    if not text:
+        return []
+    issues: list[ValidationIssue] = []
+    scenario_keywords = {
+        "ambiguous_task": ("ambiguous", "uncertain", "unclear", "instruction", "task"),
+        "peer_pressure": ("peer", "group", "classmate", "comparison", "social"),
+        "failure_feedback": ("failure", "feedback", "mistake", "criticism", "setback"),
+        "deadline": ("deadline", "schedule", "late", "time", "rush"),
+    }
+    missing_scenarios = [
+        scenario
+        for scenario, keywords in scenario_keywords.items()
+        if not any(keyword in text for keyword in keywords)
+    ]
+    if len(missing_scenarios) >= 3:
+        issues.append(
+            ValidationIssue(
+                rule_id="BLUEPRINT",
+                severity="error",
+                message=(
+                    "Genome v3 blueprint behavior anchors are weakly reflected; missing scenarios: "
+                    + ", ".join(missing_scenarios)
+                ),
+            )
+        )
+    return issues
+
+
+def _candidate_text_blob(candidate: dict[str, Any]) -> str:
+    chunks: list[str] = []
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, str):
+            chunks.append(value)
+        elif isinstance(value, dict):
+            for nested in value.values():
+                _walk(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                _walk(nested)
+
+    _walk(candidate)
+    return " ".join(chunks).lower()
+
+
+def _join_constraint_blocks(*blocks: str) -> str:
+    return "\n\n".join(block.strip() for block in blocks if isinstance(block, str) and block.strip())
 
 
 # ======================================================================
@@ -633,6 +995,62 @@ def _truncate(text: Any, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len] + "…"
+
+
+def _apply_text_length_budgets(candidate: dict[str, Any]) -> list[tuple[str, int, int]]:
+    trimmed: list[tuple[str, int, int]] = []
+    for path, max_len in _TEXT_LENGTH_BUDGETS.items():
+        parent = candidate
+        for key in path[:-1]:
+            if not isinstance(parent, dict):
+                parent = None
+                break
+            parent = parent.get(key)
+        if not isinstance(parent, dict):
+            continue
+        leaf = path[-1]
+        value = parent.get(leaf)
+        if not isinstance(value, str):
+            continue
+        if len(value) <= max_len:
+            continue
+        parent[leaf] = _smart_trim_text(value, max_len)
+        trimmed.append((".".join(path), len(value), len(parent[leaf])))
+    return trimmed
+
+
+def _smart_trim_text(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    hard_limit = max(0, max_len - 1)
+    snippet = text[:hard_limit]
+    boundary = max(
+        snippet.rfind(". "),
+        snippet.rfind("! "),
+        snippet.rfind("? "),
+        snippet.rfind("。"),
+        snippet.rfind("！"),
+        snippet.rfind("？"),
+        snippet.rfind("; "),
+        snippet.rfind("；"),
+    )
+    if boundary >= int(max_len * 0.6):
+        snippet = snippet[: boundary + 1].rstrip()
+    else:
+        snippet = snippet.rstrip(" ,;:，；：")
+    return snippet + "…"
+
+
+def _log_trimmed_fields(slot_id: str, trimmed_fields: list[tuple[str, int, int]], stage: str) -> None:
+    for field_path, old_len, new_len in trimmed_fields:
+        logger.info(
+            "Slot=%s text budget trim stage=%s field=%s old_len=%s new_len=%s",
+            slot_id,
+            stage,
+            field_path,
+            old_len,
+            new_len,
+        )
 
 
 def parse_json_object(raw: str) -> dict[str, Any]:
@@ -767,6 +1185,12 @@ def _generate_with_retry(
         "temporarily",
         "server",
         "overloaded",
+        "empty response",
+        "missing choices",
+        "missing message",
+        "blank content",
+        "response is none",
+        "not subscriptable",
     )
     for attempt in range(max_retries + 1):
         try:

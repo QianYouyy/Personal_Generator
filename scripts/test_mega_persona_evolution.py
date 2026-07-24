@@ -13,10 +13,17 @@ from src.mega_persona import (
     MegaEvolutionCandidate,
     MegaEvolutionConfig,
     MegaPersonaOpenEvolveRunner,
+    RuleBasedMegaPersonaBuilder,
+    blueprint_from_slot,
+    candidate_slots,
     default_genome,
     mutate_genome,
     prompt_addendum_from_genome,
+    validate_mega_persona,
 )
+from src.mega_persona.slots import schema_binding_for_genome
+from src.mega_persona.slots import build_adaptive_constraints
+from src.mega_persona.shadow_survey import build_initial_shadow_surveys, score_shadow_survey
 from scripts.run_mega_persona_operator_ablation import (
     build_ablation_candidates,
     summarize_ablation_results,
@@ -106,21 +113,35 @@ def test_openevolve_persistence_and_resume():
 
         final_summary = json.loads((output_dir / "final_summary.json").read_text(encoding="utf-8"))
         assert final_summary["best"]["fitness"] is not None
+        candidate_payloads = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (mega_eval_dir / "candidates").glob("*.json")
+        ]
+        assert any(payload["generation"] > 0 for payload in candidate_payloads)
+        assert final_summary["best"]["generation"] >= 0
         result_path = next((mega_eval_dir / "evaluations").glob("eval_*/*"))
         result = json.loads(result_path.read_text(encoding="utf-8"))
         seed_result = result["per_seed"][0]
         assert "train_shadow_behavior" in seed_result
         assert "validation_shadow_behavior" in seed_result
         assert "validation_behavior_diversity" in seed_result
+        assert "internal_consistency" in seed_result
+        assert 0.0 <= seed_result["internal_consistency"]["mean_score"] <= 1.0
         assert "test_shadow_behavior" not in seed_result
         assert "test_behavior_diversity" not in seed_result
         assert "shadow_survey_hashes" in seed_result
+        assert "internal_consistency.mean" in result["metrics"]
+        assert "axis_alignment.mean" in result["metrics"]
         assert "validation_shadow_alignment.mean" in result["metrics"]
         assert "test_shadow_alignment.mean" not in result["metrics"]
         test_report = json.loads((mega_eval_dir / "final_test_report.json").read_text(encoding="utf-8"))
         assert test_report["test_used_for_selection"] is False
+        assert "test_schema_fitness.mean" in test_report["metrics"]
+        assert "test_internal_consistency.mean" in test_report["metrics"]
+        assert "test_axis_alignment.mean" in test_report["metrics"]
         assert "test_shadow_alignment.mean" in test_report["metrics"]
         assert "test_behavior_coverage.mean" in test_report["metrics"]
+        assert "test_behavior_balanced_diversity.mean" in test_report["metrics"]
 
 
 def test_resume_rejects_config_mismatch():
@@ -220,13 +241,23 @@ def test_openevolve_manifest_and_artifacts():
 
 
 def test_prompt_addendum_from_genome():
-    assert len(EVOLUTION_PROMPT_OPERATORS) == 8
-    assert len({operator["id"] for operator in EVOLUTION_PROMPT_OPERATORS}) == 8
+    assert len(EVOLUTION_PROMPT_OPERATORS) >= 16
+    assert len({operator["id"] for operator in EVOLUTION_PROMPT_OPERATORS}) == len(EVOLUTION_PROMPT_OPERATORS)
     operator_instructions = " ".join(operator["instruction"] for operator in EVOLUTION_PROMPT_OPERATORS)
     assert "deadline" in operator_instructions
     assert "peer pressure" in operator_instructions
     assert "failure cycle" in operator_instructions
     assert "field lengths" in operator_instructions
+    assert "recovery latency" in operator_instructions
+    assert "support networks" in operator_instructions
+    assert "external approval" in operator_instructions
+    assert "Genome v3 blueprint" in operator_instructions
+    op16 = next(operator for operator in EVOLUTION_PROMPT_OPERATORS if operator["id"] == "op16_v3_blueprint_binding")
+    assert "blueprint_policy" in op16
+    assert "axis_expression_policy" in op16
+    assert "cross_agent_binding_policy" in op16
+    assert "behavior_prediction_policy" in op16
+    assert "critic_policy" in op16
 
     genome = default_genome()
     genome["prompt_profile"] = {
@@ -249,6 +280,19 @@ def test_prompt_addendum_from_genome():
     assert "self-image and behavior evidence" in addendum
 
 
+def test_genome_v3_blueprint_from_slot():
+    genome = default_genome()
+    assert genome["genome_version"] == 3
+    slot = candidate_slots(genome, n=1, seed=17)[0]
+    blueprint = blueprint_from_slot(genome, slot)
+    assert blueprint["blueprint_version"] == 3
+    assert blueprint["axis_expression_plan"]
+    assert set(blueprint["axis_expression_plan"]) == set(slot.target_axes)
+    assert "ambiguous_task" in blueprint["behavior_prediction_profile"]
+    assert blueprint["cross_agent_binding"]
+    assert blueprint["critic_checks"]
+
+
 def test_mutation_records_evolution_operator():
     import numpy as np
 
@@ -256,8 +300,10 @@ def test_mutation_records_evolution_operator():
     operator = mutated["last_evolution_operator"]
     assert operator["id"] in {item["id"] for item in EVOLUTION_PROMPT_OPERATORS}
     addendum = prompt_addendum_from_genome(mutated)
-    assert "Selected evolution operator" in addendum
-    assert operator["instruction"] in addendum
+    # Operator instructions guide the mutator only; they must not leak into
+    # the persona generation prompt.
+    assert "Selected evolution operator" not in addendum
+    assert operator["instruction"] not in addendum
 
 
 def test_mutation_modes_are_diagnostic():
@@ -287,6 +333,125 @@ def test_mutation_modes_are_diagnostic():
     assert numeric_only["last_evolution_operator"] is None
     assert numeric_only["prompt_profile"] == base["prompt_profile"]
     assert numeric_only["axis_bias"] != base["axis_bias"]
+
+
+def test_schema_bound_genome_can_rename_axes():
+    import numpy as np
+
+    genome = default_genome()
+    genome["schema_binding"]["axis_names"] = [
+        "thinking_depth",
+        "motivation_drive",
+        "recovery_control",
+    ]
+    genome["schema_binding"]["axis_roles"] = {
+        "cognitive_core": "thinking_depth",
+        "motivation_core": "motivation_drive",
+        "regulation_core": "recovery_control",
+    }
+    genome["axis_bias"] = {
+        "thinking_depth": 0.0,
+        "motivation_drive": 0.0,
+        "recovery_control": 0.0,
+    }
+    genome["axis_stretch"] = {
+        "thinking_depth": 1.0,
+        "motivation_drive": 1.0,
+        "recovery_control": 1.0,
+    }
+    mutated = mutate_genome(
+        genome,
+        np.random.default_rng(12),
+        0.15,
+        mutation_mode="mixed",
+        operator_id="op13_autonomy_pressure_test",
+    )
+    binding = schema_binding_for_genome(mutated)
+    assert tuple(binding["axis_names"]) == (
+        "thinking_depth",
+        "motivation_drive",
+        "recovery_control",
+    )
+    assert set(mutated["axis_bias"]) == {"thinking_depth", "motivation_drive", "recovery_control"}
+    assert set(mutated["axis_stretch"]) == {"thinking_depth", "motivation_drive", "recovery_control"}
+    slots = candidate_slots(mutated, n=2, seed=17)
+    assert set(slots[0].target_axes) == {"thinking_depth", "motivation_drive", "recovery_control"}
+    hints = build_adaptive_constraints(
+        {
+            "thinking_depth": 0.4,
+            "motivation_drive": 0.85,
+            "recovery_control": 0.55,
+        },
+        {"primary_drive": "security"},
+        axis_roles=binding["axis_roles"],
+    )
+    assert any("security or recognition needs" in hint for hint in hints)
+
+
+def test_schema_bound_shadow_surveys_remap_axes():
+    binding = {
+        "axis_names": ["thinking_depth", "motivation_drive", "recovery_control"],
+        "axis_roles": {
+            "cognitive_core": "thinking_depth",
+            "motivation_core": "motivation_drive",
+            "regulation_core": "recovery_control",
+        },
+        "quota_buckets": default_genome()["schema_binding"]["quota_buckets"],
+    }
+    surveys = build_initial_shadow_surveys(
+        num_surveys=1,
+        items_per_survey=8,
+        seed=17,
+        schema_binding=binding,
+    )
+    survey = surveys[0]
+    assert survey.axis_names == ("thinking_depth", "motivation_drive", "recovery_control")
+    assert all(
+        set(item.axis_weights).issubset(set(survey.axis_names))
+        for item in survey.items
+    )
+    responses = {item.item_id: 3 for item in survey.items}
+    scores = score_shadow_survey(survey, responses)
+    assert "axis.thinking_depth" in scores
+    assert "axis.motivation_drive" in scores
+    assert "axis.recovery_control" in scores
+
+
+def test_schema_bound_builder_and_validator_follow_renamed_axes():
+    genome = default_genome()
+    genome["schema_binding"]["axis_names"] = [
+        "thinking_depth",
+        "motivation_drive",
+        "recovery_control",
+    ]
+    genome["schema_binding"]["axis_roles"] = {
+        "cognitive_core": "thinking_depth",
+        "motivation_core": "motivation_drive",
+        "regulation_core": "recovery_control",
+    }
+    genome["axis_bias"] = {
+        "thinking_depth": 0.0,
+        "motivation_drive": 0.0,
+        "recovery_control": 0.0,
+    }
+    genome["axis_stretch"] = {
+        "thinking_depth": 1.0,
+        "motivation_drive": 1.0,
+        "recovery_control": 1.0,
+    }
+    slot = candidate_slots(genome, n=1, seed=23)[0]
+    persona = RuleBasedMegaPersonaBuilder().build(slot)
+    report = validate_mega_persona(
+        persona,
+        axis_names=tuple(genome["schema_binding"]["axis_names"]),
+        axis_roles=genome["schema_binding"]["axis_roles"],
+    )
+    assert report.schema_valid is True
+    derived_axes = persona.primary_axes(
+        axis_names=tuple(genome["schema_binding"]["axis_names"]),
+        axis_roles=genome["schema_binding"]["axis_roles"],
+    )
+    assert set(derived_axes) == {"thinking_depth", "motivation_drive", "recovery_control"}
 
 
 def test_operator_ablation_candidate_design():
@@ -390,8 +555,12 @@ def main():
     test_resume_rejects_config_mismatch()
     test_openevolve_manifest_and_artifacts()
     test_prompt_addendum_from_genome()
+    test_genome_v3_blueprint_from_slot()
     test_mutation_records_evolution_operator()
     test_mutation_modes_are_diagnostic()
+    test_schema_bound_genome_can_rename_axes()
+    test_schema_bound_shadow_surveys_remap_axes()
+    test_schema_bound_builder_and_validator_follow_renamed_axes()
     test_operator_ablation_candidate_design()
     test_operator_ablation_summary_groups_against_parent()
     test_llm_mode_uses_prompt_genome()
