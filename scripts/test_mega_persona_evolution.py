@@ -17,12 +17,14 @@ from src.mega_persona import (
     blueprint_from_slot,
     candidate_slots,
     default_genome,
+    default_genome_v4,
     mutate_genome,
     prompt_addendum_from_genome,
     validate_mega_persona,
 )
 from src.mega_persona.slots import schema_binding_for_genome
 from src.mega_persona.slots import build_adaptive_constraints
+from src.mega_persona.generator import _blueprint_hard_constraints
 from src.mega_persona.shadow_survey import build_initial_shadow_surveys, score_shadow_survey
 from scripts.run_mega_persona_operator_ablation import (
     build_ablation_candidates,
@@ -34,7 +36,7 @@ class _MockSimulatorLLM:
     """Returns neutral Likert responses for every simulate_persona call."""
 
     def generate(self, prompt: str, system_prompt: str = "", temperature: float = 0.0,
-                 max_tokens: int = 1500) -> str:
+                 max_tokens: int = 1500, **kwargs) -> str:
         import json
         # Extract item_ids from the prompt
         lines = prompt.split("\n")
@@ -291,6 +293,116 @@ def test_genome_v3_blueprint_from_slot():
     assert "ambiguous_task" in blueprint["behavior_prediction_profile"]
     assert blueprint["cross_agent_binding"]
     assert blueprint["critic_checks"]
+
+
+def test_genome_v4_structured_blueprint():
+    genome = default_genome_v4()
+    assert genome["genome_version"] == 4
+    assert "prompt_profile" not in genome
+    assert "blueprint_policy" not in genome
+    slot = candidate_slots(genome, n=1, seed=17)[0]
+    blueprint = blueprint_from_slot(genome, slot)
+    assert blueprint["blueprint_version"] == 4
+    assert set(blueprint["axis_expression_plan"]) == set(slot.target_axes)
+    assert set(blueprint["behavior_prediction_profile"]) == {
+        "ambiguous_task",
+        "peer_pressure",
+        "failure_feedback",
+        "deadline",
+    }
+    assert blueprint["structured_program"]["probe_assignment"] == genome["probe_assignment"]
+    assert "Genome v4 generation blueprint" in prompt_addendum_from_genome(genome)
+    hard_constraints = _blueprint_hard_constraints(blueprint, "cognition")
+    assert "signal strength=" in hard_constraints
+    assert "Blueprint critic requirement" in hard_constraints
+
+
+def test_genome_v4_operators_change_one_module():
+    import numpy as np
+
+    base = default_genome_v4()
+    expected_modules = {
+        "op22_v4_probe_rewire": "probe_assignment",
+        "op23_v4_signal_calibrate": "axis_realization",
+        "op24_v4_interaction_rewire": "interaction_mode",
+        "op25_v4_echo_graph_rewire": "echo_graph",
+        "op26_v4_context_diversify": "context_modulation",
+        "op27_v4_repair_calibrate": "repair_control",
+    }
+    ignored = {"last_evolution_operator", "last_mutation", "openevolve_mutation"}
+    for index, (operator_id, module) in enumerate(expected_modules.items()):
+        child = mutate_genome(
+            base,
+            np.random.default_rng(100 + index),
+            0.12,
+            operator_id=operator_id,
+        )
+        changed = {
+            key
+            for key in set(base) | set(child)
+            if key not in ignored and base.get(key) != child.get(key)
+        }
+        assert changed == {module}, (operator_id, changed)
+        assert child["last_mutation"]["module"] == module
+        assert child["quota_weights"] == base["quota_weights"]
+        assert child["axis_bias"] == base["axis_bias"]
+        assert child["axis_stretch"] == base["axis_stretch"]
+
+
+def test_genome_v4_runner_manifest_and_seed():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "v4_evolution"
+        config = MegaEvolutionConfig(
+            n=2,
+            seeds=(17,),
+            generations=1,
+            population_size=2,
+            children_per_generation=1,
+            elite_count=1,
+            shadow_surveys=1,
+            validation_shadow_surveys=1,
+            test_shadow_surveys=1,
+            items_per_shadow_survey=6,
+            candidate_evaluation_repeats=2,
+            elite_confirmation_repeats=3,
+        )
+        best = MegaPersonaOpenEvolveRunner(
+            config=config,
+            output_dir=output_dir,
+            simulator_llm_client=_MOCK_SIM,
+            children_per_island=1,
+            genome_version=4,
+            operator_family="v4",
+            fixed_operator_id="op22_v4_probe_rewire",
+        ).run()
+        manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert best.genome["genome_version"] == 4
+        assert manifest["genome_version"] == 4
+        assert manifest["operator_family"] == "v4"
+        assert manifest["config"]["candidate_evaluation_repeats"] == 2
+        assert manifest["config"]["elite_confirmation_repeats"] == 3
+        assert set(manifest["operator_pool"]) == {
+            "op22_v4_probe_rewire",
+            "op23_v4_signal_calibrate",
+            "op24_v4_interaction_rewire",
+            "op25_v4_echo_graph_rewire",
+            "op26_v4_context_diversify",
+            "op27_v4_repair_calibrate",
+        }
+        checkpoint = json.loads(
+            (output_dir / "mega_eval" / "checkpoint.json").read_text(encoding="utf-8")
+        )
+        assert all(
+            candidate["genome"]["genome_version"] == 4
+            for candidate in checkpoint["population"]
+        )
+        test_report = json.loads(
+            (output_dir / "mega_eval" / "final_test_report.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert test_report["evaluation_repeats"] == 3
+        assert {item["evaluation_repeat"] for item in test_report["per_seed"]} == {1, 2, 3}
 
 
 def test_mutation_records_evolution_operator():
@@ -556,6 +668,9 @@ def main():
     test_openevolve_manifest_and_artifacts()
     test_prompt_addendum_from_genome()
     test_genome_v3_blueprint_from_slot()
+    test_genome_v4_structured_blueprint()
+    test_genome_v4_operators_change_one_module()
+    test_genome_v4_runner_manifest_and_seed()
     test_mutation_records_evolution_operator()
     test_mutation_modes_are_diagnostic()
     test_schema_bound_genome_can_rename_axes()

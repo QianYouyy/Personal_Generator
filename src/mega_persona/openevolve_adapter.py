@@ -21,10 +21,11 @@ from src.mega_persona.evolution import (
     PROMPT_POLICY_BANK,
     build_run_manifest,
     default_genome,
+    default_genome_v4,
     mutate_genome,
     normalize_genome,
 )
-from src.mega_persona.generator import parse_json_object
+from src.mega_persona.generator import _generate_with_retry, parse_json_object
 from src.mega_persona.mcts_policy import OperatorMCTSConfig, OperatorMCTSPolicy
 from src.mega_persona.slots import (
     axis_names_for_binding,
@@ -144,6 +145,36 @@ class MegaGenomeMutator:
         generation_boost = 1.0 + min(generation, 4) * 0.08
         mutation_scale = self.base_mutation_scale * stagnation_boost * generation_boost
         fallback_reason = None
+
+        if int(parent.get("genome_version", 3)) == 4:
+            with self._rng_lock:
+                child = mutate_genome(
+                    parent,
+                    self.rng,
+                    mutation_scale=mutation_scale,
+                    mutation_mode="operator_only",
+                    operator_id=operator["id"],
+                )
+            module = str(operator.get("v4_module", "unknown"))
+            metadata = self._mutation_metadata(
+                backend="structured_v4",
+                mode="structured_v4",
+                mutation_scale=mutation_scale,
+                generation=generation,
+                stagnation=stagnation,
+                operator=operator,
+            )
+            metadata.update(
+                {
+                    "declared_edits": [module],
+                    "actual_edits": [module],
+                    "undeclared_edits": [],
+                    "phantom_edits": [],
+                    "noop_retries": 0,
+                }
+            )
+            child["openevolve_mutation"] = metadata
+            return genome_to_code(child)
 
         if self.llm_client is not None:
             try:
@@ -266,11 +297,19 @@ class MegaGenomeMutator:
     def _operators_for_family(self, operator_family: str) -> tuple[dict[str, Any], ...]:
         family = operator_family.strip().lower()
         if family == "all":
-            operators = EVOLUTION_PROMPT_OPERATORS
+            # Preserve the historical meaning of all: legacy + v3. Genome v4
+            # is an explicit experimental surface and must be requested.
+            operators = tuple(operator for operator in EVOLUTION_PROMPT_OPERATORS if "_v4_" not in operator["id"])
         elif family == "v3":
             operators = tuple(operator for operator in EVOLUTION_PROMPT_OPERATORS if "_v3_" in operator["id"])
+        elif family == "v4":
+            operators = tuple(operator for operator in EVOLUTION_PROMPT_OPERATORS if "_v4_" in operator["id"])
         elif family == "legacy":
-            operators = tuple(operator for operator in EVOLUTION_PROMPT_OPERATORS if "_v3_" not in operator["id"])
+            operators = tuple(
+                operator
+                for operator in EVOLUTION_PROMPT_OPERATORS
+                if "_v3_" not in operator["id"] and "_v4_" not in operator["id"]
+            )
         else:
             raise ValueError(f"unknown operator_family: {operator_family}")
         if not operators:
@@ -331,11 +370,15 @@ class MegaGenomeMutator:
         normalized: dict[str, Any] = {}
         audit: dict[str, Any] = {}
         for _attempt in range(2):
-            raw = self.llm_client.generate(
-                base_prompt + feedback,
+            raw = _generate_with_retry(
+                llm=self.llm_client,
+                label="mutator",
+                prompt=base_prompt + feedback,
                 system_prompt=system_prompt,
                 temperature=0.45,
                 max_tokens=4200,
+                max_retries=2,
+                retry_backoff_seconds=1.5,
             )
             child = self._parse_or_repair_child(raw)
             declared_edits = _extract_declared_edits(child)
@@ -672,13 +715,30 @@ class MegaOpenEvolveEvaluator:
     def __init__(self, backend: MegaPersonaEvolver):
         self.backend = backend
         self.num_personas = backend.config.n
+        self.candidate_evaluation_repeats = max(
+            1,
+            int(getattr(backend.config, "candidate_evaluation_repeats", 1)),
+        )
+        self.elite_confirmation_repeats = max(
+            self.candidate_evaluation_repeats,
+            int(getattr(backend.config, "elite_confirmation_repeats", 1)),
+        )
         self._code_to_candidate_id, self._phenotype_to_candidate_id = (
             self._load_existing_indexes()
         )
         self._lock = threading.Lock()
+        self._phenotype_inflight: dict[str, tuple[str, threading.Event]] = {}
         self._candidate_sequence = backend.evaluation_count + 1
 
     def evaluate(self, code_str: str) -> dict[str, float]:
+        return self.evaluate_with_context(code_str)
+
+    def evaluate_with_context(
+        self,
+        code_str: str,
+        *,
+        parent_id: str | None = None,
+    ) -> dict[str, float]:
         genome = genome_from_code(code_str)
         digest = genome_hash(genome)[:12]
         with self._lock:
@@ -687,17 +747,20 @@ class MegaOpenEvolveEvaluator:
                 candidate_id = f"openevolve_{self._candidate_sequence:06d}_{digest}"
                 self._candidate_sequence += 1
                 self._code_to_candidate_id[digest] = candidate_id
-            cached_payload = self.backend.store.find_candidate_result(candidate_id)
+        phenotype_digest = genome_phenotype_hash(genome)[:12]
+        owner_event: threading.Event | None = None
 
-        if cached_payload is not None:
-            if _is_zero_persona_cache_payload(cached_payload):
-                logger.warning(
-                    "OpenEvolve evaluator ignoring zero-persona cache candidate=%s genome_hash=%s; "
-                    "will re-evaluate after retry/LLM response fixes",
-                    candidate_id,
-                    digest,
-                )
-            else:
+        while owner_event is None:
+            with self._lock:
+                cached_payload = self.backend.store.find_candidate_result(candidate_id)
+                phenotype_candidate_id = self._phenotype_to_candidate_id.get(phenotype_digest)
+                inflight = self._phenotype_inflight.get(phenotype_digest)
+
+            if (
+                cached_payload is not None
+                and not _is_zero_persona_cache_payload(cached_payload)
+                and self._has_required_repeats(cached_payload)
+            ):
                 logger.info(
                     "OpenEvolve evaluator cache hit candidate=%s genome_hash=%s fitness=%.4f",
                     candidate_id,
@@ -705,47 +768,181 @@ class MegaOpenEvolveEvaluator:
                     cached_payload.get("fitness", 0.0),
                 )
                 return open_evolve_fitness_from_payload(cached_payload)
+            if cached_payload is not None:
+                logger.warning(
+                    "OpenEvolve evaluator ignoring stale cache candidate=%s genome_hash=%s "
+                    "cached_repeats=%s required_repeats=%s zero_persona=%s",
+                    candidate_id,
+                    digest,
+                    _evaluation_repeat_count(cached_payload),
+                    self.candidate_evaluation_repeats,
+                    _is_zero_persona_cache_payload(cached_payload),
+                )
 
-        phenotype_digest = genome_phenotype_hash(genome)[:12]
-        with self._lock:
-            phenotype_candidate_id = self._phenotype_to_candidate_id.get(phenotype_digest)
-        phenotype_payload = (
-            self.backend.store.find_candidate_result(phenotype_candidate_id)
-            if phenotype_candidate_id is not None
-            else None
-        )
-        if phenotype_payload is not None and not _is_zero_persona_cache_payload(phenotype_payload):
-            logger.info(
-                "OpenEvolve evaluator phenotype cache hit candidate=%s phenotype_hash=%s "
-                "source_candidate=%s; reusing prior evaluation",
-                candidate_id,
-                phenotype_digest,
-                phenotype_candidate_id,
+            phenotype_payload = (
+                self.backend.store.find_candidate_result(phenotype_candidate_id)
+                if phenotype_candidate_id is not None
+                else None
             )
-            alias_payload = self._write_phenotype_cache_alias(
+            if (
+                phenotype_payload is not None
+                and not _is_zero_persona_cache_payload(phenotype_payload)
+                and self._has_required_repeats(phenotype_payload)
+            ):
+                logger.info(
+                    "OpenEvolve evaluator phenotype cache hit candidate=%s phenotype_hash=%s "
+                    "source_candidate=%s; reusing prior evaluation",
+                    candidate_id,
+                    phenotype_digest,
+                    phenotype_candidate_id,
+                )
+                alias_payload = self._write_phenotype_cache_alias(
+                    candidate_id=candidate_id,
+                    genome=genome,
+                    genome_hash_digest=digest,
+                    phenotype_hash_digest=phenotype_digest,
+                    source_candidate_id=str(phenotype_candidate_id),
+                    source_payload=phenotype_payload,
+                    parent_id=parent_id,
+                )
+                return open_evolve_fitness_from_payload(alias_payload)
+            if phenotype_candidate_id is not None:
+                with self._lock:
+                    if self._phenotype_to_candidate_id.get(phenotype_digest) == phenotype_candidate_id:
+                        self._phenotype_to_candidate_id.pop(phenotype_digest, None)
+
+            if inflight is None:
+                with self._lock:
+                    inflight = self._phenotype_inflight.get(phenotype_digest)
+                    if inflight is None:
+                        owner_event = threading.Event()
+                        self._phenotype_inflight[phenotype_digest] = (candidate_id, owner_event)
+                        break
+
+            if inflight is not None:
+                source_candidate_id, wait_event = inflight
+                logger.info(
+                    "OpenEvolve evaluator waiting for in-flight phenotype candidate=%s "
+                    "phenotype_hash=%s source_candidate=%s",
+                    candidate_id,
+                    phenotype_digest,
+                    source_candidate_id,
+                )
+                wait_event.wait()
+
+        try:
+            candidate = MegaEvolutionCandidate(
                 candidate_id=candidate_id,
                 genome=genome,
-                genome_hash_digest=digest,
-                phenotype_hash_digest=phenotype_digest,
-                source_candidate_id=str(phenotype_candidate_id),
-                source_payload=phenotype_payload,
+                generation=self._generation_for_genome(genome),
+                parent_id=parent_id,
             )
+            result = self._evaluate_candidate_repeats(candidate)
+            candidate.fitness = result["fitness"]
+            candidate.metrics = result["metrics"]
+            candidate.evaluated = True
+            candidate.metrics["openevolve_genome_hash"] = digest
+            candidate.metrics["openevolve_phenotype_hash"] = phenotype_digest
+
             with self._lock:
-                self._code_to_candidate_id[digest] = candidate_id
-            return open_evolve_fitness_from_payload(alias_payload)
+                self.backend.evaluation_count += 1
+                self.backend.store.write_evaluation(
+                    evaluation_index=self.backend.evaluation_count,
+                    candidate=candidate,
+                    payload=result,
+                )
+                if not _is_zero_persona_cache_payload(result):
+                    self._phenotype_to_candidate_id.setdefault(phenotype_digest, candidate_id)
+                self.backend.best_candidate_id = self._best_candidate_id_after(candidate)
+                self.backend._save_checkpoint()
+            return open_evolve_fitness_from_payload(result)
+        finally:
+            with self._lock:
+                inflight = self._phenotype_inflight.get(phenotype_digest)
+                if inflight is not None and inflight[0] == candidate_id:
+                    self._phenotype_inflight.pop(phenotype_digest, None)
+                    inflight[1].set()
+
+    def _evaluate_candidate_repeats(
+        self,
+        candidate: MegaEvolutionCandidate,
+        *,
+        repeat_count: int | None = None,
+        start_index: int = 0,
+    ) -> dict[str, Any]:
+        repeat_count = self.candidate_evaluation_repeats if repeat_count is None else repeat_count
+        repeat_payloads: list[dict[str, Any]] = []
+        for offset in range(repeat_count):
+            repeat_index = start_index + offset
+            repeat_candidate = candidate
+            if repeat_index > 0:
+                repeat_candidate = MegaEvolutionCandidate(
+                    candidate_id=f"{candidate.candidate_id}__repeat_{repeat_index + 1:02d}",
+                    genome=candidate.genome,
+                    generation=candidate.generation,
+                    parent_id=candidate.parent_id,
+                )
+            logger.info(
+                "OpenEvolve candidate=%s selection repeat=%s/%s",
+                candidate.candidate_id,
+                repeat_index + 1,
+                start_index + repeat_count,
+            )
+            repeat_payloads.append(self.backend.evaluate_candidate(repeat_candidate))
+        return _aggregate_candidate_evaluation_repeats(candidate, repeat_payloads)
+
+    def confirm_evaluation(
+        self,
+        code_str: str,
+        *,
+        parent_id: str | None = None,
+        required_repeats: int | None = None,
+    ) -> dict[str, Any]:
+        """Extend a cached candidate evaluation to the elite confirmation budget."""
+        required = max(
+            self.candidate_evaluation_repeats,
+            int(required_repeats or self.elite_confirmation_repeats),
+        )
+        genome = genome_from_code(code_str)
+        digest = genome_hash(genome)[:12]
+        with self._lock:
+            candidate_id = self._code_to_candidate_id.get(digest)
+            cached_payload = (
+                self.backend.store.find_candidate_result(candidate_id)
+                if candidate_id is not None
+                else None
+            )
+        if candidate_id is None or cached_payload is None:
+            raise ValueError("candidate must receive its initial evaluation before confirmation")
+        current_count = _evaluation_repeat_count(cached_payload)
+        if current_count >= required:
+            return open_evolve_fitness_from_payload(cached_payload)
 
         candidate = MegaEvolutionCandidate(
             candidate_id=candidate_id,
             genome=genome,
             generation=self._generation_for_genome(genome),
+            parent_id=parent_id,
         )
-        result = self.backend.evaluate_candidate(candidate)
+        additional = self._evaluate_candidate_repeats(
+            candidate,
+            repeat_count=required - current_count,
+            start_index=current_count,
+        )
+        repeat_payloads = _repeat_payloads_from_aggregate(cached_payload)
+        repeat_payloads.extend(_repeat_payloads_from_aggregate(additional))
+        result = _aggregate_candidate_evaluation_repeats(candidate, repeat_payloads)
+        result["metrics"]["elite_confirmation"] = True
+        result["metrics"]["elite_confirmation_repeats"] = required
+        result["metrics"]["openevolve_genome_hash"] = digest
+        result["metrics"]["openevolve_phenotype_hash"] = genome_phenotype_hash(genome)[:12]
+        if bool(cached_payload.get("phenotype_cache_hit")):
+            result["phenotype_cache_hit"] = True
+            result["metrics"]["phenotype_cache_hit"] = True
+
         candidate.fitness = result["fitness"]
         candidate.metrics = result["metrics"]
         candidate.evaluated = True
-        candidate.metrics["openevolve_genome_hash"] = digest
-        candidate.metrics["openevolve_phenotype_hash"] = phenotype_digest
-
         with self._lock:
             self.backend.evaluation_count += 1
             self.backend.store.write_evaluation(
@@ -753,11 +950,18 @@ class MegaOpenEvolveEvaluator:
                 candidate=candidate,
                 payload=result,
             )
-            if not _is_zero_persona_cache_payload(result):
-                self._phenotype_to_candidate_id.setdefault(phenotype_digest, candidate_id)
             self.backend.best_candidate_id = self._best_candidate_id_after(candidate)
             self.backend._save_checkpoint()
+        logger.info(
+            "OpenEvolve elite confirmation candidate=%s repeats=%s fitness=%.4f",
+            candidate_id,
+            required,
+            candidate.fitness,
+        )
         return open_evolve_fitness_from_payload(result)
+
+    def _has_required_repeats(self, payload: dict[str, Any]) -> bool:
+        return _evaluation_repeat_count(payload) >= self.candidate_evaluation_repeats
 
     def _write_phenotype_cache_alias(
         self,
@@ -768,6 +972,7 @@ class MegaOpenEvolveEvaluator:
         phenotype_hash_digest: str,
         source_candidate_id: str,
         source_payload: dict[str, Any],
+        parent_id: str | None,
     ) -> dict[str, Any]:
         source_metrics = source_payload.get("metrics", {})
         if not isinstance(source_metrics, dict):
@@ -782,6 +987,7 @@ class MegaOpenEvolveEvaluator:
             candidate_id=candidate_id,
             genome=genome,
             generation=self._generation_for_genome(genome),
+            parent_id=parent_id,
             fitness=float(source_payload.get("fitness", 0.0) or 0.0),
             metrics=metrics,
             evaluated=True,
@@ -809,7 +1015,9 @@ class MegaOpenEvolveEvaluator:
         return alias_payload
 
     def candidate_id_for_code(self, code_str: str) -> str | None:
-        return self._code_to_candidate_id.get(genome_hash(genome_from_code(code_str))[:12])
+        digest = genome_hash(genome_from_code(code_str))[:12]
+        with self._lock:
+            return self._code_to_candidate_id.get(digest)
 
     @staticmethod
     def _generation_for_genome(genome: dict[str, Any]) -> int:
@@ -871,6 +1079,7 @@ class MegaPersonaOpenEvolveRunner:
         base_mutation_scale: float = 0.12,
         fixed_operator_id: str | None = None,
         operator_family: str = "all",
+        genome_version: int = 3,
         search_strategy: str = "openevolve",
         mcts_depth: int = 3,
         mcts_exploration_c: float = 1.4,
@@ -891,6 +1100,7 @@ class MegaPersonaOpenEvolveRunner:
         self.resume = resume
         self.fixed_operator_id = fixed_operator_id
         self.operator_family = operator_family
+        self.genome_version = int(genome_version)
         self.search_strategy = search_strategy
         self.mcts_depth = mcts_depth
         self.mcts_exploration_c = mcts_exploration_c
@@ -901,18 +1111,33 @@ class MegaPersonaOpenEvolveRunner:
         self.parent_selection = parent_selection
         self.extinction_interval = extinction_interval
 
+        if self.genome_version not in (3, 4):
+            raise ValueError(f"unknown genome_version: {self.genome_version}")
+        if self.genome_version == 4 and self.operator_family != "v4":
+            raise ValueError("Genome v4 requires operator_family='v4'")
+        if self.genome_version == 3 and self.operator_family == "v4":
+            raise ValueError("operator_family='v4' requires genome_version=4")
+        if self.fixed_operator_id:
+            fixed_is_v4 = "_v4_" in self.fixed_operator_id
+            if fixed_is_v4 != (self.genome_version == 4):
+                raise ValueError(
+                    "fixed operator genome family does not match genome_version"
+                )
+
         if resume and not (self.open_evolve_dir / "checkpoint.json").exists():
             raise FileNotFoundError(
                 f"OpenEvolve checkpoint not found: {self.open_evolve_dir / 'checkpoint.json'}"
             )
 
         backend_resume = resume and (self.eval_dir / "checkpoint.json").exists()
+        initial_genome = default_genome_v4() if self.genome_version == 4 else default_genome()
         self.backend = MegaPersonaEvolver(
             config=config,
             output_dir=self.eval_dir,
             resume=backend_resume,
             llm_client=llm_client,
             simulator_llm_client=simulator_llm_client,
+            initial_genome=initial_genome,
         )
         self.mutator = MegaGenomeMutator(
             random_seed=config.random_seed,
@@ -977,6 +1202,7 @@ class MegaPersonaOpenEvolveRunner:
         manifest["mega_eval_dir"] = str(self.eval_dir)
         manifest["shadow_survey_hashes"] = self.backend.survey_hashes
         manifest["fixed_operator_id"] = self.fixed_operator_id
+        manifest["genome_version"] = self.genome_version
         manifest["operator_family"] = self.operator_family
         manifest["operator_pool"] = self.mutator.operator_ids()
         manifest["search_strategy"] = self.search_strategy
@@ -1022,10 +1248,13 @@ class MegaPersonaOpenEvolveRunner:
             )
             engine.checkpoint_path = self.open_evolve_dir
             engine.max_workers = max(1, int(self.config.max_workers))
+            # mutation 线程数跟随岛屿数（每岛 1 个子代时正好全并行）
+            engine.mutation_max_workers = max(1, int(self.config.population_size))
             return engine
 
-        seed_codes = {"mega_default": genome_to_code(default_genome())}
-        return OpenEvolve(
+        seed_genome = default_genome_v4() if self.genome_version == 4 else default_genome()
+        seed_codes = {"mega_default": genome_to_code(seed_genome)}
+        engine = OpenEvolve(
             mutator=self.mutator,
             evaluator=self.evaluator,
             questionnaires=list(self.backend.survey_splits.validation),
@@ -1035,6 +1264,9 @@ class MegaPersonaOpenEvolveRunner:
             max_workers=self.config.max_workers,
             checkpoint_path=self.open_evolve_dir,
         )
+        # mutation 线程数跟随岛屿数（每岛 1 个子代时正好全并行）
+        engine.mutation_max_workers = max(1, int(self.config.population_size))
+        return engine
 
     def _apply_extinction_interval(self, extinction_interval: int) -> None:
         interval = max(2, int(extinction_interval))
@@ -1342,12 +1574,155 @@ def open_evolve_fitness_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return mapped
 
 
+def _aggregate_candidate_evaluation_repeats(
+    candidate: MegaEvolutionCandidate,
+    repeat_payloads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate independent full-pipeline evaluations for selection."""
+    if not repeat_payloads:
+        raise ValueError("candidate evaluation requires at least one repeat")
+
+    repeat_count = len(repeat_payloads)
+    fitness_values = np.asarray(
+        [float(payload.get("fitness", 0.0) or 0.0) for payload in repeat_payloads],
+        dtype=float,
+    )
+    fitness_std = float(np.std(fitness_values, ddof=1)) if repeat_count > 1 else 0.0
+    fitness_sem = fitness_std / float(np.sqrt(repeat_count))
+
+    first_metrics = repeat_payloads[0].get("metrics", {})
+    metrics = dict(first_metrics) if isinstance(first_metrics, dict) else {}
+    metric_keys: set[str] = set()
+    for payload in repeat_payloads:
+        payload_metrics = payload.get("metrics", {})
+        if isinstance(payload_metrics, dict):
+            metric_keys.update(payload_metrics)
+
+    metric_stats: dict[str, dict[str, float | int]] = {}
+    for key in sorted(metric_keys):
+        values: list[float] = []
+        for payload in repeat_payloads:
+            payload_metrics = payload.get("metrics", {})
+            value = payload_metrics.get(key) if isinstance(payload_metrics, dict) else None
+            if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+                continue
+            numeric = float(value)
+            if np.isfinite(numeric):
+                values.append(numeric)
+        if not values:
+            continue
+        values_array = np.asarray(values, dtype=float)
+        metric_std = float(np.std(values_array, ddof=1)) if len(values) > 1 else 0.0
+        metrics[key] = float(np.mean(values_array))
+        metric_stats[key] = {
+            "n": len(values),
+            "values": [float(value) for value in values],
+            "mean": metrics[key],
+            "std": metric_std,
+            "sem": metric_std / float(np.sqrt(len(values))),
+        }
+
+    metrics["evaluation_repeats"] = repeat_count
+    metrics["selection_fitness_std"] = fitness_std
+    metrics["selection_fitness_sem"] = fitness_sem
+    return {
+        "candidate": candidate.to_dict(),
+        "fitness": float(np.mean(fitness_values)),
+        "metrics": metrics,
+        # The sealed test consumes one stored persona population. Repeat 1 is
+        # fixed in advance so validation outcomes cannot choose that population.
+        "per_seed": repeat_payloads[0].get("per_seed", []),
+        "evaluation_repeat_per_seed": [
+            payload.get("per_seed", []) for payload in repeat_payloads
+        ],
+        "evaluation_repeats": repeat_count,
+        "selection_aggregation": "mean",
+        "selection_representative_repeat": 1,
+        "repeat_summary": {
+            "count": repeat_count,
+            "fitness": {
+                "values": [float(value) for value in fitness_values],
+                "mean": float(np.mean(fitness_values)),
+                "std": fitness_std,
+                "sem": fitness_sem,
+            },
+            "metrics": metric_stats,
+        },
+    }
+
+
+def _repeat_payloads_from_aggregate(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rehydrate repeat-level numeric values needed to append confirmations."""
+    count = _evaluation_repeat_count(payload)
+    summary = payload.get("repeat_summary", {})
+    fitness_summary = summary.get("fitness", {}) if isinstance(summary, dict) else {}
+    fitness_values = fitness_summary.get("values") if isinstance(fitness_summary, dict) else None
+    if not isinstance(fitness_values, list) or len(fitness_values) != count:
+        fitness_values = [float(payload.get("fitness", 0.0) or 0.0)] * count
+
+    metrics_summary = summary.get("metrics", {}) if isinstance(summary, dict) else {}
+    metrics_by_repeat: list[dict[str, float]] = [{} for _ in range(count)]
+    if isinstance(metrics_summary, dict):
+        for key, stat in metrics_summary.items():
+            if not isinstance(stat, dict):
+                continue
+            values = stat.get("values")
+            if not isinstance(values, list) or len(values) != count:
+                mean = stat.get("mean")
+                if not isinstance(mean, (int, float, np.number)):
+                    continue
+                values = [float(mean)] * count
+            for index, value in enumerate(values):
+                if isinstance(value, (int, float, np.number)) and np.isfinite(float(value)):
+                    metrics_by_repeat[index][key] = float(value)
+
+    if count == 1 and not metrics_by_repeat[0]:
+        raw_metrics = payload.get("metrics", {})
+        if isinstance(raw_metrics, dict):
+            metrics_by_repeat[0] = {
+                key: float(value)
+                for key, value in raw_metrics.items()
+                if not isinstance(value, bool)
+                and isinstance(value, (int, float, np.number))
+                and np.isfinite(float(value))
+            }
+
+    per_seed_groups = payload.get("evaluation_repeat_per_seed")
+    if not isinstance(per_seed_groups, list) or len(per_seed_groups) != count:
+        per_seed_groups = [payload.get("per_seed", [])] + [[] for _ in range(count - 1)]
+    return [
+        {
+            "fitness": float(fitness_values[index]),
+            "metrics": metrics_by_repeat[index],
+            "per_seed": per_seed_groups[index],
+        }
+        for index in range(count)
+    ]
+
+
+def _evaluation_repeat_count(payload: dict[str, Any]) -> int:
+    value = payload.get("evaluation_repeats")
+    if value is None:
+        repeat_summary = payload.get("repeat_summary", {})
+        if isinstance(repeat_summary, dict):
+            value = repeat_summary.get("count")
+    if value is None:
+        metrics = payload.get("metrics", {})
+        if isinstance(metrics, dict):
+            value = metrics.get("evaluation_repeats")
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _clip01(value: float) -> float:
     return float(np.clip(value, 0.0, 1.0))
 
 
 def _root_summary_markdown(payload: dict[str, Any]) -> str:
     best = payload["best"]
+    best_metrics = best.get("metrics", {})
     test_metrics = payload.get("final_test_report", {}).get("metrics", {})
     lines = [
         "# MegaPersona OpenEvolve Summary",
@@ -1355,6 +1730,10 @@ def _root_summary_markdown(payload: dict[str, Any]) -> str:
         f"- engine: `{payload['engine']}`",
         f"- best candidate: `{best['candidate_id']}`",
         f"- validation fitness: `{best.get('fitness', 0.0):.4f}`",
+        f"- candidate evaluation repeats: `{int(best_metrics.get('evaluation_repeats', 1))}`",
+        "- validation fitness uncertainty: "
+        f"`std={float(best_metrics.get('selection_fitness_std', 0.0)):.4f}, "
+        f"sem={float(best_metrics.get('selection_fitness_sem', 0.0)):.4f}`",
         f"- search strategy: `{payload.get('search_strategy', 'openevolve')}`",
         f"- mega eval dir: `{payload['mega_eval_dir']}`",
         f"- OpenEvolve checkpoint dir: `{payload['open_evolve_checkpoint_dir']}`",
@@ -1421,7 +1800,17 @@ def _root_summary_markdown(payload: dict[str, Any]) -> str:
                     f"mean_reward={float(item.get('mean_reward', 0.0)):.6f}"
                 )
     if test_metrics:
-        lines.extend(["", "## Sealed Test", "", "| Metric | Value |", "|---|---:|"])
+        lines.extend(
+            [
+                "",
+                "## Sealed Test",
+                "",
+                f"- evaluation repeats: `{int(payload.get('final_test_report', {}).get('evaluation_repeats', 1))}`",
+                "",
+                "| Metric | Value |",
+                "|---|---:|",
+            ]
+        )
         for key, value in test_metrics.items():
             lines.append(f"| {key} | {value:.4f} |")
     return "\n".join(lines) + "\n"

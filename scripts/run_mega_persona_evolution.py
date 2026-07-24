@@ -137,13 +137,66 @@ def parse_args() -> argparse.Namespace:
         help="Parallel OpenEvolve candidate evaluations per generation.",
     )
     parser.add_argument(
+        "--candidate-evaluation-repeats",
+        type=int,
+        default=1,
+        help=(
+            "Independent full evaluations per candidate used for selection. "
+            "OpenEvolve elites and MCTS receive the repeat mean; repeat uncertainty "
+            "is stored in each evaluation payload. Use 3 or more for confirmatory runs."
+        ),
+    )
+    parser.add_argument(
+        "--elite-confirmation-repeats",
+        type=int,
+        default=1,
+        help=(
+            "Optional full-evaluation confirmation budget for elite challengers. "
+            "The default 1 disables additional evaluations."
+        ),
+    )
+    parser.add_argument(
         "--persona-max-workers",
         type=int,
         default=2,
         help="Parallel persona generations inside each candidate/seed evaluation.",
     )
     parser.add_argument("--shadow-max-workers", type=int, default=1)
+    parser.add_argument(
+        "--persona-temperature",
+        type=float,
+        default=0.45,
+        help="Persona generator sampling temperature.",
+    )
+    parser.add_argument(
+        "--persona-top-p",
+        type=float,
+        default=0.85,
+        help="Persona generator nucleus-sampling probability.",
+    )
+    parser.add_argument(
+        "--simulator-temperature",
+        type=float,
+        default=0.05,
+        help="Shadow evaluator sampling temperature; kept low to reduce selection noise.",
+    )
+    parser.add_argument(
+        "--simulator-top-p",
+        type=float,
+        default=0.80,
+        help="Shadow evaluator nucleus-sampling probability.",
+    )
     parser.add_argument("--base-mutation-scale", type=float, default=0.12)
+    parser.add_argument(
+        "--genome-version",
+        type=int,
+        choices=(3, 4),
+        default=3,
+        help=(
+            "Genome representation. v3 keeps the existing mixed prompt/blueprint surface; "
+            "v4 uses a low-dimensional structured generation program with deterministic mutation."
+        ),
+    )
     parser.add_argument(
         "--extinction-interval",
         type=int,
@@ -161,11 +214,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--operator-family",
-        choices=("all", "v3", "legacy"),
-        default="all",
+        choices=("all", "v3", "v4", "legacy"),
+        default=None,
         help=(
-            "Random operator pool when --fixed-operator is not set. Use v3 for the "
-            "Genome v3 operator family; legacy keeps the pre-v3 operators for historical comparisons."
+            "Random operator pool when --fixed-operator is not set. Defaults to v4 for "
+            "--genome-version 4, otherwise all (legacy + v3)."
         ),
     )
     parser.add_argument(
@@ -251,6 +304,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.candidate_evaluation_repeats < 1:
+        raise SystemExit("--candidate-evaluation-repeats must be >= 1")
+    if args.elite_confirmation_repeats < args.candidate_evaluation_repeats:
+        raise SystemExit(
+            "--elite-confirmation-repeats must be >= --candidate-evaluation-repeats"
+        )
+    if not 0.0 <= args.persona_temperature <= 2.0:
+        raise SystemExit("--persona-temperature must be between 0 and 2")
+    if not 0.0 <= args.simulator_temperature <= 2.0:
+        raise SystemExit("--simulator-temperature must be between 0 and 2")
+    if not 0.0 < args.persona_top_p <= 1.0:
+        raise SystemExit("--persona-top-p must be in (0, 1]")
+    if not 0.0 < args.simulator_top_p <= 1.0:
+        raise SystemExit("--simulator-top-p must be in (0, 1]")
+    operator_family = args.operator_family or ("v4" if args.genome_version == 4 else "all")
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir()
     open_evolve_checkpoint = output_dir / "open_evolve" / "checkpoint.json"
     if args.resume and not open_evolve_checkpoint.exists():
@@ -268,7 +336,21 @@ def main() -> None:
     if args.fixed_operator:
         _validate_fixed_operator(args.fixed_operator)
         logging.info("Fixed evolution operator enabled: %s", args.fixed_operator)
-    logging.info("Evolution operator family: %s", args.operator_family)
+    logging.info("Genome version: v%s", args.genome_version)
+    logging.info("Evolution operator family: %s", operator_family)
+    logging.info(
+        "Candidate selection evaluations: base_repeats=%s elite_confirmation_repeats=%s "
+        "aggregation=mean",
+        args.candidate_evaluation_repeats,
+        args.elite_confirmation_repeats,
+    )
+    logging.info(
+        "Sampling: persona temperature=%.2f top_p=%.2f; simulator temperature=%.2f top_p=%.2f",
+        args.persona_temperature,
+        args.persona_top_p,
+        args.simulator_temperature,
+        args.simulator_top_p,
+    )
     logging.info(
         "Search strategy: %s mcts_depth=%s mcts_c=%.3f progressive_widening=%s "
         "reward_profile=%s plateau_stagnation=%s reward_weight_mode=%s parent_selection=%s",
@@ -299,10 +381,16 @@ def main() -> None:
         survey_seed=args.survey_seed,
         random_seed=args.random_seed,
         max_workers=args.candidate_max_workers,
+        candidate_evaluation_repeats=args.candidate_evaluation_repeats,
+        elite_confirmation_repeats=args.elite_confirmation_repeats,
         shadow_max_workers=args.shadow_max_workers,
         persona_max_workers=args.persona_max_workers,
         shadow_simulator_backend=args.simulator_backend,
         persona_pipeline=args.persona_pipeline,
+        persona_temperature=args.persona_temperature,
+        persona_top_p=args.persona_top_p,
+        simulator_temperature=args.simulator_temperature,
+        simulator_top_p=args.simulator_top_p,
     )
 
     logging.info(
@@ -310,7 +398,9 @@ def main() -> None:
         args.generator_mode,
         args.llm_provider or "config",
     )
-    mutator_llm = _load_mutator_llm(args)
+    # Genome v4 mutations are deterministic structured patches; the mutator
+    # LLM is intentionally not loaded or called for this experimental surface.
+    mutator_llm = None if args.genome_version == 4 else _load_mutator_llm(args)
     gen_llm = _load_generation_llm(args) if args.generator_mode == "llm" else None
     sim_llm = _load_simulator_llm(args)
     logging.info(
@@ -331,7 +421,8 @@ def main() -> None:
         children_per_island=args.children_per_island,
         base_mutation_scale=args.base_mutation_scale,
         fixed_operator_id=args.fixed_operator,
-        operator_family=args.operator_family,
+        operator_family=operator_family,
+        genome_version=args.genome_version,
         search_strategy=args.search_strategy,
         mcts_depth=args.mcts_depth,
         mcts_exploration_c=args.mcts_exploration_c,

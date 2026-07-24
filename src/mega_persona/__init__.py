@@ -29,7 +29,9 @@ from src.mega_persona.evolution import (
     blueprint_from_slot,
     candidate_slots,
     default_genome,
+    default_genome_v4,
     mutate_genome,
+    mutate_genome_v4,
     prompt_addendum_from_genome,
 )
 from src.mega_persona.generator import (
@@ -145,6 +147,7 @@ __all__ = [
     "candidate_slots",
     "compute_experiment_score",
     "default_genome",
+    "default_genome_v4",
     "default_schema_binding",
     "evaluate_mega_personas",
     "evaluate_persona_consistency",
@@ -154,6 +157,7 @@ __all__ = [
     "genome_hash",
     "genome_to_code",
     "mutate_genome",
+    "mutate_genome_v4",
     "open_evolve_fitness_from_payload",
     "prompt_addendum_from_genome",
     "quota_buckets_for_binding",

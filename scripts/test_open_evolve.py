@@ -70,6 +70,51 @@ class RecordingMutator(MockMutator):
         self.records.append(kwargs)
 
 
+class LineageEvaluator:
+    """Evaluator that exposes candidate IDs and records parent context."""
+
+    def __init__(self):
+        self.ids = {}
+        self.records = []
+
+    def evaluate(self, code_str: str):
+        return self.evaluate_with_context(code_str)
+
+    def evaluate_with_context(self, code_str: str, *, parent_id=None):
+        candidate_id = self.ids.setdefault(code_str, f"lineage_{len(self.ids) + 1:03d}")
+        self.records.append((candidate_id, parent_id))
+        score = 0.5 + 0.01 * len(self.records)
+        return {
+            "global_best": score,
+            "research_score_v2": score,
+            "coverage_elite": score,
+            "alignment_elite": score,
+            "shadow_mae_elite": score,
+            "consistency_elite": score,
+            "axis_target_elite": score,
+            "issue_rate_elite": score,
+            "strict_consistency_elite": score,
+            "diversity_elite": score,
+            "schema_elite": score,
+        }
+
+    def candidate_id_for_code(self, code_str: str):
+        return self.ids.get(code_str)
+
+
+class EliteConfirmingEvaluator:
+    candidate_evaluation_repeats = 1
+    elite_confirmation_repeats = 3
+
+    def __init__(self, confirmed_score=0.4):
+        self.confirmed_score = confirmed_score
+        self.confirm_calls = 0
+
+    def confirm_evaluation(self, code_str, *, parent_id=None, required_repeats=None):
+        self.confirm_calls += 1
+        return {metric: self.confirmed_score for metric in Island.METRIC_NAMES}
+
+
 def test_island():
     print("=" * 60)
     print("测试岛屿系统")
@@ -326,12 +371,103 @@ def test_phenotype_cache_hit_skips_mcts_record():
     print("✅ phenotype cache hit 跳过 MCTS 回传测试通过")
 
 
+def test_potential_elite_is_confirmed_before_selection_and_mcts():
+    evaluator = EliteConfirmingEvaluator(confirmed_score=0.4)
+    mutator = RecordingMutator()
+    engine = OpenEvolve(
+        mutator=mutator,
+        evaluator=evaluator,
+        questionnaires=[],
+        seed_codes=SEED_CODES,
+        num_islands=1,
+        initialize=False,
+    )
+    island = engine.islands[0]
+    incumbent = Candidate(
+        code="incumbent",
+        fitness={metric: 0.5 for metric in Island.METRIC_NAMES},
+        island_id=0,
+    )
+    island.update_elite(incumbent)
+    lucky_single_draw = Candidate(
+        code="challenger",
+        fitness={metric: 0.9 for metric in Island.METRIC_NAMES},
+        generation=1,
+        island_id=0,
+        candidate_id="challenger-id",
+    )
+    round_stats = {"evaluations": 0, "improvements": 0}
+    engine._update_island_with_child(
+        island,
+        0,
+        lucky_single_draw,
+        round_stats,
+        operator_id="op-test",
+        parent_fitness=incumbent.fitness,
+    )
+    assert evaluator.confirm_calls == 1
+    assert island.elites["global_best"].code == "incumbent"
+    assert round_stats == {"evaluations": 1, "improvements": 0}
+    assert mutator.records[0]["child_fitness"]["global_best"] == 0.4
+    assert mutator.records[0]["improved"] is False
+    print("✅ potential elite 确认后再选择并回传 MCTS")
+
+
+def test_candidate_lineage_round_trip():
+    print("=" * 60)
+    print("测试 candidate / parent 谱系透传与 checkpoint 恢复")
+    print("=" * 60)
+
+    with TemporaryDirectory() as tmp:
+        evaluator = LineageEvaluator()
+        engine = OpenEvolve(
+            mutator=MockMutator(),
+            evaluator=evaluator,
+            questionnaires=[],
+            seed_codes={"seed1": "seed-code-1"},
+            initial_seed_distribution={"seed1": 1},
+            num_islands=1,
+            max_workers=1,
+            checkpoint_path=tmp,
+        )
+        engine.mutation_max_workers = 1
+        engine.extinction_interval = 100
+        parent = engine.islands[0].get_best_candidate()
+        assert parent is not None
+        assert parent.candidate_id == "lineage_001"
+        assert parent.parent_id is None
+
+        engine.children_per_island = 1
+        engine.evolve_once()
+        child = engine.get_global_best()
+        assert child is not None
+        assert child.candidate_id == "lineage_002"
+        assert child.parent_id == parent.candidate_id
+        assert evaluator.records[-1] == (child.candidate_id, parent.candidate_id)
+
+        engine._save_checkpoint()
+        restored = OpenEvolve.from_checkpoint(
+            str(Path(tmp) / "checkpoint.json"),
+            mutator=MockMutator(),
+            evaluator=evaluator,
+            questionnaires=[],
+        )
+        restored_child = restored.get_global_best()
+        assert restored_child is not None
+        assert restored_child.candidate_id == child.candidate_id
+        assert restored_child.parent_id == parent.candidate_id
+
+    print("✅ candidate / parent 谱系测试通过")
+
+
 def main():
     test_island()
     test_engine()
     test_extinction()
     test_objective_rotation_parent_selection()
     test_phenotype_cache_hit_skips_mcts_record()
+    test_potential_elite_is_confirmed_before_selection_and_mcts()
+    test_candidate_lineage_round_trip()
 
     print("\n" + "=" * 60)
     print("所有 Open-Evolve 测试通过!")

@@ -450,6 +450,23 @@ Recent report:
 docs/mega_persona_experiment_records/WEEKLY_REPORT_2026-07-14.md
 ```
 
+## 2026-07-24 Next Direction: Goal-Conditioned Generator + Persona Archive
+
+Confirmed next-phase design (not yet implemented): keep the OpenEvolve
+island + MCTS loop unchanged, but move evaluation from scalar-fitness slots to
+curriculum-sampled target cells with a `PersonaArchive` bookkeeping layer
+(MAP-Elites style) inside the evaluator. The deliverable is a goal-conditioned
+generator `Gθ`, validated by clearing the archive and regenerating the whole
+persona space. Full design, motivation evidence (behavior-grid occupancy,
+noise floor), and the six locked decisions are in:
+
+```text
+docs/MEGA_PERSONA_GOAL_CONDITIONED_GENERATOR_DESIGN.md
+```
+
+Analysis tool added for this: `scripts/report_behavior_grid_occupancy.py`
+(post-hoc behavior-grid occupancy of any finished run, zero API cost).
+
 ## Common Commands
 
 Small LLM smoke run:
@@ -638,6 +655,14 @@ Behavior changes made to make mutations measurable and cheaper:
   `phenotype_cache_source_candidate_id`, so the current child keeps its own
   lineage/operator metadata without increasing the true evaluation count. The
   phenotype index is rebuilt from stored candidates on resume.
+- Concurrent candidates now register an in-flight phenotype owner before the
+  expensive evaluation starts. Other threads wait for that owner and then write
+  their own alias records, preventing parallel cache misses from evaluating the
+  same phenotype multiple times.
+- OpenEvolve candidates and elite checkpoints persist both `candidate_id` and
+  `parent_id`. The engine passes parent context into the MegaPersona evaluator,
+  including phenotype-cache aliases, so operator chains can be reconstructed
+  after a run or resume instead of leaving every stored parent as `null`.
 - Phenotype cache-hit children are not backpropagated into the MCTS operator
   policy. They may still enter the island archive if their reused fitness is an
   elite, but they do not count as fresh operator evidence because no new
@@ -651,6 +676,63 @@ Behavior changes made to make mutations measurable and cheaper:
   the LLM rarely edits numeric fields on its own. Jittered axes are reported
   under `numeric_jitter`, separate from the mutator-facing `actual_edits`, so
   no-op detection and per-field attribution stay clean.
+- Mutator network resilience: the mutator's LLM call now goes through
+  `_generate_with_retry` (same transient-error classification and backoff as
+  the generator/simulator), so a transient connection error no longer silently
+  demotes the child to rule mutation.
+- `scripts/measure_evaluation_noise_floor.py --source-run <run>` re-evaluates
+  the run's best genome and the default seed genome K times under the run's
+  exact config (same slots/surveys/models, verified via survey hashes) and
+  writes `noise_floor.json/.md`. Fitness differences below 2*std are within
+  noise; use this to size large runs and to judge plateau claims.
+
+## 2026-07-24 Experimental Genome v4
+
+Genome v3 remains the default for backward compatibility. Genome v4 is an
+explicit experimental surface enabled by `--genome-version 4`; it automatically
+uses `--operator-family v4` unless overridden.
+
+Genome v4 replaces the high-dimensional free-form prompt surface with a small
+structured behavior-generation program:
+
+- `probe_assignment`: maps the three schema-bound axis roles to observable scenarios;
+- `axis_realization`: bounded realization mode and signal strength per axis role;
+- `interaction_mode`: strongest/weakest-axis relationship;
+- `echo_graph`: deterministic cross-field evidence graph;
+- `context_modulation`: how context changes expression of the same mechanism;
+- `repair_control`: evidence density and repair priority.
+
+`quota_weights`, `axis_bias`, and `axis_stretch` remain in the JSON for sampler
+compatibility but are frozen by v4 operators. `blueprint_from_slot()` renders
+the v4 program deterministically into the existing generation blueprint.
+
+The v4 operator pool is `op22` through `op27`. Every operator mutates exactly
+one module, records that module under `actual_edits`, and uses the
+`structured_v4` backend. The LLM mutator and v3 numeric jitter are intentionally
+skipped so operator rewards remain attributable. Keep initial v4 validation on
+`search_strategy=openevolve`; test MCTS only after fixed-operator effects exceed
+the measured evaluation noise floor.
+
+## 2026-07-24 Noise-Aware Candidate Selection
+
+The v4 noise-floor audit showed that the apparent smoke improvement was not
+resolvable: repeated best-genome fitness was `0.23497 +/- 0.00922` (std) versus
+`0.23416 +/- 0.01202` for the default v4 seed. Coverage/diversity were noisier
+still. Treat all historical single-evaluation search gains as exploratory.
+
+`--candidate-evaluation-repeats` controls the number of independent
+full-pipeline evaluations per phenotype. The default experiment protocol is
+`--candidate-evaluation-repeats 1 --elite-confirmation-repeats 1`; no candidate
+receives automatic additional evaluations. Use larger repeat counts only for an explicit
+noise-floor or confirmatory ablation.
+`MegaOpenEvolveEvaluator` averages fitness and every numeric metric before
+OpenEvolve elite updates or MCTS backpropagation, and stores repeat values,
+std, and SEM. Phenotype caches are reused only when they contain at least the
+requested repeat count, including resume. All stored repeat persona populations
+are evaluated on the sealed test after selection, so validation and test use
+the same statistical unit while test remains excluded from selection. New-run
+sampling defaults are persona `temperature=0.45, top_p=0.85` and simulator
+`temperature=0.05, top_p=0.80`.
 
 ## Quick Orientation For New Chats
 

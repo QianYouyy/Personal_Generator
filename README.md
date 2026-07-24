@@ -482,7 +482,39 @@ The current implementation already propagates schema-aware axis bindings into:
 - Concordia native behavior calibration
 - visualization / HTML report extraction
 
-## Current Operator Evidence
+## Experimental Genome v4
+
+Genome v3 remains the default for historical reproducibility. The experimental
+Genome v4 path is enabled explicitly:
+
+```bash
+python scripts/run_mega_persona_evolution.py \
+  --genome-version 4 \
+  --operator-family v4 \
+  --search-strategy openevolve \
+  ...
+```
+
+V4 evolves a low-dimensional structured behavior program rather than free-form
+prompt policy. Operators `op22` through `op27` each change exactly one module;
+sampling weights/bias/stretch are fixed, and mutations do not call the mutator
+LLM or apply v3 numeric jitter. First measure the evaluation noise floor and
+run fixed-operator screens. Use MCTS only after these operators show repeatable
+target-metric effects.
+
+Candidate selection is stochastic in LLM mode. The default evolution protocol
+uses one evaluation per candidate:
+`--candidate-evaluation-repeats 1 --elite-confirmation-repeats 1`. This keeps
+the search budget and selection rule simple. Use
+`--candidate-evaluation-repeats 3` only for an explicitly repeated ablation;
+repeat fitness values and per-metric mean/std/SEM are persisted, while test
+results remain excluded from selection.
+
+New-run sampling defaults are `persona temperature=0.45, top_p=0.85` and
+`simulator temperature=0.05, top_p=0.80`. This reduces evaluator noise while
+preserving generation diversity; both are exposed as CLI overrides.
+
+## Historical Operator Evidence
 
 Latest retained report:
 
@@ -522,6 +554,14 @@ python scripts/test_mega_persona_runner.py
 python scripts/test_evaluator.py
 python scripts/test_visualization.py
 python scripts/test_multi_objective_sealed_test.py
+```
+
+Noise-floor measurement:
+
+```bash
+python scripts/measure_evaluation_noise_floor.py \
+  --source-run data/results/<run> \
+  --repeats 5
 ```
 
 ## Agent Context

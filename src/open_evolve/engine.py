@@ -56,6 +56,26 @@ class EvaluatorProtocol(Protocol):
     def evaluate(self, code_str: str) -> dict[str, float]:
         ...
 
+    def evaluate_with_context(
+        self,
+        code_str: str,
+        *,
+        parent_id: str | None = None,
+    ) -> dict[str, float]:
+        ...
+
+    def candidate_id_for_code(self, code_str: str) -> str | None:
+        ...
+
+    def confirm_evaluation(
+        self,
+        code_str: str,
+        *,
+        parent_id: str | None = None,
+        required_repeats: int | None = None,
+    ) -> dict[str, float]:
+        ...
+
 
 @dataclass
 class Candidate:
@@ -66,6 +86,8 @@ class Candidate:
     generation: int = 0
     island_id: int = 0
     seed_name: str = ""
+    candidate_id: str | None = None
+    parent_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -74,6 +96,8 @@ class Candidate:
             "generation": self.generation,
             "island_id": self.island_id,
             "seed_name": self.seed_name,
+            "candidate_id": self.candidate_id,
+            "parent_id": self.parent_id,
         }
 
 
@@ -108,15 +132,9 @@ class Island:
 
     def update_elite(self, candidate: Candidate) -> Tuple[bool, List[str]]:
         """若候选在任一指标上打破纪录，更新精英."""
-        improved_metrics = []
-        for metric in self.METRIC_NAMES:
-            current_best = self.elites.get(metric)
-            if current_best is None:
-                self.elites[metric] = copy.deepcopy(candidate)
-                improved_metrics.append(metric)
-            elif candidate.fitness.get(metric, float('-inf')) > current_best.fitness.get(metric, float('-inf')):
-                self.elites[metric] = copy.deepcopy(candidate)
-                improved_metrics.append(metric)
+        improved_metrics = self.improvement_metrics(candidate)
+        for metric in improved_metrics:
+            self.elites[metric] = copy.deepcopy(candidate)
 
         if improved_metrics:
             self.last_improvement_gen = self.generation
@@ -124,6 +142,17 @@ class Island:
 
         self.total_evaluations += 1
         return len(improved_metrics) > 0, improved_metrics
+
+    def improvement_metrics(self, candidate: Candidate) -> List[str]:
+        """Return elite slots this candidate would improve without mutating state."""
+        improved_metrics = []
+        for metric in self.METRIC_NAMES:
+            current_best = self.elites.get(metric)
+            if current_best is None or candidate.fitness.get(
+                metric, float("-inf")
+            ) > current_best.fitness.get(metric, float("-inf")):
+                improved_metrics.append(metric)
+        return improved_metrics
 
     def get_best_candidate(self) -> Optional[Candidate]:
         """获取该岛屿当前综合最优候选."""
@@ -330,6 +359,8 @@ class OpenEvolve:
                         generation=meta["generation"],
                         island_id=meta["island_id"],
                         seed_name=meta["seed_name"],
+                        candidate_id=meta.get("candidate_id"),
+                        parent_id=meta.get("parent_id"),
                     )
                     island.elites[metric] = candidate
                 
@@ -430,15 +461,20 @@ class OpenEvolve:
         for i, island in enumerate(self.islands):
             seed_name, code = seed_list[i % len(seed_list)]
             logger.info(f"  [Island {i}] 评估初始种子 {seed_name}...")
-            fitness = self.evaluator.evaluate(code)
+            fitness = self._evaluate_code(code)
             candidate = Candidate(
                 code=code,
                 fitness=fitness,
                 generation=0,
                 island_id=i,
                 seed_name=seed_name,
+                candidate_id=self._candidate_id_for_code(code),
             )
+            candidate = self._confirm_potential_elite(candidate, force=True)
             island.update_elite(candidate)
+            # Baselines must use the confirmed aggregate that entered the
+            # island elite, not the initial single-draw estimate.
+            fitness = candidate.fitness
             
             # 记录baseline
             if seed_name not in self.seed_baselines:
@@ -504,17 +540,44 @@ class OpenEvolve:
                     logger.error(f"[Island {island_id}] 候选 {child_idx+1} 变异失败 {max_retries} 次，跳过")
         return None
 
-    def _evaluate_single(self, child_code: str, island_id: int, child_idx: int, total_children: int, seed_name: str) -> Optional[Candidate]:
+    def _evaluate_code(
+        self,
+        code_str: str,
+        *,
+        parent_id: str | None = None,
+    ) -> dict[str, float]:
+        contextual_evaluate = getattr(self.evaluator, "evaluate_with_context", None)
+        if callable(contextual_evaluate):
+            return contextual_evaluate(code_str, parent_id=parent_id)
+        return self.evaluator.evaluate(code_str)
+
+    def _candidate_id_for_code(self, code_str: str) -> str | None:
+        resolver = getattr(self.evaluator, "candidate_id_for_code", None)
+        if not callable(resolver):
+            return None
+        return resolver(code_str)
+
+    def _evaluate_single(
+        self,
+        child_code: str,
+        island_id: int,
+        child_idx: int,
+        total_children: int,
+        seed_name: str,
+        parent_id: str | None = None,
+    ) -> Optional[Candidate]:
         """评估单个候选解（用于线程池并行）."""
         try:
             logger.debug(f"[Island {island_id}] 候选 {child_idx+1}/{total_children} 评估中...")
-            child_fitness = self.evaluator.evaluate(child_code)
+            child_fitness = self._evaluate_code(child_code, parent_id=parent_id)
             return Candidate(
                 code=child_code,
                 fitness=child_fitness,
                 generation=self.generation,
                 island_id=island_id,
                 seed_name=seed_name,
+                candidate_id=self._candidate_id_for_code(child_code),
+                parent_id=parent_id,
             )
         except Exception as e:
             logger.error(f"[Island {island_id}] 候选 {child_idx+1} 评估失败: {e}")
@@ -576,6 +639,7 @@ class OpenEvolve:
                         "seed_name": parent.seed_name,
                         "operator_id": operator_id,
                         "parent_fitness": dict(parent.fitness),
+                        "parent_id": parent.candidate_id or self._candidate_id_for_code(parent.code),
                     }
                 )
 
@@ -661,6 +725,7 @@ class OpenEvolve:
                             job["child_idx"],
                             children_per_island,
                             job["seed_name"],
+                            job.get("parent_id"),
                         ): (job_index, job)
                         for job_index, job in enumerate(evaluation_jobs)
                     }
@@ -740,6 +805,7 @@ class OpenEvolve:
             child_idx,
             job.get("total_children", getattr(self, "children_per_island", 1)),
             job["seed_name"],
+            job.get("parent_id"),
         )
         self._update_island_with_child(
             island,
@@ -853,6 +919,9 @@ class OpenEvolve:
             return
 
         round_stats["evaluations"] += 1
+        potential_metrics = island.improvement_metrics(child)
+        if potential_metrics:
+            child = self._confirm_potential_elite(child)
         improved, metrics = island.update_elite(child)
         self._record_mutation_result(
             operator_id=operator_id,
@@ -869,6 +938,50 @@ class OpenEvolve:
                 self._log_metric_with_baseline(metric, child.fitness.get(metric, 0), child)
         else:
             logger.debug(f"[Island {island.id}] 候选 {child_idx+1} 未打破纪录")
+
+    def _confirm_potential_elite(
+        self,
+        candidate: Candidate,
+        *,
+        force: bool = False,
+    ) -> Candidate:
+        confirmer = getattr(self.evaluator, "confirm_evaluation", None)
+        required = max(
+            1,
+            int(getattr(self.evaluator, "elite_confirmation_repeats", 1)),
+        )
+        base = max(
+            1,
+            int(getattr(self.evaluator, "candidate_evaluation_repeats", 1)),
+        )
+        if not callable(confirmer) or required <= base:
+            return candidate
+        logger.info(
+            f"[Island {candidate.island_id}] candidate={candidate.candidate_id or '?'} "
+            f"触发精英确认: {base} -> {required} 次"
+        )
+        try:
+            confirmed_fitness = confirmer(
+                candidate.code,
+                parent_id=candidate.parent_id,
+                required_repeats=required,
+            )
+        except Exception as exc:
+            if force:
+                raise
+            logger.warn(
+                f"[Island {candidate.island_id}] 精英确认失败，保留单次结果: {exc}"
+            )
+            return candidate
+        return Candidate(
+            code=candidate.code,
+            fitness=confirmed_fitness,
+            generation=candidate.generation,
+            island_id=candidate.island_id,
+            seed_name=candidate.seed_name,
+            candidate_id=candidate.candidate_id,
+            parent_id=candidate.parent_id,
+        )
 
     def _record_mutation_result(
         self,
@@ -1128,12 +1241,38 @@ class OpenEvolve:
         )
         logger.info(f"大群体进化: 每岛 {children_per_island} 候选 × {self.num_islands} 岛屿 = {children_per_island * self.num_islands} 评估/轮")
         num_personas = getattr(self.evaluator, "num_personas", "?")
+        evaluation_repeats = max(
+            1,
+            int(getattr(self.evaluator, "candidate_evaluation_repeats", 1)),
+        )
+        elite_confirmation_repeats = max(
+            evaluation_repeats,
+            int(getattr(self.evaluator, "elite_confirmation_repeats", evaluation_repeats)),
+        )
         logger.info(f"人格数: {num_personas} 人/问卷 | 问卷数: {len(self.questionnaires)} 份")
+        logger.info(
+            f"候选评估: 基础={evaluation_repeats} 次，"
+            f"潜在精英确认={elite_confirmation_repeats} 次"
+        )
         
         # 计算 API 调用量
         if isinstance(num_personas, int):
-            evals_per_round = self.num_islands * children_per_island * len(self.questionnaires) * num_personas
-            logger.info(f"每轮 API 调用: {self.num_islands} 岛 × {children_per_island} 候选 × {len(self.questionnaires)} 问卷 × {num_personas} 人格 = {evals_per_round} 次")
+            evals_per_round = (
+                self.num_islands
+                * children_per_island
+                * len(self.questionnaires)
+                * num_personas
+                * evaluation_repeats
+            )
+            logger.info(
+                f"每轮 API 调用: {self.num_islands} 岛 × {children_per_island} 候选 "
+                f"× {len(self.questionnaires)} 问卷 × {num_personas} 人格 "
+                f"× {evaluation_repeats} 次评估 = {evals_per_round} 次"
+            )
+            if elite_confirmation_repeats > evaluation_repeats:
+                logger.info(
+                    "潜在精英会按需追加评估；实际 API 调用量取决于触发确认的候选数"
+                )
         
         # 打印灭绝逻辑
         self._print_extinction_logic(max_generations)
@@ -1269,6 +1408,8 @@ class OpenEvolve:
                     "generation": candidate.generation,
                     "island_id": candidate.island_id,
                     "seed_name": candidate.seed_name,
+                    "candidate_id": candidate.candidate_id,
+                    "parent_id": candidate.parent_id,
                     "code_file": str(code_path.relative_to(self.checkpoint_path)),
                 }
             

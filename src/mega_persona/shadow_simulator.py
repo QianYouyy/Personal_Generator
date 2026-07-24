@@ -323,7 +323,8 @@ class LLMShadowSimulator:
     def __init__(
         self,
         llm_client,
-        temperature: float = 0.3,
+        temperature: float = 0.05,
+        top_p: float = 0.80,
         max_tokens: int = 1500,
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.5,
@@ -333,6 +334,7 @@ class LLMShadowSimulator:
             raise ValueError("llm_client is required for LLMShadowSimulator")
         self.llm = llm_client
         self.temperature = temperature
+        self.top_p = top_p
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
@@ -429,6 +431,7 @@ class LLMShadowSimulator:
             prompt=user_prompt,
             system_prompt=_LLM_SIMULATOR_SYSTEM_PROMPT,
             temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_tokens,
             max_retries=self.max_retries,
             retry_backoff_seconds=self.retry_backoff_seconds,
@@ -500,7 +503,8 @@ class ConcordiaShadowSimulator(LLMShadowSimulator):
     def __init__(
         self,
         llm_client,
-        temperature: float = 0.25,
+        temperature: float = 0.05,
+        top_p: float = 0.80,
         max_tokens: int = 1500,
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.5,
@@ -509,6 +513,7 @@ class ConcordiaShadowSimulator(LLMShadowSimulator):
         super().__init__(
             llm_client=llm_client,
             temperature=temperature,
+            top_p=top_p,
             max_tokens=max_tokens,
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
@@ -533,6 +538,7 @@ class ConcordiaShadowSimulator(LLMShadowSimulator):
             prompt=user_prompt,
             system_prompt=_CONCORDIA_SIMULATOR_SYSTEM_PROMPT,
             temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_tokens,
             max_retries=self.max_retries,
             retry_backoff_seconds=self.retry_backoff_seconds,
@@ -833,7 +839,8 @@ class StudentRealisticShadowSimulator(LLMShadowSimulator):
     def __init__(
         self,
         llm_client,
-        temperature: float = 0.25,
+        temperature: float = 0.05,
+        top_p: float = 0.80,
         max_tokens: int = 1800,
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.5,
@@ -842,6 +849,7 @@ class StudentRealisticShadowSimulator(LLMShadowSimulator):
         super().__init__(
             llm_client=llm_client,
             temperature=temperature,
+            top_p=top_p,
             max_tokens=max_tokens,
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
@@ -867,6 +875,7 @@ class StudentRealisticShadowSimulator(LLMShadowSimulator):
             prompt=user_prompt,
             system_prompt=_STUDENT_REALISTIC_SYSTEM_PROMPT,
             temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_tokens,
             max_retries=self.max_retries,
             retry_backoff_seconds=self.retry_backoff_seconds,
@@ -907,7 +916,8 @@ class StudentRealisticV2ShadowSimulator(LLMShadowSimulator):
     def __init__(
         self,
         llm_client,
-        temperature: float = 0.25,
+        temperature: float = 0.05,
+        top_p: float = 0.80,
         max_tokens: int = 2200,
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.5,
@@ -916,6 +926,7 @@ class StudentRealisticV2ShadowSimulator(LLMShadowSimulator):
         super().__init__(
             llm_client=llm_client,
             temperature=temperature,
+            top_p=top_p,
             max_tokens=max_tokens,
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
@@ -947,6 +958,7 @@ class StudentRealisticV2ShadowSimulator(LLMShadowSimulator):
             prompt=user_prompt,
             system_prompt=_STUDENT_REALISTIC_V2_SYSTEM_PROMPT,
             temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_tokens,
             max_retries=self.max_retries,
             retry_backoff_seconds=self.retry_backoff_seconds,
@@ -984,7 +996,8 @@ class ConcordiaNativeShadowSimulator(LLMShadowSimulator):
     def __init__(
         self,
         llm_client,
-        temperature: float = 0.25,
+        temperature: float = 0.05,
+        top_p: float = 0.80,
         max_tokens: int = 1500,
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.5,
@@ -993,6 +1006,7 @@ class ConcordiaNativeShadowSimulator(LLMShadowSimulator):
         super().__init__(
             llm_client=llm_client,
             temperature=temperature,
+            top_p=top_p,
             max_tokens=max_tokens,
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
@@ -1036,18 +1050,30 @@ def build_shadow_simulator(
     backend: str,
     llm_client,
     max_workers: int = 1,
+    temperature: float = 0.05,
+    top_p: float = 0.80,
 ) -> LLMShadowSimulator:
     """Create a shadow-survey simulator backend."""
     if backend == "llm":
-        return LLMShadowSimulator(llm_client, max_workers=max_workers)
+        return LLMShadowSimulator(
+            llm_client, max_workers=max_workers, temperature=temperature, top_p=top_p
+        )
     if backend == "concordia":
-        return ConcordiaShadowSimulator(llm_client, max_workers=max_workers)
+        return ConcordiaShadowSimulator(
+            llm_client, max_workers=max_workers, temperature=temperature, top_p=top_p
+        )
     if backend == "concordia-native":
-        return ConcordiaNativeShadowSimulator(llm_client, max_workers=max_workers)
+        return ConcordiaNativeShadowSimulator(
+            llm_client, max_workers=max_workers, temperature=temperature, top_p=top_p
+        )
     if backend == "student-realistic":
-        return StudentRealisticShadowSimulator(llm_client, max_workers=max_workers)
+        return StudentRealisticShadowSimulator(
+            llm_client, max_workers=max_workers, temperature=temperature, top_p=top_p
+        )
     if backend == "student-realistic-v2":
-        return StudentRealisticV2ShadowSimulator(llm_client, max_workers=max_workers)
+        return StudentRealisticV2ShadowSimulator(
+            llm_client, max_workers=max_workers, temperature=temperature, top_p=top_p
+        )
     raise ValueError(
         f"Unknown shadow simulator backend: {backend}. "
         f"Expected one of {', '.join(SUPPORTED_SHADOW_SIMULATOR_BACKENDS)}."
@@ -1551,6 +1577,7 @@ def _generate_with_retry(
     prompt: str,
     system_prompt: str,
     temperature: float,
+    top_p: float | None,
     max_tokens: int,
     max_retries: int,
     retry_backoff_seconds: float,
@@ -1568,11 +1595,13 @@ def _generate_with_retry(
     )
     for attempt in range(max_retries + 1):
         try:
+            sampling_kwargs = {"top_p": top_p} if top_p is not None else {}
             return llm.generate(
                 prompt,
                 system_prompt=system_prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **sampling_kwargs,
             )
         except Exception as exc:
             message = str(exc).lower()

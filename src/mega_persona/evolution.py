@@ -75,10 +75,16 @@ class MegaEvolutionConfig:
     survey_seed: int = 17
     random_seed: int = 1234
     max_workers: int = 1
+    candidate_evaluation_repeats: int = 1
+    elite_confirmation_repeats: int = 1
     shadow_max_workers: int = 1
     persona_max_workers: int = 2
     shadow_simulator_backend: str = "llm"
     persona_pipeline: str = "five_agent"
+    persona_temperature: float = 0.45
+    persona_top_p: float = 0.85
+    simulator_temperature: float = 0.05
+    simulator_top_p: float = 0.80
 
 
 # Score aggregation uses the same multiplicative gated formula as the batch
@@ -115,6 +121,7 @@ class MegaPersonaEvolver:
         resume: bool = False,
         llm_client=None,
         simulator_llm_client=None,
+        initial_genome: dict[str, Any] | None = None,
     ):
         self.config = config
         self.output_dir = output_dir
@@ -122,6 +129,7 @@ class MegaPersonaEvolver:
         self.rng = np.random.default_rng(config.random_seed)
         self.llm_client = llm_client
         self.simulator_llm_client = simulator_llm_client
+        self.initial_genome = normalize_genome(initial_genome) if initial_genome is not None else default_genome()
         self.generation = 0
         self.population: list[MegaEvolutionCandidate] = []
         self.evaluation_count = 0
@@ -188,7 +196,7 @@ class MegaPersonaEvolver:
     def _initial_population(self) -> list[MegaEvolutionCandidate]:
         baseline = MegaEvolutionCandidate(
             candidate_id="candidate_baseline",
-            genome=default_genome(),
+            genome=json.loads(json.dumps(self.initial_genome)),
             generation=0,
         )
         candidates = [baseline]
@@ -369,6 +377,8 @@ class MegaPersonaEvolver:
             backend=self.config.shadow_simulator_backend,
             llm_client=self.simulator_llm_client,
             max_workers=self.config.shadow_max_workers,
+            temperature=self.config.simulator_temperature,
+            top_p=self.config.simulator_top_p,
         )
         train_surveys = list(self.survey_splits.train)
         validation_surveys = list(self.survey_splits.validation)
@@ -454,15 +464,22 @@ class MegaPersonaEvolver:
         }
 
     def evaluate_final_test(self, best: MegaEvolutionCandidate) -> dict[str, Any]:
-        """Evaluate the selected best candidate on the sealed test split once."""
+        """Evaluate the selected candidate on test without using test for selection."""
         best_result = self.store.find_candidate_result(best.candidate_id)
         if best_result is None:
             raise FileNotFoundError(f"missing stored evaluation for best candidate {best.candidate_id}")
 
+        repeat_groups = best_result.get("evaluation_repeat_per_seed")
+        if not isinstance(repeat_groups, list) or not repeat_groups:
+            repeat_groups = [best_result.get("per_seed", [])]
         successful_seed_results = [
-            seed_result
-            for seed_result in best_result.get("per_seed", [])
-            if seed_result.get("status") == "ok" and seed_result.get("personas")
+            (repeat_index, seed_result)
+            for repeat_index, repeat_group in enumerate(repeat_groups, start=1)
+            if isinstance(repeat_group, list)
+            for seed_result in repeat_group
+            if isinstance(seed_result, dict)
+            and seed_result.get("status") == "ok"
+            and seed_result.get("personas")
         ]
         if (best.fitness or 0.0) <= 0.0 or not successful_seed_results:
             logger.info(
@@ -485,12 +502,16 @@ class MegaPersonaEvolver:
             backend=self.config.shadow_simulator_backend,
             llm_client=self.simulator_llm_client,
             max_workers=self.config.shadow_max_workers,
+            temperature=self.config.simulator_temperature,
+            top_p=self.config.simulator_top_p,
         )
         per_seed = []
-        for seed_result in successful_seed_results:
+        for repeat_index, seed_result in successful_seed_results:
             logger.info(
-                "Final sealed test candidate=%s seed=%s",
+                "Final sealed test candidate=%s repeat=%s/%s seed=%s",
                 best.candidate_id,
+                repeat_index,
+                len(repeat_groups),
                 seed_result["seed"],
             )
             personas = [
@@ -534,6 +555,7 @@ class MegaPersonaEvolver:
             per_seed.append(
                 {
                     "seed": seed_result["seed"],
+                    "evaluation_repeat": repeat_index,
                     "candidate_id": best.candidate_id,
                     "schema_evaluation": schema_evaluation.to_dict(),
                     "internal_consistency": consistency_evaluation.to_dict(),
@@ -546,14 +568,25 @@ class MegaPersonaEvolver:
             )
 
         metrics = _aggregate_final_test_metrics(per_seed)
+        repeat_metrics = [
+            {
+                "evaluation_repeat": repeat_index,
+                "metrics": _aggregate_final_test_metrics(
+                    [item for item in per_seed if item["evaluation_repeat"] == repeat_index]
+                ),
+            }
+            for repeat_index in range(1, len(repeat_groups) + 1)
+        ]
         logger.info("Final sealed test metrics: %s", metrics)
         return {
             "candidate_id": best.candidate_id,
             "candidate_fitness": best.fitness,
             "selection_metric": "validation",
             "test_used_for_selection": False,
+            "evaluation_repeats": len(repeat_groups),
             "survey_hashes": self.survey_hashes,
             "metrics": metrics,
+            "repeat_metrics": repeat_metrics,
             "per_seed": per_seed,
             "created_at": datetime.now().isoformat(),
         }
@@ -577,6 +610,8 @@ class MegaPersonaEvolver:
             ]
         generator = MegaPersonaGenerator(
             self.llm_client,
+            temperature=self.config.persona_temperature,
+            top_p=self.config.persona_top_p,
             prompt_addendum=prompt_addendum_from_genome(candidate.genome),
             blueprint_builder=lambda slot: blueprint_from_slot(candidate.genome, slot),
             pipeline_mode=self.config.persona_pipeline,
@@ -789,7 +824,7 @@ class EvolutionStore:
     def find_candidate_result(self, candidate_id: str) -> dict[str, Any] | None:
         paths = sorted(self.evaluations_dir.glob("eval_*_*/result.json"))
         paths.extend(sorted(self.evaluations_dir.glob("alias_*/result.json")))
-        for path in paths:
+        for path in reversed(paths):
             with open(path, "r", encoding="utf-8") as file:
                 payload = json.load(file)
             if payload.get("candidate", {}).get("candidate_id") == candidate_id:
@@ -900,6 +935,81 @@ def default_genome() -> dict[str, Any]:
             "behavior_echo": "Ambiguous task, peer pressure, failure feedback, and deadline anchors must be inferable.",
             "contradiction_check": "A cross-field contradiction is allowed only with an explicit context boundary.",
             "length_check": "Trim decorative biography before removing behavior-predictive evidence.",
+        },
+        "last_evolution_operator": None,
+    }
+
+
+V4_PROBE_SCENARIOS = (
+    "ambiguous_task",
+    "peer_pressure",
+    "failure_feedback",
+    "deadline",
+)
+V4_AXIS_REALIZATION_MODES = (
+    "visible_cost",
+    "context_switch",
+    "tradeoff",
+)
+V4_INTERACTION_MODES = (
+    "strongest_weakest_tension",
+    "compensatory",
+    "context_switch",
+    "independent",
+)
+V4_ECHO_GRAPHS = (
+    "axis_behavior_cross_field",
+    "cognition_values_social",
+    "regulation_health_feedback",
+)
+V4_CONTEXT_MODES = (
+    "quota_conditioned",
+    "support_conditioned",
+    "audience_conditioned",
+)
+V4_REPAIR_PRIORITIES = (
+    "preserve_axis_signal",
+    "preserve_behavior_trace",
+    "preserve_schema_precision",
+)
+V4_AXIS_ROLES = (
+    "cognitive_core",
+    "motivation_core",
+    "regulation_core",
+)
+
+
+def default_genome_v4() -> dict[str, Any]:
+    """Return the low-dimensional structured Genome v4 seed.
+
+    Sampling controls remain present for compatibility with candidate_slots(),
+    but v4 operators deliberately leave them fixed. The evolvable surface is a
+    small behavior-generation program rendered deterministically into the
+    existing generation blueprint.
+    """
+    v3 = default_genome()
+    return {
+        "genome_version": 4,
+        "schema_binding": v3["schema_binding"],
+        "quota_weights": v3["quota_weights"],
+        "axis_bias": v3["axis_bias"],
+        "axis_stretch": v3["axis_stretch"],
+        "probe_assignment": {
+            "cognitive_core": "ambiguous_task",
+            "motivation_core": "peer_pressure",
+            "regulation_core": "failure_feedback",
+        },
+        "axis_realization": {
+            "cognitive_core": {"mode": "tradeoff", "strength": 0.65},
+            "motivation_core": {"mode": "context_switch", "strength": 0.60},
+            "regulation_core": {"mode": "visible_cost", "strength": 0.70},
+        },
+        "interaction_mode": "strongest_weakest_tension",
+        "echo_graph": "axis_behavior_cross_field",
+        "context_modulation": "quota_conditioned",
+        "repair_control": {
+            "evidence_density": 2,
+            "priority": "preserve_axis_signal",
         },
         "last_evolution_operator": None,
     }
@@ -1067,6 +1177,13 @@ def mutate_genome(
     mutation_mode: str = "mixed",
     operator_id: str | None = None,
 ) -> dict[str, Any]:
+    if int(genome.get("genome_version", 3)) == 4:
+        return mutate_genome_v4(
+            genome,
+            rng,
+            mutation_scale=mutation_scale,
+            operator_id=operator_id,
+        )
     mutated = normalize_genome(genome)
     mutated["schema_binding"] = schema_binding_for_genome(mutated)
     axis_names = axis_names_for_binding(mutated["schema_binding"])
@@ -1123,8 +1240,77 @@ def mutate_genome(
     return mutated
 
 
+def mutate_genome_v4(
+    genome: dict[str, Any],
+    rng: np.random.Generator,
+    mutation_scale: float,
+    operator_id: str | None = None,
+) -> dict[str, Any]:
+    """Apply one auditable, single-module mutation to Genome v4."""
+    mutated = normalize_genome_v4(genome)
+    operator = _select_v4_operator(rng, operator_id=operator_id)
+    module = str(operator["v4_module"])
+
+    if module == "probe_assignment":
+        role = str(rng.choice(V4_AXIS_ROLES))
+        current = mutated["probe_assignment"][role]
+        choices = [value for value in V4_PROBE_SCENARIOS if value != current]
+        mutated["probe_assignment"][role] = str(rng.choice(choices))
+    elif module == "axis_realization":
+        role = str(rng.choice(V4_AXIS_ROLES))
+        realization = mutated["axis_realization"][role]
+        if rng.random() < 0.5:
+            choices = [value for value in V4_AXIS_REALIZATION_MODES if value != realization["mode"]]
+            realization["mode"] = str(rng.choice(choices))
+        else:
+            step = max(0.05, float(mutation_scale) * 0.5)
+            direction = -1.0 if rng.random() < 0.5 else 1.0
+            current_strength = float(realization["strength"])
+            new_strength = _clip(
+                current_strength + direction * step,
+                0.35,
+                0.90,
+            )
+            if abs(new_strength - current_strength) <= 1e-12:
+                new_strength = _clip(current_strength - direction * step, 0.35, 0.90)
+            realization["strength"] = new_strength
+    elif module == "interaction_mode":
+        choices = [value for value in V4_INTERACTION_MODES if value != mutated["interaction_mode"]]
+        mutated["interaction_mode"] = str(rng.choice(choices))
+    elif module == "echo_graph":
+        choices = [value for value in V4_ECHO_GRAPHS if value != mutated["echo_graph"]]
+        mutated["echo_graph"] = str(rng.choice(choices))
+    elif module == "context_modulation":
+        choices = [value for value in V4_CONTEXT_MODES if value != mutated["context_modulation"]]
+        mutated["context_modulation"] = str(rng.choice(choices))
+    elif module == "repair_control":
+        repair = mutated["repair_control"]
+        if rng.random() < 0.5:
+            repair["evidence_density"] = 1 + (int(repair["evidence_density"]) % 3)
+        else:
+            choices = [value for value in V4_REPAIR_PRIORITIES if value != repair["priority"]]
+            repair["priority"] = str(rng.choice(choices))
+    else:
+        raise ValueError(f"unknown Genome v4 mutation module: {module}")
+
+    mutated["last_evolution_operator"] = {
+        "id": operator["id"],
+        "name": operator["name"],
+        "instruction": operator["instruction"],
+        "module": module,
+    }
+    mutated["last_mutation"] = {
+        "mode": "structured_v4",
+        "module": module,
+        "scale": float(mutation_scale),
+    }
+    return mutated
+
+
 def prompt_addendum_from_genome(genome: dict[str, Any]) -> str:
     genome = normalize_genome(genome)
+    if int(genome.get("genome_version", 3)) == 4:
+        return _prompt_addendum_from_genome_v4(genome)
     profile = genome.get("prompt_profile", {})
     mechanism_focus = _profile_choice(profile, "mechanism_focus", "balanced")
     tension_level = _profile_choice(profile, "tension_level", "moderate")
@@ -1160,6 +1346,8 @@ def normalize_genome(genome: dict[str, Any]) -> dict[str, Any]:
     function fills structural prompt and blueprint modules without changing the
     caller's object in-place.
     """
+    if isinstance(genome, dict) and int(genome.get("genome_version", 3)) == 4:
+        return normalize_genome_v4(genome)
     base = default_genome()
     normalized = json.loads(json.dumps(base))
     if not isinstance(genome, dict):
@@ -1227,6 +1415,114 @@ def normalize_genome(genome: dict[str, Any]) -> dict[str, Any]:
         normalized["last_mutation"] = genome["last_mutation"]
     normalized["genome_version"] = 3
     return normalized
+
+
+def normalize_genome_v4(genome: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Genome v4 without accepting new free-form prompt fields."""
+    base = default_genome_v4()
+    normalized = json.loads(json.dumps(base))
+    if not isinstance(genome, dict):
+        return normalized
+
+    schema_binding = schema_binding_for_genome(genome)
+    normalized["schema_binding"] = schema_binding
+    axis_names = axis_names_for_binding(schema_binding)
+    quota_buckets = quota_buckets_for_binding(schema_binding)
+
+    source_quota = genome.get("quota_weights", {})
+    normalized["quota_weights"] = {
+        bucket.label: _clip(
+            _safe_float_like(source_quota.get(bucket.label, bucket.weight), bucket.weight),
+            0.02,
+            0.6,
+        )
+        for bucket in quota_buckets
+    }
+    _normalize_weights(normalized["quota_weights"])
+    source_bias = genome.get("axis_bias", {})
+    source_stretch = genome.get("axis_stretch", {})
+    normalized["axis_bias"] = {
+        axis: _clip(_safe_float_like(source_bias.get(axis, 0.0), 0.0), -0.35, 0.35)
+        for axis in axis_names
+    }
+    normalized["axis_stretch"] = {
+        axis: _clip(_safe_float_like(source_stretch.get(axis, 1.0), 1.0), 0.55, 1.75)
+        for axis in axis_names
+    }
+
+    raw_probes = genome.get("probe_assignment", {})
+    raw_realization = genome.get("axis_realization", {})
+    for role in V4_AXIS_ROLES:
+        scenario = raw_probes.get(role, base["probe_assignment"][role])
+        if scenario in V4_PROBE_SCENARIOS:
+            normalized["probe_assignment"][role] = scenario
+        realization = raw_realization.get(role, {})
+        if not isinstance(realization, dict):
+            realization = {}
+        mode = realization.get("mode", base["axis_realization"][role]["mode"])
+        if mode not in V4_AXIS_REALIZATION_MODES:
+            mode = base["axis_realization"][role]["mode"]
+        normalized["axis_realization"][role] = {
+            "mode": mode,
+            "strength": _clip(
+                _safe_float_like(
+                    realization.get("strength", base["axis_realization"][role]["strength"]),
+                    base["axis_realization"][role]["strength"],
+                ),
+                0.35,
+                0.90,
+            ),
+        }
+
+    for key, choices in (
+        ("interaction_mode", V4_INTERACTION_MODES),
+        ("echo_graph", V4_ECHO_GRAPHS),
+        ("context_modulation", V4_CONTEXT_MODES),
+    ):
+        value = genome.get(key, base[key])
+        normalized[key] = value if value in choices else base[key]
+
+    repair = genome.get("repair_control", {})
+    if not isinstance(repair, dict):
+        repair = {}
+    priority = repair.get("priority", base["repair_control"]["priority"])
+    normalized["repair_control"] = {
+        "evidence_density": int(
+            _clip(
+                _safe_float_like(
+                    repair.get("evidence_density", base["repair_control"]["evidence_density"]),
+                    base["repair_control"]["evidence_density"],
+                ),
+                1,
+                3,
+            )
+        ),
+        "priority": priority if priority in V4_REPAIR_PRIORITIES else base["repair_control"]["priority"],
+    }
+    if isinstance(genome.get("last_evolution_operator"), dict) or genome.get("last_evolution_operator") is None:
+        normalized["last_evolution_operator"] = genome.get("last_evolution_operator")
+    if isinstance(genome.get("openevolve_mutation"), dict):
+        normalized["openevolve_mutation"] = genome["openevolve_mutation"]
+    if isinstance(genome.get("last_mutation"), dict):
+        normalized["last_mutation"] = genome["last_mutation"]
+    return normalized
+
+
+def _prompt_addendum_from_genome_v4(genome: dict[str, Any]) -> str:
+    repair = genome["repair_control"]
+    probe_summary = ", ".join(
+        f"{role}={scenario}"
+        for role, scenario in genome["probe_assignment"].items()
+    )
+    return "\n".join(
+        (
+            "Respect all schema length limits. Treat the Genome v4 generation blueprint as the source of behavioral constraints.",
+            f"Structured probe assignment: {probe_summary}.",
+            f"Interaction mode: {genome['interaction_mode']}; echo graph: {genome['echo_graph']}.",
+            f"Context modulation: {genome['context_modulation']}; evidence density: {repair['evidence_density']}.",
+            f"Repair priority: {repair['priority']}. Preserve concrete behavior evidence instead of adding decorative biography.",
+        )
+    )
 
 
 def _safe_float_like(value: Any, default: float) -> float:
@@ -1311,6 +1607,8 @@ def blueprint_from_slot(genome: dict[str, Any], slot: MegaPersonaSlot) -> dict[s
     bindings that the generator injects into the multi-agent pipeline.
     """
     genome = normalize_genome(genome)
+    if int(genome.get("genome_version", 3)) == 4:
+        return _blueprint_from_slot_v4(genome, slot)
     axis_policy = genome.get("axis_expression_policy", {})
     behavior_policy = genome.get("behavior_prediction_policy", {})
     binding_policy = genome.get("cross_agent_binding_policy", {})
@@ -1386,6 +1684,164 @@ def blueprint_from_slot(genome: dict[str, Any], slot: MegaPersonaSlot) -> dict[s
             if key in slot.constraints
         },
     }
+
+
+def _blueprint_from_slot_v4(
+    genome: dict[str, Any],
+    slot: MegaPersonaSlot,
+) -> dict[str, Any]:
+    schema_binding = schema_binding_for_genome(genome)
+    role_to_axis = axis_roles_for_binding(schema_binding)
+    axis_plan: dict[str, dict[str, Any]] = {}
+    scenario_axes: dict[str, list[str]] = {scenario: [] for scenario in V4_PROBE_SCENARIOS}
+
+    for role in V4_AXIS_ROLES:
+        axis = role_to_axis.get(role)
+        if axis not in slot.target_axes:
+            continue
+        target = float(slot.target_axes[axis])
+        realization = genome["axis_realization"][role]
+        scenario = genome["probe_assignment"][role]
+        scenario_axes[scenario].append(axis)
+        axis_plan[axis] = {
+            "target": round(target, 3),
+            "band": _axis_band(target),
+            "probe": scenario,
+            "mode": realization["mode"],
+            "strength": round(float(realization["strength"]), 3),
+            "evidence": _v4_axis_evidence(axis, scenario, realization),
+            "boundary": _v4_axis_boundary(axis, realization["mode"]),
+            "echo_fields": _axis_echo_fields(axis),
+        }
+
+    strongest = max(slot.target_axes.items(), key=lambda item: item[1])[0]
+    weakest = min(slot.target_axes.items(), key=lambda item: item[1])[0]
+    behavior_profile = {
+        scenario: _v4_behavior_probe(
+            scenario,
+            axes=scenario_axes[scenario],
+            interaction_mode=genome["interaction_mode"],
+            context_modulation=genome["context_modulation"],
+            quota_label=slot.quota_label,
+        )
+        for scenario in V4_PROBE_SCENARIOS
+    }
+    repair = genome["repair_control"]
+    return {
+        "blueprint_version": 4,
+        "quota_label": slot.quota_label,
+        "core_tension": _v4_core_tension(
+            strongest,
+            weakest,
+            genome["interaction_mode"],
+        ),
+        "axis_expression_plan": axis_plan,
+        "behavior_prediction_profile": behavior_profile,
+        "cross_agent_binding": _v4_echo_bindings(genome["echo_graph"]),
+        "critic_checks": _v4_critic_checks(
+            priority=repair["priority"],
+            evidence_density=repair["evidence_density"],
+        ),
+        "structured_program": {
+            "probe_assignment": genome["probe_assignment"],
+            "interaction_mode": genome["interaction_mode"],
+            "echo_graph": genome["echo_graph"],
+            "context_modulation": genome["context_modulation"],
+            "repair_control": repair,
+        },
+        "slot_constraints": {
+            key: slot.constraints.get(key)
+            for key in (
+                "primary_drive",
+                "stress_band",
+                "social_energy_band",
+                "derived_performance_band",
+            )
+            if key in slot.constraints
+        },
+    }
+
+
+def _v4_axis_evidence(axis: str, scenario: str, realization: dict[str, Any]) -> str:
+    mode_text = {
+        "visible_cost": "show a visible cost and a partial workaround",
+        "context_switch": "show a direction change across two named contexts",
+        "tradeoff": "show one benefit and one boundary where it stops helping",
+    }[realization["mode"]]
+    strength = float(realization["strength"])
+    strength_text = "restrained" if strength < 0.50 else "clear" if strength < 0.70 else "strong"
+    return (
+        f"Use {scenario} as the primary probe for {axis}; {mode_text}; "
+        f"require {strength_text} behavioral evidence (signal strength={strength:.2f})."
+    )
+
+
+def _v4_axis_boundary(axis: str, mode: str) -> str:
+    return {
+        "visible_cost": f"The {axis} signal must retain a measurable cost under pressure.",
+        "context_switch": f"The {axis} signal may change only when the context boundary is explicit.",
+        "tradeoff": f"The {axis} signal must include both a useful consequence and a limiting consequence.",
+    }[mode]
+
+
+def _v4_behavior_probe(
+    scenario: str,
+    *,
+    axes: list[str],
+    interaction_mode: str,
+    context_modulation: str,
+    quota_label: str,
+) -> str:
+    axis_text = ", ".join(axes) if axes else "the strongest-weakest axis interaction"
+    return (
+        f"In {scenario}, make {axis_text} predict trigger, appraisal, first action, and aftereffect. "
+        f"Use interaction={interaction_mode}, context={context_modulation}, and quota={quota_label}; "
+        "do not quote or paraphrase survey items."
+    )
+
+
+def _v4_core_tension(strongest: str, weakest: str, mode: str) -> str:
+    templates = {
+        "strongest_weakest_tension": "Let {strongest} help first while {weakest} creates a recurring limit.",
+        "compensatory": "Let {strongest} partially compensate for {weakest}, but preserve a residual cost.",
+        "context_switch": "Let context decide whether {strongest} or {weakest} dominates observable behavior.",
+        "independent": "Keep {strongest} and {weakest} behaviorally separable instead of one general competence factor.",
+    }
+    return templates[mode].format(strongest=strongest, weakest=weakest)
+
+
+def _v4_echo_bindings(echo_graph: str) -> list[str]:
+    return {
+        "axis_behavior_cross_field": [
+            "cognition to values: reuse the same appraisal mechanism",
+            "cognition to social: reuse the same ambiguity and help-seeking threshold",
+            "regulation to health: reuse recovery latency, coping action, and residual cost",
+            "values to behavior: reuse the same peer-pressure or deadline decision",
+        ],
+        "cognition_values_social": [
+            "cognition to values: appraisal determines what the student protects",
+            "values to social: protected values predict negotiation, conformity, or withdrawal",
+            "social to cognition: audience changes evidence seeking without changing the target axis",
+        ],
+        "regulation_health_feedback": [
+            "regulation to health: coping latency and residual strain must match",
+            "feedback to cognition: failure appraisal changes the next evidence-seeking action",
+            "health to social: support seeking must match stress recovery and peer behavior",
+        ],
+    }[echo_graph]
+
+
+def _v4_critic_checks(*, priority: str, evidence_density: int) -> list[str]:
+    priority_text = {
+        "preserve_axis_signal": "Repair schema issues without smoothing away low or high target-axis signals.",
+        "preserve_behavior_trace": "Repair prose while preserving trigger, appraisal, action, and aftereffect.",
+        "preserve_schema_precision": "Repair toward concise schema-valid fields without adding unsupported details.",
+    }[priority]
+    return [
+        priority_text,
+        f"Require at least {evidence_density} independent behavior evidence units for each primary axis.",
+        "Reject contradictions that lack an explicit context boundary.",
+    ]
 
 
 def _axis_band(value: float) -> str:
@@ -2436,6 +2892,63 @@ EVOLUTION_PROMPT_OPERATORS: tuple[dict[str, Any], ...] = (
         ],
         "preferred_parent_metric": "schema_elite",
     },
+    {
+        "id": "op22_v4_probe_rewire",
+        "name": "Genome v4 probe reassignment",
+        "instruction": (
+            "Reassign exactly one primary axis to a different observable scenario probe so axis-to-behavior "
+            "alignment can be tested without changing any other generation mechanism."
+        ),
+        "v4_module": "probe_assignment",
+        "preferred_parent_metric": "shadow_mae_elite",
+    },
+    {
+        "id": "op23_v4_signal_calibrate",
+        "name": "Genome v4 axis signal calibration",
+        "instruction": (
+            "Change exactly one axis realization mode or signal strength to improve target-axis calibration."
+        ),
+        "v4_module": "axis_realization",
+        "preferred_parent_metric": "axis_target_elite",
+    },
+    {
+        "id": "op24_v4_interaction_rewire",
+        "name": "Genome v4 axis interaction rewiring",
+        "instruction": (
+            "Change only the relationship between strongest and weakest axes to explore separable, compensatory, "
+            "or context-dependent behavior combinations."
+        ),
+        "v4_module": "interaction_mode",
+        "preferred_parent_metric": "coverage_elite",
+    },
+    {
+        "id": "op25_v4_echo_graph_rewire",
+        "name": "Genome v4 cross-field echo rewiring",
+        "instruction": (
+            "Change only the deterministic cross-field evidence graph to improve causal consistency across sections."
+        ),
+        "v4_module": "echo_graph",
+        "preferred_parent_metric": "strict_consistency_elite",
+    },
+    {
+        "id": "op26_v4_context_diversify",
+        "name": "Genome v4 context modulation",
+        "instruction": (
+            "Change only how context modulates the same axis mechanism to seek realistic behavioral diversity."
+        ),
+        "v4_module": "context_modulation",
+        "preferred_parent_metric": "diversity_elite",
+    },
+    {
+        "id": "op27_v4_repair_calibrate",
+        "name": "Genome v4 repair calibration",
+        "instruction": (
+            "Change only evidence density or repair priority to improve schema-safe generation while preserving "
+            "behavioral evidence."
+        ),
+        "v4_module": "repair_control",
+        "preferred_parent_metric": "schema_elite",
+    },
 )
 
 
@@ -2598,7 +3111,21 @@ def _select_evolution_operator(
             if operator["id"] == operator_id:
                 return dict(operator)
         raise ValueError(f"unknown evolution operator id: {operator_id}")
-    return dict(EVOLUTION_PROMPT_OPERATORS[int(rng.integers(0, len(EVOLUTION_PROMPT_OPERATORS)))])
+    operators = tuple(operator for operator in EVOLUTION_PROMPT_OPERATORS if "_v4_" not in operator["id"])
+    return dict(operators[int(rng.integers(0, len(operators)))])
+
+
+def _select_v4_operator(
+    rng: np.random.Generator,
+    operator_id: str | None = None,
+) -> dict[str, Any]:
+    operators = tuple(operator for operator in EVOLUTION_PROMPT_OPERATORS if "_v4_" in operator["id"])
+    if operator_id is not None:
+        for operator in operators:
+            if operator["id"] == operator_id:
+                return dict(operator)
+        raise ValueError(f"unknown Genome v4 operator id: {operator_id}")
+    return dict(operators[int(rng.integers(0, len(operators)))])
 
 
 def _apply_evolution_operator(
@@ -2804,6 +3331,13 @@ def _config_to_dict(config: MegaEvolutionConfig) -> dict[str, Any]:
 
 def _normalize_config_dict(config: dict[str, Any]) -> dict[str, Any]:
     payload = dict(config)
+    # Checkpoints created before repeat-aware selection are single-draw runs.
+    payload.setdefault("candidate_evaluation_repeats", 1)
+    payload.setdefault("elite_confirmation_repeats", 1)
+    payload.setdefault("persona_temperature", 0.45)
+    payload.setdefault("persona_top_p", 1.0)
+    payload.setdefault("simulator_temperature", 0.25)
+    payload.setdefault("simulator_top_p", 1.0)
     if "num_islands" not in payload and "population_size" in payload:
         payload["num_islands"] = payload["population_size"]
     if "population_size_deprecated" not in payload and "population_size" in payload:

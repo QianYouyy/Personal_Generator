@@ -1,13 +1,15 @@
 """Smoke tests for the MegaPersona OpenEvolve adapter."""
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.mega_persona.evolution import default_genome
+from src.mega_persona.evolution import default_genome, default_genome_v4
 from src.mega_persona.openevolve_adapter import (
     MegaGenomeMutator,
     MegaOpenEvolveEvaluator,
@@ -193,6 +195,30 @@ def test_fixed_operator_mutator():
         mutated = genome_from_code(mutator.mutate(genome_to_code(parent), generation=generation))
         assert mutated["openevolve_mutation"]["operator_id"] == "op06_low_axis_fidelity"
     print("✅ fixed operator mutator")
+
+
+def test_v4_mutator_is_structured_and_single_module():
+    parent = default_genome_v4()
+    client = MockLLM([])
+    mutator = MegaGenomeMutator(
+        random_seed=7,
+        llm_client=client,
+        fixed_operator_id="op22_v4_probe_rewire",
+        operator_family="v4",
+    )
+    mutated = genome_from_code(
+        mutator.mutate(genome_to_code(parent), generation=2, stagnation=1)
+    )
+    audit = mutated["openevolve_mutation"]
+    assert client.calls == []
+    assert audit["backend"] == "structured_v4"
+    assert audit["actual_edits"] == ["probe_assignment"]
+    assert "numeric_jitter" not in audit
+    assert mutated["probe_assignment"] != parent["probe_assignment"]
+    assert mutated["axis_bias"] == parent["axis_bias"]
+    assert mutated["axis_stretch"] == parent["axis_stretch"]
+    assert all(operator_id.startswith("op2") for operator_id in mutator.operator_ids())
+    print("✅ Genome v4 structured mutator")
 
 
 def test_hybrid_mcts_policy_state():
@@ -472,6 +498,28 @@ def test_llm_mutator_numeric_jitter():
     print("✅ LLM mutator numeric jitter")
 
 
+def test_llm_mutator_transient_network_retry():
+    parent = default_genome()
+    patch = {
+        "patch": {
+            "blueprint_policy": {
+                "core_tension_rule": "Bind the weakest axis to one repeated feedback scene."
+            }
+        },
+        "declared_edits": ["blueprint_policy.core_tension_rule"],
+    }
+    client = MockLLM([
+        RuntimeError("APIConnectionError: Connection error."),
+        json.dumps(patch, ensure_ascii=False),
+    ])
+    mutator = MegaGenomeMutator(random_seed=7, llm_client=client)
+    mutated = genome_from_code(mutator.mutate(genome_to_code(parent), generation=1, stagnation=0))
+    assert mutated["openevolve_mutation"]["backend"] == "llm"
+    assert "feedback scene" in mutated["blueprint_policy"]["core_tension_rule"]
+    assert len(client.calls) == 2
+    print("✅ LLM mutator transient network retry")
+
+
 def test_genome_phenotype_hash_excludes_lineage_metadata():
     base = default_genome()
     variant = json.loads(json.dumps(base))
@@ -514,17 +562,25 @@ def test_evaluator_phenotype_cache():
 
     class StubBackend:
         def __init__(self, root):
-            self.config = SimpleNamespace(n=2)
+            self.config = SimpleNamespace(n=2, candidate_evaluation_repeats=1)
             self.store = StubStore(root)
             self.evaluation_count = 0
             self.best_candidate_id = None
             self.calls = 0
+            self.fitness_values = []
+            self.started_event = None
+            self.release_event = None
 
         def evaluate_candidate(self, candidate):
             self.calls += 1
+            if self.started_event is not None:
+                self.started_event.set()
+            if self.release_event is not None:
+                assert self.release_event.wait(timeout=5)
+            fitness = self.fitness_values.pop(0) if self.fitness_values else 0.42
             return {
-                "fitness": 0.42,
-                "metrics": {"validation_behavior_coverage.mean": 0.3},
+                "fitness": fitness,
+                "metrics": {"validation_behavior_coverage.mean": fitness},
                 "per_seed": [],
             }
 
@@ -542,11 +598,15 @@ def test_evaluator_phenotype_cache():
             "instruction": "y",
         }
         genome_b["openevolve_mutation"] = {"backend": "llm", "timestamp": "later"}
-        first = evaluator.evaluate(genome_to_code(genome_a))
+        first = evaluator.evaluate_with_context(
+            genome_to_code(genome_a), parent_id="parent-a"
+        )
         assert backend.calls == 1
         assert backend.evaluation_count == 1
         source_candidate_id = evaluator.candidate_id_for_code(genome_to_code(genome_a))
-        second = evaluator.evaluate(genome_to_code(genome_b))
+        second = evaluator.evaluate_with_context(
+            genome_to_code(genome_b), parent_id="parent-b"
+        )
         assert backend.calls == 1  # phenotype cache hit, no re-evaluation
         assert backend.evaluation_count == 1  # alias does not count as a real evaluation
         assert {k: v for k, v in first.items() if k != "phenotype_cache_hit"} == {
@@ -560,12 +620,122 @@ def test_evaluator_phenotype_cache():
         assert alias_payload["phenotype_cache_source_candidate_id"] == source_candidate_id
         assert alias_payload["candidate"]["candidate_id"] == alias_candidate_id
         assert alias_payload["candidate"]["genome"] == genome_b
+        assert alias_payload["candidate"]["parent_id"] == "parent-b"
         assert alias_payload["metrics"]["openevolve_phenotype_hash"]
 
         # A fresh evaluator over the same store also dedups (resume path).
         resumed = MegaOpenEvolveEvaluator(backend)
         resumed.evaluate(genome_to_code(genome_b))
         assert backend.calls == 1
+
+    # Concurrent candidates with the same phenotype share one in-flight
+    # evaluation while retaining separate lineage records.
+    with TemporaryDirectory() as tmp:
+        backend = StubBackend(tmp)
+        backend.started_event = threading.Event()
+        backend.release_event = threading.Event()
+        evaluator = MegaOpenEvolveEvaluator(backend)
+        genome_a = default_genome_v4()
+        genome_b = json.loads(json.dumps(genome_a))
+        genome_b["last_evolution_operator"] = {
+            "id": "op25_v4_echo_graph_rewire",
+            "name": "concurrent alias",
+            "instruction": "lineage only",
+        }
+        genome_b["openevolve_mutation"] = {
+            "backend": "structured_v4",
+            "generation": 1,
+            "timestamp": "later",
+        }
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            owner_future = executor.submit(
+                evaluator.evaluate_with_context,
+                genome_to_code(genome_a),
+                parent_id="parent-owner",
+            )
+            assert backend.started_event.wait(timeout=5)
+            waiter_future = executor.submit(
+                evaluator.evaluate_with_context,
+                genome_to_code(genome_b),
+                parent_id="parent-waiter",
+            )
+            backend.release_event.set()
+            owner_result = owner_future.result(timeout=5)
+            waiter_result = waiter_future.result(timeout=5)
+
+        assert backend.calls == 1
+        assert backend.evaluation_count == 1
+        assert owner_result.get("phenotype_cache_hit") is not True
+        assert waiter_result["phenotype_cache_hit"] is True
+        owner_id = evaluator.candidate_id_for_code(genome_to_code(genome_a))
+        waiter_id = evaluator.candidate_id_for_code(genome_to_code(genome_b))
+        assert owner_id != waiter_id
+        assert backend.store.find_candidate_result(owner_id)["candidate"]["parent_id"] == "parent-owner"
+        waiter_payload = backend.store.find_candidate_result(waiter_id)
+        assert waiter_payload["candidate"]["parent_id"] == "parent-waiter"
+        assert waiter_payload["phenotype_cache_source_candidate_id"] == owner_id
+
+    # Selection repeats are aggregated before elite/MCTS mapping and the
+    # aggregate, rather than an individual lucky draw, is cached.
+    with TemporaryDirectory() as tmp:
+        backend = StubBackend(tmp)
+        backend.config.candidate_evaluation_repeats = 3
+        backend.fitness_values = [0.2, 0.4, 0.6]
+        evaluator = MegaOpenEvolveEvaluator(backend)
+        code = genome_to_code(default_genome_v4())
+        mapped = evaluator.evaluate(code)
+        assert backend.calls == 3
+        assert backend.evaluation_count == 1
+        assert abs(mapped["global_best"] - 0.4) < 1e-12
+        assert abs(mapped["coverage_elite"] - 0.4) < 1e-12
+        candidate_id = evaluator.candidate_id_for_code(code)
+        payload = backend.store.find_candidate_result(candidate_id)
+        assert payload["evaluation_repeats"] == 3
+        assert payload["selection_aggregation"] == "mean"
+        assert payload["repeat_summary"]["fitness"]["values"] == [0.2, 0.4, 0.6]
+        assert abs(payload["repeat_summary"]["fitness"]["std"] - 0.2) < 1e-12
+        assert abs(
+            payload["repeat_summary"]["fitness"]["sem"] - (0.2 / (3 ** 0.5))
+        ) < 1e-12
+        evaluator.evaluate(code)
+        assert backend.calls == 3
+
+    # A resume that raises the repeat requirement must not reuse an old
+    # single-draw payload as if it were a confirmed aggregate.
+    with TemporaryDirectory() as tmp:
+        backend = StubBackend(tmp)
+        code = genome_to_code(default_genome_v4())
+        MegaOpenEvolveEvaluator(backend).evaluate(code)
+        assert backend.calls == 1
+        backend.config.candidate_evaluation_repeats = 3
+        backend.fitness_values = [0.2, 0.4, 0.6]
+        resumed = MegaOpenEvolveEvaluator(backend)
+        mapped = resumed.evaluate(code)
+        assert backend.calls == 4
+        assert abs(mapped["global_best"] - 0.4) < 1e-12
+
+    # Adaptive confirmation reuses the first draw and appends only the two
+    # missing repeats before replacing the cached selection aggregate.
+    with TemporaryDirectory() as tmp:
+        backend = StubBackend(tmp)
+        backend.config.elite_confirmation_repeats = 3
+        backend.fitness_values = [0.6, 0.2, 0.4]
+        evaluator = MegaOpenEvolveEvaluator(backend)
+        code = genome_to_code(default_genome_v4())
+        initial = evaluator.evaluate(code)
+        assert initial["global_best"] == 0.6
+        confirmed = evaluator.confirm_evaluation(code)
+        assert backend.calls == 3
+        assert backend.evaluation_count == 2
+        assert abs(confirmed["global_best"] - 0.4) < 1e-12
+        candidate_id = evaluator.candidate_id_for_code(code)
+        payload = backend.store.find_candidate_result(candidate_id)
+        assert payload["evaluation_repeats"] == 3
+        assert payload["repeat_summary"]["fitness"]["values"] == [0.6, 0.2, 0.4]
+        assert payload["metrics"]["elite_confirmation"] is True
+        evaluator.confirm_evaluation(code)
+        assert backend.calls == 3
     print("✅ evaluator phenotype cache")
 
 
@@ -579,8 +749,10 @@ def main():
     test_llm_mutator_noop_retry()
     test_llm_mutator_noop_retry_exhausted()
     test_llm_mutator_numeric_jitter()
+    test_llm_mutator_transient_network_retry()
     test_llm_mutator_fallback_to_rule()
     test_fixed_operator_mutator()
+    test_v4_mutator_is_structured_and_single_module()
     test_hybrid_mcts_policy_state()
     test_hybrid_mcts_reward_protects_diversity()
     test_multi_objective_candidate_report()

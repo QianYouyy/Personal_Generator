@@ -54,6 +54,53 @@ The MVP uses three axes:
 These axes are intentionally low-dimensional. The full schema stays rich, but
 coverage is computed over a compact target space to avoid dimensional collapse.
 
+## Experimental Genome v4
+
+Genome v4 is an opt-in representation experiment (`--genome-version 4`). It
+keeps schema binding and slot sampling fixed, and evolves a small structured
+behavior-generation program:
+
+| Module | Controlled mechanism | Primary diagnostic metric |
+|---|---|---|
+| `probe_assignment` | axis-to-scenario assignment | shadow MAE |
+| `axis_realization` | expression mode and signal strength | axis target MAE |
+| `interaction_mode` | strongest/weakest-axis relationship | coverage |
+| `echo_graph` | cross-field evidence propagation | strict consistency error |
+| `context_modulation` | context-dependent expression | balanced diversity |
+| `repair_control` | evidence density and repair priority | schema fitness |
+
+Operators `op22` through `op27` each mutate exactly one module with a
+deterministic structured patch. The mutator LLM and v3 numeric jitter are not
+used. This makes operator effects auditable and keeps MCTS actions semantically
+stable.
+
+Validation order is fixed:
+
+1. Measure repeated-evaluation noise on the v4 seed genome.
+2. Run each v4 operator as a fixed one-step screen from the same seed parent.
+3. Compare v3 and v4 under the same random operator-selection budget.
+4. Compare random selection and shallow MCTS only after step 2 shows effects
+   larger than the noise floor.
+
+Do not interpret v4 as successful evolution until target-metric effects are
+repeatable across search seeds and survive the sealed test protocol.
+
+### Reliable candidate selection
+
+LLM generation and shadow simulation make one candidate evaluation noisy. The
+current evolution protocol intentionally uses one evaluation per candidate:
+`--candidate-evaluation-repeats 1 --elite-confirmation-repeats 1`. This keeps
+the evolution budget and selection rule simple; the repeat statistics remain
+available for separate noise-floor or confirmatory experiments. Use
+`--candidate-evaluation-repeats 3` only when running an explicitly repeated
+ablation. `result.json` stores repeat values and metric uncertainty (`std` and
+`sem`); the sealed test remains excluded from selection.
+
+New runs use moderate sampling for persona generation (`temperature=0.45`,
+`top_p=0.85`) and lower sampling for shadow simulation (`temperature=0.05`,
+`top_p=0.80`). This reduces evaluator noise while retaining enough generation
+randomness for a diverse persona population.
+
 ## Shadow Surveys
 
 The shadow-survey protocol follows the HACHIMI paper's external-evaluation
@@ -285,7 +332,8 @@ data/results/mega_persona_evolution_run/
 Each candidate `result.json` stores the candidate genome, per-seed slots,
 generated personas, schema metrics, frozen survey hashes, train/validation
 shadow behavior, train/validation behavior diversity, and train/validation
-shadow survey responses. It deliberately excludes test behavior. The selected
+shadow survey responses. With candidate repeats enabled it also stores compact
+repeat statistics and each repeat's persona population. It deliberately excludes test behavior. The selected
 best candidate's sealed test behavior is stored only in `final_test_report.json`.
 The checkpoint is written after every candidate evaluation, so the run can
 continue after process death, machine sleep, or network interruption.

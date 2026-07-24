@@ -612,6 +612,33 @@ shadow_surveys/
 7. Prefer `rg` for code search.
 8. Use `apply_patch` for manual code edits.
 
+## Experimental Genome v4 (2026-07-24)
+
+Genome v3 remains the backward-compatible default. Use `--genome-version 4`
+for the experimental low-dimensional structured surface; the runner then uses
+the `v4` operator family by default.
+
+V4 evolves only `probe_assignment`, `axis_realization`, `interaction_mode`,
+`echo_graph`, `context_modulation`, and `repair_control`. Sampling controls stay
+fixed. Operators `op22`-`op27` each mutate one module through code and record a
+`structured_v4` mutation, so the LLM mutator and numeric jitter are bypassed.
+Validate operator effects against `measure_evaluation_noise_floor.py` before
+running MCTS or large-generation experiments.
+
+OpenEvolve now carries `candidate_id` and `parent_id` through evaluation and
+elite checkpoints. MegaPersona phenotype caching also coordinates in-flight
+evaluations: one thread evaluates a phenotype, concurrent matches wait and
+write separate alias records with their own lineage metadata.
+
+For scientific runs, use `--candidate-evaluation-repeats 1
+--elite-confirmation-repeats 1`: every candidate is evaluated once and no
+automatic additional evaluation is performed. Use uniform
+`--candidate-evaluation-repeats 3` only for an explicit noise-floor or
+confirmatory ablation. Repeat values and std/SEM are persisted, and the final
+sealed test evaluates all stored repeat persona populations. New-run defaults are
+persona `temperature=0.45, top_p=0.85` and simulator
+`temperature=0.05, top_p=0.80`.
+
 ## Fast Orientation
 
 For a new work session, read these first:

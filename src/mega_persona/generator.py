@@ -97,6 +97,7 @@ class MegaPersonaGenerator:
         self,
         llm_client,
         temperature: float = 0.45,
+        top_p: float = 0.85,
         max_tokens: int = 3000,
         max_revisions: int = 1,
         prompt_addendum: str = "",
@@ -105,6 +106,7 @@ class MegaPersonaGenerator:
     ):
         self.llm = llm_client
         self.temperature = temperature
+        self.top_p = top_p
         self.max_tokens = max_tokens
         self.max_revisions = max_revisions
         self.prompt_addendum = prompt_addendum.strip()
@@ -302,6 +304,7 @@ class MegaPersonaGenerator:
             llm=self.llm,
             system_prompt_fn=self._system_prompt,
             temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_tokens,
             whiteboard=whiteboard,
             slot=slot,
@@ -345,6 +348,7 @@ class MegaPersonaGenerator:
             ),
             system_prompt=self._system_prompt(COMPACT_PERSONA_SYSTEM_PROMPT),
             temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=max(self.max_tokens, 4200),
         )
         logger.info("Slot=%s compact_persona done", slot.slot_id)
@@ -416,6 +420,7 @@ class MegaPersonaGenerator:
                 ),
                 system_prompt="You repair structured JSON for a schema-constrained persona pipeline.",
                 temperature=0.2,
+                top_p=self.top_p,
                 max_tokens=self.max_tokens,
             )
             raw_outputs[f"revision_{attempt + 1}"] = raw
@@ -466,6 +471,7 @@ class MegaPersonaGenerator:
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=self.temperature,
+            top_p=self.top_p,
             max_tokens=self.max_tokens,
         )
         parsed = _parse_or_repair_json(
@@ -536,6 +542,7 @@ class MegaPersonaGenerator:
                 "Return valid JSON only with the required top-level keys."
             ),
             temperature=0.1,
+            top_p=self.top_p,
             max_tokens=self.max_tokens,
         )
         raw_outputs[f"{stage_name}_stage_repair"] = repair_raw
@@ -570,6 +577,7 @@ def _run_parallel_agents(
     llm,
     system_prompt_fn,
     temperature: float,
+    top_p: float,
     max_tokens: int,
     whiteboard: dict[str, Any],
     slot: MegaPersonaSlot,
@@ -591,6 +599,7 @@ def _run_parallel_agents(
             prompt=agent_cfg["prompt"],
             system_prompt=system_prompt_fn(agent_cfg["system_prompt"]),
             temperature=temperature,
+            top_p=top_p,
             max_tokens=max_tokens,
         )
         logger.info("Slot=%s agent=%s done", slot.slot_id, agent_cfg["stage_name"])
@@ -892,6 +901,11 @@ def _blueprint_hard_constraints(blueprint: dict[str, Any], stage_name: str) -> s
                 lines.append(f"  - Behavior prediction anchor `{key}`: {value.strip()}")
     for binding in _blueprint_stage_bindings(blueprint, stage_name):
         lines.append(f"  - Cross-agent binding: {binding}")
+    critic_checks = blueprint.get("critic_checks")
+    if isinstance(critic_checks, list):
+        for check in critic_checks[:3]:
+            if isinstance(check, str) and check.strip():
+                lines.append(f"  - Blueprint critic requirement: {check.strip()}")
     lines.append(
         "  - The final text must echo these blueprint constraints through concrete behavior, "
         "not by naming the blueprint."
@@ -1074,6 +1088,7 @@ def _parse_or_repair_json(
     stage_name: str,
     temperature: float,
     max_tokens: int,
+    top_p: float | None = None,
 ) -> dict[str, Any]:
     try:
         return parse_json_object(raw)
@@ -1174,6 +1189,7 @@ def _generate_with_retry(
     system_prompt: str,
     temperature: float,
     max_tokens: int,
+    top_p: float | None = None,
     max_retries: int = 2,
     retry_backoff_seconds: float = 1.5,
 ) -> str:
@@ -1194,11 +1210,13 @@ def _generate_with_retry(
     )
     for attempt in range(max_retries + 1):
         try:
+            sampling_kwargs = {"top_p": top_p} if top_p is not None else {}
             return llm.generate(
                 prompt,
                 system_prompt=system_prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **sampling_kwargs,
             )
         except Exception as exc:
             message = str(exc).lower()
